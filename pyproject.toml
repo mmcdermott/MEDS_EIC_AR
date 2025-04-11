@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
   "polars~=1.26.0", "pyarrow", "hydra-core", "numpy", "meds==0.3.3", "filelock", "pytest",
-  "meds_testing_helpers~=0.2.6", "MEDS_transforms~=0.2.4", "meds-torch-data"
+  "meds_testing_helpers~=0.2.6", "MEDS_transforms~=0.2.4", "meds-torch-data", "transformers",
 ]
 
 [tool.setuptools_scm]
@@ -84,4 +84,4 @@ select = [
 "__init__.py" = ["F401"]  # Unused imports in __init__ files
 
 [tool.ruff.lint.pep8-naming]
-extend-ignore-names = ["*MEDS*"]  # Ignore MEDS in variable names
+extend-ignore-names = ["*MEDS*", "F"]  # Ignore MEDS in variable names
