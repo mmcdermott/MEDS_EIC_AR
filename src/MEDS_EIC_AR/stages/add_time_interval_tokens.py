@@ -10,12 +10,14 @@ from collections.abc import Callable
 
 import hydra
 import polars as pl
-from meds_torch.utils import TIME_DELTA_TOKEN, TIME_START_TOKEN
 from MEDS_transforms import INFERRED_STAGE_KEYS, PREPROCESS_CONFIG_YAML
 from MEDS_transforms.mapreduce.mapper import map_over
 from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
+
+TIME_START_TOKEN = "TIME//START//TOKEN"
+TIME_DELTA_TOKEN = "TIME//DELTA//TOKEN"
 
 
 def add_new_events_fntr(fn: Callable[[pl.DataFrame], pl.DataFrame]) -> Callable[[pl.DataFrame], pl.DataFrame]:
