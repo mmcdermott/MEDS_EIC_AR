@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MEDS_EIC_AR"
+dynamic = ["version"]
+authors = [
+  {name="Matthew McDermott", email="mattmcdermott8@gmail.com"},
+  {name="Nassim Oufattole", email="noufattole@gmail.com"},
+  {name="Teya Bergamaschi", email="teyabergamaschi@gmail.com"},
+  {name="Aleksia Kolo", email="aleksiakolo@gmail.com"},
+]
+description = "A simple auto-regressive, 'everything-is-code' style model for MEDS datasets"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+  "polars~=1.26.0", "pyarrow", "hydra-core", "numpy", "meds==0.3.3", "filelock", "pytest",
+  "meds_testing_helpers~=0.2.6", "MEDS_transforms~=0.2.0", "meds-torch-data"
+]
+
+[tool.setuptools_scm]
+
+[project.optional-dependencies]
+dev = ["pre-commit<4", "ruff"]
+tests = ["pytest-cov"]
+local_parallelism = ["hydra-joblib-launcher"]
+slurm_parallelism = ["hydra-submitit-launcher"]
+
+[project.urls]
+Homepage = "https://github.com/mmcdermott/MEDS_EIC_AR"
+Issues = "https://github.com/mmcdermott/MEDS_EIC_AR/issues"
+
+[project.scripts]
+# Full pipeline
+MEICAR_process_data = "MEDS_EIC_AR.__main__:process_data"
+# Stages
+MEICAR_add_time_interval_tokens = "MEDS_EIC_AR.stages.add_time_interval_tokens:main"
+MEICAR_quantile_binning = "MEDS_EIC_AR.stages.quantile_binning:main"
+
+[tool.pytest.ini_options]
+addopts = [
+  "--color=yes",
+  "--doctest-modules",
+  "--ignore=docs",
+  "--doctest-glob=*.md",
+]
+python_classes = "!TestEnv"
+doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
+markers = [
+  "parallelized: mark test as parallelized, requiring hydra-joblib-launcher",
+]
+
+[tool.coverage.report]
+exclude_also = ["logger\\.debug", "except ImportError:", "if TYPE_CHECKING:"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+extend-exclude = ["docs/index.md"]
+
+# Enable linters
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "DTZ", # flake8-datetimez
+    "RUF", # Ruff-specific rules
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+    "N",   # pep8-naming
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Unused imports in __init__ files
+
+[tool.ruff.lint.pep8-naming]
+extend-ignore-names = ["*MEDS*"]  # Ignore MEDS in variable names
