@@ -56,7 +56,7 @@ def process_data(cfg: DictConfig):
 
         cmd = [
             "MTD_preprocess",
-            f"input_dir={intermediate_dir!s}",
+            f"MEDS_dataset_dir={intermediate_dir!s}",
             f"output_dir={output_dir!s}",
         ]
         logger.info(f"Running command: {' '.join(cmd)}")
