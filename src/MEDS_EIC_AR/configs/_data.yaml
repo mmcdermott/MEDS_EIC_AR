@@ -24,8 +24,12 @@ stage_configs:
   filter_measurements:
     _match_revise:
       - _matcher:
+          time:
+            present: False
+      - _matcher:
           code:
-            regex: "^(?:(?!MEDS_DEATH|MEDS_BIRTH|ADMISSION|DISCHARGE|REGISTRATION|TIME).)*$"
+            regex: "MEDS_DEATH.*|MEDS_BIRTH.*|.*ADMISSION.*|.*DISCHARGE.*|.*REGISTRATION.*|.*TIME.*"
+      - _matcher:
           time:
             present: True
         min_subjects_per_code: 10000
