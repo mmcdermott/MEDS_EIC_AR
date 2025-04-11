@@ -32,10 +32,10 @@ stage_configs:
       - _matcher:
           time:
             present: True
-        min_subjects_per_code: 10000
+        min_subjects_per_code: ${oc.decode:${oc.env:MIN_SUBJECTS_PER_CODE,1000}}
   filter_subjects:
-    min_events_per_subject: 10
-    min_measurements_per_subject: 10
+    min_events_per_subject: ${oc.decode:${oc.env:MIN_EVENTS_PER_SUBJECT,10}}
+    min_measurements_per_subject: null
   fit_quantile_binning:
     _script: MEDS_transform-aggregate_code_metadata
     aggregations:

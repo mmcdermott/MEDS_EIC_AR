@@ -1,31 +1,12 @@
-import subprocess
-import tempfile
 from pathlib import Path
 
+from meds_torchdata import MEDSPytorchDataset
 
-def test_process_data_runs(simple_static_MEDS: Path):
-    with tempfile.TemporaryDirectory() as test_root:
-        test_root = Path(test_root)
 
-        input_dir = simple_static_MEDS
-        interemediate_dir = test_root / "intermediate"
-        output_dir = test_root / "output"
+def test_process_data_runs(preprocessed_dataset: Path):
+    out_files = list(preprocessed_dataset.rglob("*.*"))
+    assert len(out_files) > 0
 
-        cmd = [
-            "MEICAR_process_data",
-            f"input_dir={input_dir!s}",
-            f"intermediate_dir={interemediate_dir!s}",
-            f"output_dir={output_dir!s}",
-        ]
 
-        out = subprocess.run(cmd, capture_output=True, check=False)
-
-        err_lines = [
-            "Command failed:",
-            "Stdout:",
-            out.stdout.decode(),
-            "Stderr:",
-            out.stderr.decode(),
-        ]
-
-        assert out.returncode == 0, "\n".join([*err_lines, f"Return code: {out.returncode}"])
+def test_process_dataset_correct(pytorch_dataset: MEDSPytorchDataset):
+    assert len(pytorch_dataset) > 0
