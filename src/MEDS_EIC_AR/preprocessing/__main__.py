@@ -10,7 +10,7 @@ from omegaconf import DictConfig
 
 logger = logging.getLogger(__name__)
 
-CONFIGS = files(__package__).joinpath("configs")
+CONFIGS = files("MEDS_EIC_AR") / "preprocessing" / "configs"
 
 
 @hydra.main(version_base=None, config_path=str(CONFIGS), config_name="_process_data")

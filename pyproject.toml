@@ -38,10 +38,10 @@ Issues = "https://github.com/mmcdermott/MEDS_EIC_AR/issues"
 
 [project.scripts]
 # Full pipeline
-MEICAR_process_data = "MEDS_EIC_AR.__main__:process_data"
+MEICAR_process_data = "MEDS_EIC_AR.preprocessing.__main__:process_data"
 # Stages
-MEICAR_add_time_interval_tokens = "MEDS_EIC_AR.stages.add_time_interval_tokens:main"
-MEICAR_quantile_binning = "MEDS_EIC_AR.stages.quantile_binning:main"
+MEICAR_add_time_interval_tokens = "MEDS_EIC_AR.preprocessing.add_time_interval_tokens:main"
+MEICAR_quantile_binning = "MEDS_EIC_AR.preprocessing.quantile_binning:main"
 
 [tool.pytest.ini_options]
 addopts = [
