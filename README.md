@@ -10,6 +10,32 @@ This is based on the [MEDS-Torch](https://github.com/Oufattole/meds-torch) model
 pip install MEDS-EIC-AR
 ```
 
+## Usage
+
+### 1. Pre-process your data
+
+You have three directories:
+
+1. `$RAW_MEDS_DIR` -- The raw MEDS data directory that you want to pre-process.
+2. `$INTERMEDIATE_DIR` -- An intermediate directory where the partially processed data will be stored prior
+    to tokenization and tensorization.
+3. `$OUTPUT_DIR` -- The final output directory where the tokenized and tensorized data will be stored. This
+    directory is suitable for use in loading the data with `meds-torch-data`.
+
+Run:
+
+```bash
+MEICAR_process_data input_dir="$RAW_MEDS_DIR" intermediate_dir="$INTERMEDIATE_DIR" output_dir="$OUTPUT_DIR"
+```
+
+### 2. Train the model
+
+Not yet implemented.
+
+### 3. Zero-shot Inference
+
+Not yet implemented.
+
 ## Differences from the MEDS-Torch version
 
 1. In comparison to the MEDS-Torch
