@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
   "polars~=1.26.0", "pyarrow", "hydra-core", "numpy", "meds==0.3.3", "filelock", "pytest",
-  "meds_testing_helpers~=0.2.6", "MEDS_transforms~=0.2.0", "meds-torch-data"
+  "meds_testing_helpers~=0.2.6", "MEDS_transforms~=0.2.4", "meds-torch-data"
 ]
 
 [tool.setuptools_scm]
