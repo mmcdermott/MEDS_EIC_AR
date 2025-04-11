@@ -1,17 +1,19 @@
 """Transformations for adding time-derived measurements (e.g., a subject's age) to a MEDS dataset.
 
-See https://github.com/Oufattole/meds-torch/blob/d1650ea6152301a9b9bdbd32756337214e5f310f/src/meds_torch/utils/custom_time_token.py
+See
+https://github.com/Oufattole/meds-torch/blob/d1650ea6152301a9b9bdbd32756337214e5f310f/src/meds_torch/utils/custom_time_token.py
 for source.
 """
-from collections.abc import Callable
+
 import logging
+from collections.abc import Callable
+
 import hydra
 import polars as pl
-from MEDS_transforms import PREPROCESS_CONFIG_YAML
+from meds_torch.utils import TIME_DELTA_TOKEN, TIME_START_TOKEN
+from MEDS_transforms import INFERRED_STAGE_KEYS, PREPROCESS_CONFIG_YAML
 from MEDS_transforms.mapreduce.mapper import map_over
 from omegaconf import DictConfig, OmegaConf
-
-from meds_torch.utils import TIME_DELTA_TOKEN, TIME_START_TOKEN
 
 logger = logging.getLogger(__name__)
 
@@ -391,14 +393,6 @@ def time_delta_fntr(cfg: DictConfig) -> Callable[[pl.DataFrame], pl.DataFrame]:
 
 
 def add_time_derived_measurements_fntr(stage_cfg: DictConfig) -> Callable[[pl.LazyFrame], pl.LazyFrame]:
-    INFERRED_STAGE_KEYS = {
-        "is_metadata",
-        "data_input_dir",
-        "metadata_input_dir",
-        "output_dir",
-        "reducer_output_dir",
-    }
-
     compute_fns = []
     # We use the raw stages object as the induced `stage_cfg` has extra properties like the input and output
     # directories.

@@ -1,14 +1,17 @@
+import copy
+import logging
+import os
+import subprocess
 from importlib.resources import files
+from pathlib import Path
+
 import hydra
 from omegaconf import DictConfig
-from pathlib import Path
-import subprocess
-import os
-import logging
 
 logger = logging.getLogger(__name__)
 
 CONFIGS = files(__package__).joinpath("configs")
+
 
 @hydra.main(version_base=None, config_path=str(CONFIGS), config_name="_process_data")
 def process_data(cfg: DictConfig):

@@ -5,9 +5,10 @@ DO NOT RUN THIS WITH PARALLELISM.
 Original source:
 https://github.com/Oufattole/meds-torch/blob/d1650ea6152301a9b9bdbd32756337214e5f310f/src/meds_torch/utils/quantile_binning.py
 """
-from pathlib import Path
 
 import logging
+from pathlib import Path
+
 import hydra
 import polars as pl
 from MEDS_transforms import PREPROCESS_CONFIG_YAML
@@ -121,8 +122,7 @@ def process_quantiles(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def add_custom_quantiles_column(code_metadata: pl.DataFrame, custom_quantiles: dict) -> pl.DataFrame:
-    """Add a custom_quantiles column to code_metadata DataFrame based on provided
-    dictionary.
+    """Add a custom_quantiles column to code_metadata DataFrame based on provided dictionary.
 
     Args:
         code_metadata: A Polars DataFrame containing code information
@@ -181,8 +181,7 @@ def add_custom_quantiles_column(code_metadata: pl.DataFrame, custom_quantiles: d
 def convert_to_discrete_quantiles(
     meds_data: pl.DataFrame, code_metadata: pl.DataFrame, custom_quantiles
 ) -> pl.DataFrame:
-    """Converts the numeric values in a MEDS dataset to discrete quantiles that are
-    added to the code name.
+    """Converts the numeric values in a MEDS dataset to discrete quantiles that are added to the code name.
 
     Returns:
         - A new DataFrame with the quantile values added to the code name.
@@ -291,8 +290,7 @@ def convert_to_discrete_quantiles(
 def convert_metadata_codes_to_discrete_quantiles(
     code_metadata: pl.DataFrame, custom_quantiles
 ) -> pl.DataFrame:
-    """Converts the numeric values in a MEDS dataset to discrete quantiles that are
-    added to the code name.
+    """Converts the numeric values in a MEDS dataset to discrete quantiles that are added to the code name.
 
     Returns:
         - A new DataFrame with the quantile values added to the code name.
@@ -493,7 +491,7 @@ def quantile_normalize(
     df: pl.LazyFrame,
     code_metadata: pl.DataFrame,
     code_modifiers: list[str] | None = None,
-    custom_quantiles: dict = {},
+    custom_quantiles: dict | None = None,
 ) -> pl.LazyFrame:
     """Normalize a MEDS dataset across both categorical and continuous dimensions.
 
@@ -614,6 +612,8 @@ def quantile_normalize(
         └────────────┴─────────────────────┴──────────────┴───────────────┘
     """
     # TODO: add support for original values/mean and values/std normalization of continuous values
+    if custom_quantiles is None:
+        custom_quantiles = {}
     df = convert_to_discrete_quantiles(df.collect(), code_metadata, custom_quantiles)
     return df.lazy()
 
