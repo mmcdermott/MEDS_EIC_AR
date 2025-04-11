@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
   "polars~=1.26.0", "pyarrow", "hydra-core", "numpy", "meds==0.3.3", "filelock", "pytest",
-  "meds_testing_helpers~=0.2.6", "MEDS_transforms~=0.2.4", "meds-torch-data", "transformers",
+  "meds_testing_helpers~=0.2.6", "MEDS_transforms~=0.2.4", "meds-torch-data", "transformers"
 ]
 
 [tool.setuptools_scm]
@@ -29,8 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pre-commit<4", "ruff"]
 tests = ["pytest-cov"]
-local_parallelism = ["hydra-joblib-launcher"]
-slurm_parallelism = ["hydra-submitit-launcher"]
+flash_attn = ["flash-attn"]
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_EIC_AR"

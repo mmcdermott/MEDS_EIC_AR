@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from meds_torchdata import MEDSPytorchDataset, MEDSTorchDataConfig
+from meds_torchdata import MEDSPytorchDataset, MEDSTorchBatch, MEDSTorchDataConfig
+from torch.utils.data import DataLoader
 
 
 @pytest.fixture(scope="session")
@@ -56,11 +57,20 @@ def pytorch_dataset(preprocessed_dataset: Path) -> MEDSPytorchDataset:
     return MEDSPytorchDataset(config, split="train")
 
 
+@pytest.fixture(scope="session")
+def sample_batch(pytorch_dataset: MEDSPytorchDataset) -> MEDSTorchBatch:
+    """Fixture to create a sample batch."""
+    dataloader = DataLoader(pytorch_dataset, batch_size=2, shuffle=False, collate_fn=pytorch_dataset.collate)
+    return next(iter(dataloader))
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _setup_doctest_namespace(
     doctest_namespace: dict[str, Any],
     simple_static_MEDS: Path,
     simple_static_MEDS_dataset_with_task: Path,
+    sample_batch: MEDSTorchBatch,
+    preprocessed_dataset: Path,
 ):
     doctest_namespace.update(
         {
@@ -69,5 +79,6 @@ def _setup_doctest_namespace(
             "simple_static_MEDS": simple_static_MEDS,
             "simple_static_MEDS_dataset_with_task": simple_static_MEDS_dataset_with_task,
             "preprocessed_dataset": preprocessed_dataset,
+            "sample_batch": sample_batch,
         }
     )

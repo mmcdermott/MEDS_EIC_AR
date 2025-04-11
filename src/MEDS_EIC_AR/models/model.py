@@ -9,8 +9,42 @@ from transformers import (
     GPTNeoXForCausalLM,
 )
 
+try:
+    import flash_attn  # noqa: F401
+
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+
 
 class Model(torch.nn.Module):
+    """A basic GPT-NeoX like model for pre-training an autoregressive, "everything-is-code" model.
+
+    This model is a wrapper around the Hugging Face GPTNeoXForCausalLM model to run it over MEDS-TorchData
+    batches.
+
+    Args:
+        gpt_kwargs: A dictionary of keyword arguments to pass to the GPTNeoXConfig constructor. These can
+            include 'max_position_embeddings', 'vocab_size', 'hidden_size', etc.
+
+    Examples:
+        >>> import polars as pl
+        >>> metadata_df = pl.read_parquet(preprocessed_dataset / "metadata" / "codes.parquet")
+        >>> vocab_size = metadata_df.select(pl.col("code/vocab_index")).max().item() + 1
+        >>> print(f"Vocab size: {vocab_size}")
+        Vocab size: 38
+        >>> model = Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 2,
+        ...     "hidden_size": 4,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": vocab_size,
+        ... })
+        >>> loss, outputs = model(sample_batch)
+        >>> print(loss)
+        >>> print(outputs)
+    """
+
     HF_model_config: GPTNeoXConfig
     HF_model: GPTNeoXForCausalLM
 
@@ -26,12 +60,17 @@ class Model(torch.nn.Module):
 
         self.HF_model_config.intermediate_size = 4 * self.HF_model_config.hidden_size
 
-        self.HF_model = AutoModelForCausalLM.from_config(
-            self.HF_model_config, attn_implementation="flash_attention_2"
-        )
+        if HAS_FLASH_ATTN:
+            self.HF_model = AutoModelForCausalLM.from_config(
+                self.HF_model_config, attn_implementation="flash_attention_2"
+            )
+        else:
+            self.HF_model = AutoModelForCausalLM.from_config(self.HF_model_config)
 
     def forward(self, batch: MEDSTorchBatch):
         outputs = self.HF_model(input_ids=batch.code, attention_mask=(batch.code == batch.PAD_INDEX))
-        loss = F.cross_entropy(outputs.logits[:, :-1], batch.code[:, 1:], ignore_index=batch.PAD_INDEX)
+        loss = F.cross_entropy(
+            outputs.logits[:, :-1].transpose(2, 1), batch.code[:, 1:], ignore_index=batch.PAD_INDEX
+        )
 
         return loss, outputs
