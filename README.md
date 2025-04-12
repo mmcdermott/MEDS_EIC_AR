@@ -1,5 +1,14 @@
 # MEDS "Everything-is-code" Autoregressive Model
 
+[![PyPI - Version](https://img.shields.io/pypi/v/MEDS-EIC-AR)](https://pypi.org/project/MEDS-EIC-AR/)
+![python](https://img.shields.io/badge/-Python_3.12-blue?logo=python&logoColor=white)
+[![codecov](https://codecov.io/gh/mmcdermott/MEDS_EIC_AR/graph/badge.svg?token=5RORKQOZF9)](https://codecov.io/gh/mmcdermott/MEDS_EIC_AR)
+[![tests](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/tests.yaml/badge.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/tests.yml)
+[![code-quality](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/code-quality-main.yaml/badge.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/code-quality-main.yaml)
+[![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/mmcdermott/MEDS_EIC_AR#license)
+[![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/pulls)
+[![contributors](https://img.shields.io/github/contributors/mmcdermott/MEDS_EIC_AR.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/graphs/contributors)
+
 A MEDS, "Everything-is-code" style Autoregressive Generative Model, capable of zero-shot inference.
 
 This is based on the [MEDS-Torch](https://github.com/Oufattole/meds-torch) model of the same name.
