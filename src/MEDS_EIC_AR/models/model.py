@@ -33,6 +33,7 @@ class Model(torch.nn.Module):
         >>> vocab_size = metadata_df.select(pl.col("code/vocab_index")).max().item() + 1
         >>> print(f"Vocab size: {vocab_size}")
         Vocab size: 38
+        >>> _ = torch.manual_seed(0)
         >>> model = Model({
         ...     "num_hidden_layers": 2,
         ...     "num_attention_heads": 2,
@@ -42,7 +43,17 @@ class Model(torch.nn.Module):
         ... })
         >>> loss, outputs = model(sample_batch)
         >>> print(loss)
-        >>> print(outputs)
+        tensor(3.6152, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
+        >>> print(f"Outputs have keys: {', '.join(outputs.keys())}")
+        Outputs have keys: logits, past_key_values
+        >>> print(f"Logits shape: {outputs.logits.shape}")
+        Logits shape: torch.Size([2, 8, 38])
+        >>> print(outputs.logits)
+        tensor([[[ 3.4485e-02, ..., -2.7084e-02], ..., [ 7.9407e-02, ..., -2.3972e-02]],
+        <BLANKLINE>
+                [[ 3.3356e-02, ..., -2.7267e-02], ..., [ 7.9529e-02, ..., -2.4506e-02]]],
+               dtype=torch.float16,
+               grad_fn=<UnsafeViewBackward0>)
     """
 
     HF_model_config: GPTNeoXConfig
