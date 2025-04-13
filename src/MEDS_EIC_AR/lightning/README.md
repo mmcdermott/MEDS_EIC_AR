@@ -2,6 +2,9 @@
 
 To-add:
 
-1. Metrics
-2. Optimizers
-3. Generation Support
+1. Optimizers
+2. Generation Support
+
+## Differences from `meds-torch` base:
+
+1. Metrics track perplexity and do not track AUC.

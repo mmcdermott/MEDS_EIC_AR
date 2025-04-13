@@ -1,0 +1,5 @@
+_target_: MEDS_EIC_AR.lightning.NextCodeMetrics
+
+top_k: [1, 2, 5, 25, 50, 100]
+vocab_size: ???
+ignore_index: 0
