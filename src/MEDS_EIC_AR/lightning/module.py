@@ -1,22 +1,35 @@
 import lightning as L
+import torch
 from meds_torchdata import MEDSTorchBatch
 from omegaconf import DictConfig
 
 from ..model import Model
+from .metrcis import NextCodeMetrics
 
 
 class MEICARModule(L.LightningModule):
-    def __init__(self, gpt_kwargs: dict | DictConfig):
+    def __init__(
+        self,
+        model: Model,
+        metrics: NextCodeMetrics,
+    ):
         super().__init__()
-        self.model = Model(gpt_kwargs)
+        self.model = model
+        self.metrics = metrics
+
+    def _log_metrics(self, loss: torch.Tensor, outputs: ???, batch: MEDSTorchBatch, stage: str):
+        self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log(f"{stage}/metrics", self.metrics(outputs.logits, batch))
 
     def training_step(self, batch: MEDSTorchBatch):
         loss, outputs = self.model(batch)
+        self._log_metrics(loss, outputs, batch, "train")
 
         return loss
 
     def validation_step(self, batch):
         loss, outputs = self.model(batch)
+        self._log_metrics(loss, outputs, batch, "val")
 
         return loss
 

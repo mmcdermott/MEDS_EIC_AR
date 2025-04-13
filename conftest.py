@@ -5,6 +5,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from meds_torchdata import MEDSPytorchDataset, MEDSTorchBatch, MEDSTorchDataConfig
@@ -74,6 +75,8 @@ def _setup_doctest_namespace(
 ):
     doctest_namespace.update(
         {
+            "MagicMock": MagicMock,
+            "Mock": Mock,
             "datetime": datetime,
             "tempfile": tempfile,
             "simple_static_MEDS": simple_static_MEDS,
