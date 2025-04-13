@@ -1,0 +1,9 @@
+defaults:
+  - default
+  - _self_
+
+split: train
+
+config:
+  seq_len: 512
+  subseq_sampling_strategy: "random"

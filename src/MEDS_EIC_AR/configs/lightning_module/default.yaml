@@ -3,3 +3,7 @@ defaults:
   - metrics: default
 
 _target_: MEDS_EIC_AR.lightning.MEICARModule
+
+vocab_size: ???
+model.gpt_kwargs.vocab_size: ${vocab_size}
+metrics.vocab_size: ${vocab_size}

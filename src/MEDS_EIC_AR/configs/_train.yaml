@@ -1,5 +1,6 @@
 defaults:
   - lightning_module: default
+  - dataset: train
 
 output_dir: ???
 

@@ -37,11 +37,15 @@ Homepage = "https://github.com/mmcdermott/MEDS_EIC_AR"
 Issues = "https://github.com/mmcdermott/MEDS_EIC_AR/issues"
 
 [project.scripts]
+# Data preprocessing
 # Full pipeline
 MEICAR_process_data = "MEDS_EIC_AR.preprocessing.__main__:process_data"
 # Stages
 MEICAR_add_time_interval_tokens = "MEDS_EIC_AR.preprocessing.add_time_interval_tokens:main"
 MEICAR_quantile_binning = "MEDS_EIC_AR.preprocessing.quantile_binning:main"
+
+# Model training
+MEICAR_train = "MEDS_EIC_AR.__main__:train"
 
 [tool.pytest.ini_options]
 addopts = [
@@ -84,4 +88,4 @@ select = [
 "__init__.py" = ["F401"]  # Unused imports in __init__ files
 
 [tool.ruff.lint.pep8-naming]
-extend-ignore-names = ["*MEDS*", "F", "L"]  # Ignore MEDS in variable names
+extend-ignore-names = ["*MEDS*", "F", "L", "M", "D"]  # Ignore MEDS in variable names
