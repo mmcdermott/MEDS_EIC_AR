@@ -4,6 +4,6 @@ defaults:
 
 split: train
 
-config:
-  seq_len: 512
-  subseq_sampling_strategy: "random"
+cfg:
+  max_seq_len: 512
+  seq_sampling_strategy: RANDOM
