@@ -26,7 +26,11 @@ def train(cfg: DictConfig):
     metadata_df = pl.read_parquet(D.config.tensorized_cohort_dir / code_metadata_filepath, use_pyarrow=True)
     D.vocab_size = metadata_df.select(pl.col("code/vocab_index")).max().item() + 1
 
-    M = instantiate(cfg.lightning_module, vocab_size=D.vocab_size)
+    M = instantiate(
+        cfg.lightning_module,
+        model={"gpt_kwargs": {"vocab_size": D.vocab_size}},
+        metrics={"vocab_size": D.vocab_size},
+    )
 
     print("WOO", M)
 

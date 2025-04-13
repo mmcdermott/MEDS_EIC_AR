@@ -4,7 +4,7 @@ from meds_torchdata import MEDSTorchBatch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..model import Model
-from .metrcis import NextCodeMetrics
+from .metrics import NextCodeMetrics
 
 
 class MEICARModule(L.LightningModule):

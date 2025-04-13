@@ -2,4 +2,4 @@ defaults:
   - model: default
   - metrics: default
 
-_target_: MEDS_EIC_AR.lightning.MEICARModule
+_target_: MEDS_EIC_AR.lightning.module.MEICARModule

@@ -48,14 +48,15 @@ def preprocessed_dataset(simple_static_MEDS: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
-def pytorch_dataset(preprocessed_dataset: Path) -> MEDSPytorchDataset:
-    """Fixture to create a PyTorch dataset."""
-    config = MEDSTorchDataConfig(
-        tensorized_cohort_dir=preprocessed_dataset,
-        max_seq_len=10,
-    )
+def dataset_config(preprocessed_dataset: Path) -> MEDSTorchDataConfig:
+    """Fixture to create a dataset configuration."""
+    return MEDSTorchDataConfig(tensorized_cohort_dir=preprocessed_dataset, max_seq_len=10)
 
-    return MEDSPytorchDataset(config, split="train")
+
+@pytest.fixture(scope="session")
+def pytorch_dataset(dataset_config: MEDSTorchDataConfig) -> MEDSPytorchDataset:
+    """Fixture to create a PyTorch dataset."""
+    return MEDSPytorchDataset(dataset_config, split="train")
 
 
 @pytest.fixture(scope="session")
@@ -72,6 +73,7 @@ def _setup_doctest_namespace(
     simple_static_MEDS_dataset_with_task: Path,
     sample_batch: MEDSTorchBatch,
     preprocessed_dataset: Path,
+    dataset_config: MEDSTorchDataConfig,
 ):
     doctest_namespace.update(
         {
@@ -83,5 +85,6 @@ def _setup_doctest_namespace(
             "simple_static_MEDS_dataset_with_task": simple_static_MEDS_dataset_with_task,
             "preprocessed_dataset": preprocessed_dataset,
             "sample_batch": sample_batch,
+            "dataset_config": dataset_config,
         }
     )
