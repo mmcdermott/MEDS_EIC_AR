@@ -8,6 +8,7 @@ from transformers import (
     GPTNeoXConfig,
     GPTNeoXForCausalLM,
 )
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 try:
     import flash_attn  # noqa: F401
@@ -78,7 +79,7 @@ class Model(torch.nn.Module):
         else:
             self.HF_model = AutoModelForCausalLM.from_config(self.HF_model_config)
 
-    def forward(self, batch: MEDSTorchBatch):
+    def forward(self, batch: MEDSTorchBatch) -> tuple[torch.Tensor, CausalLMOutputWithPast]:
         outputs = self.HF_model(input_ids=batch.code, attention_mask=(batch.code == batch.PAD_INDEX))
         loss = F.cross_entropy(
             outputs.logits[:, :-1].transpose(2, 1), batch.code[:, 1:], ignore_index=batch.PAD_INDEX

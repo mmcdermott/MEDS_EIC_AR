@@ -1,7 +1,7 @@
 import lightning as L
 import torch
 from meds_torchdata import MEDSTorchBatch
-from omegaconf import DictConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..model import Model
 from .metrcis import NextCodeMetrics
@@ -17,7 +17,9 @@ class MEICARModule(L.LightningModule):
         self.model = model
         self.metrics = metrics
 
-    def _log_metrics(self, loss: torch.Tensor, outputs: ???, batch: MEDSTorchBatch, stage: str):
+    def _log_metrics(
+        self, loss: torch.Tensor, outputs: CausalLMOutputWithPast, batch: MEDSTorchBatch, stage: str
+    ):
         self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log(f"{stage}/metrics", self.metrics(outputs.logits, batch))
 
