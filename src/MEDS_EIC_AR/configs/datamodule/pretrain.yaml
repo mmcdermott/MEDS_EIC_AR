@@ -2,8 +2,6 @@ defaults:
   - default
   - _self_
 
-split: train
-
-cfg:
+config:
   max_seq_len: 512
   seq_sampling_strategy: RANDOM

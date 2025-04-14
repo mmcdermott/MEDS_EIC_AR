@@ -1,5 +1,0 @@
-defaults:
-  - cfg: MEDSTorchDataConfig # Added in the structured config store
-_target_: "meds_torchdata.MEDSPytorchDataset"
-
-split: ???

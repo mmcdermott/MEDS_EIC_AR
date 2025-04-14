@@ -1,6 +1,6 @@
 defaults:
   - lightning_module: default
-  - dataset: train
+  - datamodule: pretrain
 
 model_dir: ???
 

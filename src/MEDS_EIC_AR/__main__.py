@@ -20,8 +20,8 @@ with open_dict(cfg_node):
     cfg_node["_target_"] = "meds_torchdata.MEDSTorchDataConfig"
 
 
-@hydra.main(version_base=None, config_path=str(CONFIGS), config_name="_train")
-def train(cfg: DictConfig):
+@hydra.main(version_base=None, config_path=str(CONFIGS), config_name="_pretrain")
+def pretrain(cfg: DictConfig):
     D = instantiate(cfg.dataset)
     metadata_df = pl.read_parquet(D.config.tensorized_cohort_dir / code_metadata_filepath, use_pyarrow=True)
     D.vocab_size = metadata_df.select(pl.col("code/vocab_index")).max().item() + 1

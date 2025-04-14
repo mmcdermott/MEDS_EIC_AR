@@ -45,7 +45,7 @@ MEICAR_add_time_interval_tokens = "MEDS_EIC_AR.preprocessing.add_time_interval_t
 MEICAR_quantile_binning = "MEDS_EIC_AR.preprocessing.quantile_binning:main"
 
 # Model training
-MEICAR_train = "MEDS_EIC_AR.__main__:train"
+MEICAR_pretrain = "MEDS_EIC_AR.__main__:pretrain"
 
 [tool.pytest.ini_options]
 addopts = [
