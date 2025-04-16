@@ -1,3 +1,5 @@
+from collections.abc import Callable, Iterator
+
 import lightning as L
 import torch
 from meds_torchdata import MEDSTorchBatch
@@ -12,10 +14,12 @@ class MEICARModule(L.LightningModule):
         self,
         model: Model,
         metrics: NextCodeMetrics,
+        optimizer: Callable[[Iterator[torch.nn.parameter.Parameter]], torch.optim.Optimizer],
     ):
         super().__init__()
         self.model = model
         self.metrics = metrics
+        self.optimizer_factory = optimizer
 
     def _log_metrics(
         self, loss: torch.Tensor, outputs: CausalLMOutputWithPast, batch: MEDSTorchBatch, stage: str
@@ -36,4 +40,4 @@ class MEICARModule(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        raise NotImplementedError("Optimizer not yet implemented")
+        return self.optimizer_factory(self.parameters())

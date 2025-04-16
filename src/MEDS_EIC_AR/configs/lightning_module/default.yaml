@@ -1,5 +1,6 @@
 defaults:
   - model: default
   - metrics: default
+  - optimizer: adam
 
 _target_: MEDS_EIC_AR.lightning.module.MEICARModule
