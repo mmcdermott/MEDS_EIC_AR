@@ -32,8 +32,6 @@ def pretrain(cfg: DictConfig):
         metrics={"vocab_size": D.vocab_size},
     )
 
-    print("WOO", M)
+    trainer = instantiate(cfg.trainer)
 
-    # trainer = instantiate(cfg.trainer)
-
-    # trainer.fit(M, D)
+    trainer.fit(M, D)

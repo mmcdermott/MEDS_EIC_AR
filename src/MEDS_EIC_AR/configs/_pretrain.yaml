@@ -1,6 +1,7 @@
 defaults:
   - lightning_module: default
   - datamodule: pretrain
+  - trainer: default
 
 model_dir: ???
 
