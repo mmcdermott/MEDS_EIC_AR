@@ -36,17 +36,17 @@ def process_data(cfg: DictConfig):
 
         pipeline_config_fp = CONFIGS / "_data.yaml"
         cmd = [
-            "MEDS_transform-runner",
+            "MEDS_transform-pipeline",
             f"pipeline_config_fp={pipeline_config_fp!s}",
         ]
         logger.info(f"Running command: {' '.join(cmd)}")
 
         result = subprocess.run(cmd, env=env, capture_output=True, check=False)
         if result.returncode != 0:
-            logger.error("Error running MEDS_transform-runner")
+            logger.error("Error running MEDS_transform-pipeline")
             logger.error(result.stdout.decode())
             logger.error(result.stderr.decode())
-            raise RuntimeError("Error running MEDS_transform-runner")
+            raise RuntimeError("Error running MEDS_transform-pipeline")
 
         logger.info("Pre-MTD pre-processing done")
         done_fp.touch()

@@ -8,10 +8,9 @@ for source.
 import logging
 from collections.abc import Callable
 
-import hydra
 import polars as pl
-from MEDS_transforms import INFERRED_STAGE_KEYS, PREPROCESS_CONFIG_YAML
-from MEDS_transforms.mapreduce.mapper import map_over
+from MEDS_transforms import INFERRED_STAGE_KEYS
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
@@ -394,7 +393,8 @@ def time_delta_fntr(cfg: DictConfig) -> Callable[[pl.DataFrame], pl.DataFrame]:
     return fn
 
 
-def add_time_derived_measurements_fntr(stage_cfg: DictConfig) -> Callable[[pl.LazyFrame], pl.LazyFrame]:
+@Stage.register(stage_name="add_time_interval_tokens")
+def map_fntr(stage_cfg: DictConfig) -> Callable[[pl.LazyFrame], pl.LazyFrame]:
     compute_fns = []
     # We use the raw stages object as the induced `stage_cfg` has extra properties like the input and output
     # directories.
@@ -404,7 +404,7 @@ def add_time_derived_measurements_fntr(stage_cfg: DictConfig) -> Callable[[pl.La
                 compute_fns.append(add_new_events_fntr(time_delta_fntr(feature_cfg)))
             case str() if feature_name in INFERRED_STAGE_KEYS:
                 continue
-            case "_script":
+            case "_script" | "_base_stage":
                 continue
             case _:
                 raise ValueError(f"Unknown time-derived measurement: {feature_name}")
@@ -417,12 +417,3 @@ def add_time_derived_measurements_fntr(stage_cfg: DictConfig) -> Callable[[pl.La
         return df
 
     return fn
-
-
-@hydra.main(
-    version_base=None, config_path=str(PREPROCESS_CONFIG_YAML.parent), config_name=PREPROCESS_CONFIG_YAML.stem
-)
-def main(cfg: DictConfig):
-    """Adds time-derived measurements to a MEDS cohort as separate observations at each unique time."""
-
-    map_over(cfg, compute_fn=add_time_derived_measurements_fntr)
