@@ -9,10 +9,9 @@ https://github.com/Oufattole/meds-torch/blob/d1650ea6152301a9b9bdbd32756337214e5
 import logging
 from pathlib import Path
 
-import hydra
 import polars as pl
-from MEDS_transforms import PREPROCESS_CONFIG_YAML
-from MEDS_transforms.mapreduce.mapper import map_over
+from MEDS_transforms.mapreduce import map_stage
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
@@ -618,9 +617,7 @@ def quantile_normalize(
     return df.lazy()
 
 
-@hydra.main(
-    version_base=None, config_path=str(PREPROCESS_CONFIG_YAML.parent), config_name=PREPROCESS_CONFIG_YAML.stem
-)
+@Stage.register(is_metadata=True)
 def main(cfg: DictConfig):
     """Bins the numeric values and collapses the bin number into the code name.
 
@@ -640,7 +637,7 @@ def main(cfg: DictConfig):
             custom_quantiles=cfg.stage_cfg.get("custom_quantiles", {}),
         )
 
-    map_over(cfg, compute_fn=normalize)
+    map_stage(cfg, normalize)
 
     custom_quantiles = cfg.stage_cfg.get("custom_quantiles", {})
 
