@@ -1,5 +1,6 @@
 defaults:
   - default
+  - override logger: csv
   - _self_
 
 accelerator: cpu

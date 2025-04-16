@@ -1,3 +1,6 @@
+defaults:
+  - logger: csv
+
 _target_: lightning.pytorch.trainer.Trainer
 
 default_root_dir: ${model_dir}
