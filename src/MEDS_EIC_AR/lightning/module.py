@@ -25,7 +25,7 @@ class MEICARModule(L.LightningModule):
         self, loss: torch.Tensor, outputs: CausalLMOutputWithPast, batch: MEDSTorchBatch, stage: str
     ):
         self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log(f"{stage}/metrics", self.metrics(outputs.logits, batch))
+        self.log_dict({f"{stage}/{k}": v for k, v in self.metrics(outputs.logits, batch).items()})
 
     def training_step(self, batch: MEDSTorchBatch):
         loss, outputs = self.model(batch)
