@@ -1,5 +1,6 @@
 defaults:
   - logger: csv
+  - callbacks: default
 
 _target_: lightning.pytorch.trainer.Trainer
 

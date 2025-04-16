@@ -35,7 +35,7 @@ class MEICARModule(L.LightningModule):
 
     def validation_step(self, batch):
         loss, outputs = self.model(batch)
-        self._log_metrics(loss, outputs, batch, "val")
+        self._log_metrics(loss, outputs, batch, "tuning")
 
         return loss
 
