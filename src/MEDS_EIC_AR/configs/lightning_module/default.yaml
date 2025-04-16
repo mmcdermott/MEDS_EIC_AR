@@ -2,5 +2,6 @@ defaults:
   - model: default
   - metrics: default
   - optimizer: adam
+  - LR_scheduler: reduce_LR_on_plateau
 
 _target_: MEDS_EIC_AR.lightning.module.MEICARModule

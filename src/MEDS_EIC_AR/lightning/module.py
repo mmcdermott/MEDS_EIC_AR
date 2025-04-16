@@ -15,11 +15,13 @@ class MEICARModule(L.LightningModule):
         model: Model,
         metrics: NextCodeMetrics,
         optimizer: Callable[[Iterator[torch.nn.parameter.Parameter]], torch.optim.Optimizer],
+        LR_scheduler: Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler._LRScheduler] | None = None,
     ):
         super().__init__()
         self.model = model
         self.metrics = metrics
         self.optimizer_factory = optimizer
+        self.LR_scheduler_factory = LR_scheduler
 
     def _log_metrics(
         self, loss: torch.Tensor, outputs: CausalLMOutputWithPast, batch: MEDSTorchBatch, stage: str
@@ -40,4 +42,13 @@ class MEICARModule(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return self.optimizer_factory(self.parameters())
+        optimizer = self.optimizer_factory(self.parameters())
+
+        if self.LR_scheduler_factory is not None:
+            scheduler = self.LR_scheduler_factory(optimizer)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "monitor": "tuning/loss"},
+            }
+        else:
+            return optimizer
