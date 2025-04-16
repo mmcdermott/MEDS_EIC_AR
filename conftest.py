@@ -55,6 +55,8 @@ def pretrained_model(preprocessed_dataset: Path) -> Path:
         cmd = [
             "MEICAR_pretrain",
             f"model_dir={model_dir!s}",
+            f"datamodule.config.tensorized_cohort_dir={preprocessed_dataset!s}",
+            "trainer=demo",
         ]
 
         out = subprocess.run(cmd, capture_output=True, check=False)

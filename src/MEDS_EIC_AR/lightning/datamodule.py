@@ -4,6 +4,8 @@ import lightning as L
 from meds_torchdata import MEDSPytorchDataset, MEDSTorchDataConfig
 from torch.utils.data import DataLoader
 
+# TODO: Pending https://github.com/mmcdermott/meds-torch-data/issues/26, remove this class.
+
 
 class Datamodule(L.LightningDataModule):
     """A lightning datamodule for a MEDSPytorchDataset.
