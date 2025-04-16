@@ -28,13 +28,15 @@ You have three directories:
 1. `$RAW_MEDS_DIR` -- The raw MEDS data directory that you want to pre-process.
 2. `$INTERMEDIATE_DIR` -- An intermediate directory where the partially processed data will be stored prior
     to tokenization and tensorization.
-3. `$OUTPUT_DIR` -- The final output directory where the tokenized and tensorized data will be stored. This
-    directory is suitable for use in loading the data with `meds-torch-data`.
+3. `$FINAL_DATA_DIR` -- The final output directory where the tokenized and tensorized data will be stored.
+    This directory is suitable for use in loading the data with `meds-torch-data`.
 
 Run:
 
 ```bash
-MEICAR_process_data input_dir="$RAW_MEDS_DIR" intermediate_dir="$INTERMEDIATE_DIR" output_dir="$OUTPUT_DIR"
+MEICAR_process_data input_dir="$RAW_MEDS_DIR" \
+    intermediate_dir="$INTERMEDIATE_DIR" \
+    output_dir="$FINAL_DATA_DIR"
 ```
 
 You can also run this in demo mode, which lowers the filtering thresholds significantly so the script does not
@@ -54,9 +56,28 @@ You can exert more fine-grained control on the filtering with the following envi
 > I suspect this is not actually working yet. Tests currently just ensure it does not crash; not that the
 > entire output of the pipeline looks as expected.
 
-### 2. Train the model
+### 2. Pre-train the model
 
-Not yet implemented.
+You can pre-train the model using the `MEICAR_pretrain` command. To use this, let us assume you have a new
+directory to store the pretrained model artifacts called `$PRETRAINED_MODEL_DIR`. Then, you can run:
+
+```bash
+MEICAR_pretrain datamodule.config.tensorized_cohort_dir="$FINAL_DATA_DIR" \
+    model_dir="$PRETRAINED_MODEL_DIR" \
+    trainer.max_epochs=10
+```
+
+to train the model for 10 epochs.
+
+This uses a [Hydra](https://hydra.cc/) configuration system, with the root config located in the
+[`_pretrain.yaml`](src/MEDS_EIC_AR/configs/_pretrain.yaml) file. You can override any of the nested
+configuration parameters (as shown above via `datamodule.config.tensorized_cohort_dir` on the command line,
+though you will more likely materialize an experimental configuration file to disk in yaml form and overwrite
+the config path and name directly in the normal hydra manner.
+
+> [!WARNING]
+> I suspect this is not actually working yet. Tests currently just ensure it does not crash; not that the
+> entire output of the pipeline looks as expected.
 
 ### 3. Zero-shot Inference
 
