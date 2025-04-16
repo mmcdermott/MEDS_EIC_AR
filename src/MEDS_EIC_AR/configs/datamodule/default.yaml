@@ -1,3 +1,6 @@
 defaults:
   - config: MEDSTorchDataConfig # Added in the structured config store
 _target_: "MEDS_EIC_AR.lightning.datamodule.Datamodule"
+
+batch_size: ???
+num_workers: null

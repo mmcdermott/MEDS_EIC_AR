@@ -56,6 +56,7 @@ def pretrained_model(preprocessed_dataset: Path) -> Path:
             "MEICAR_pretrain",
             f"model_dir={model_dir!s}",
             f"datamodule.config.tensorized_cohort_dir={preprocessed_dataset!s}",
+            "datamodule.batch_size=2",
             "trainer=demo",
         ]
 

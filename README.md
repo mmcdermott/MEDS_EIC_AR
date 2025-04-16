@@ -64,6 +64,7 @@ directory to store the pretrained model artifacts called `$PRETRAINED_MODEL_DIR`
 ```bash
 MEICAR_pretrain datamodule.config.tensorized_cohort_dir="$FINAL_DATA_DIR" \
     model_dir="$PRETRAINED_MODEL_DIR" \
+    datamodule.batch_size=32 \
     trainer.max_epochs=10
 ```
 
