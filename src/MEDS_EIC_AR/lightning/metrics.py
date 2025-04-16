@@ -1,7 +1,12 @@
+import logging
+
 import torch
 from meds_torchdata import MEDSTorchBatch
+from omegaconf import ListConfig
 from torchmetrics import Accuracy, Metric, MetricCollection
 from torchmetrics.text import Perplexity
+
+logger = logging.getLogger(__name__)
 
 
 class NextCodeMetrics(Metric):
@@ -58,10 +63,21 @@ class NextCodeMetrics(Metric):
         match top_k:
             case int():
                 top_k = [top_k]
-            case list() if all(isinstance(k, int) for k in top_k):
+            case list() | ListConfig() if all(isinstance(k, int) for k in top_k):
                 pass
             case _:
                 raise ValueError(f"Invalid type for top_k. Want list[int] | int, got {type(top_k)}")
+
+        if max(top_k) >= vocab_size:
+            logger.warning(
+                f"Top-k accuracy requested for k ({max(top_k)} >= vocab_size ({vocab_size}). "
+                f"This is not a valid metric. Filtering to only requested k < {vocab_size}."
+            )
+            top_k = [k for k in top_k if k < vocab_size]
+
+        if not top_k:
+            logger.warning("No valid top-k accuracy requested. Adding top-k of 1.")
+            top_k = [1]
 
         acc_kwargs = {
             "task": "multiclass",

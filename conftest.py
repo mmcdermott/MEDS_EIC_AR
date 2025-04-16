@@ -48,6 +48,31 @@ def preprocessed_dataset(simple_static_MEDS: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
+def pretrained_model(preprocessed_dataset: Path) -> Path:
+    with tempfile.TemporaryDirectory() as model_dir:
+        model_dir = Path(model_dir)
+
+        cmd = [
+            "MEICAR_pretrain",
+            f"model_dir={model_dir!s}",
+        ]
+
+        out = subprocess.run(cmd, capture_output=True, check=False)
+
+        err_lines = [
+            "Command failed:",
+            "Stdout:",
+            out.stdout.decode(),
+            "Stderr:",
+            out.stderr.decode(),
+        ]
+
+        if out.returncode != 0:
+            raise ValueError("\n".join([*err_lines, f"Return code: {out.returncode}"]))
+        yield model_dir
+
+
+@pytest.fixture(scope="session")
 def dataset_config(preprocessed_dataset: Path) -> MEDSTorchDataConfig:
     """Fixture to create a dataset configuration."""
     return MEDSTorchDataConfig(tensorized_cohort_dir=preprocessed_dataset, max_seq_len=10)

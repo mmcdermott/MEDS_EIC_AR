@@ -14,15 +14,15 @@ logger = logging.getLogger(__name__)
 CONFIGS = files("MEDS_EIC_AR") / "configs"
 
 cs = ConfigStore.instance()
-cs.store(group="dataset/cfg", name="MEDSTorchDataConfig", node=MEDSTorchDataConfig)
-cfg_node = cs.repo["dataset"]["cfg"]["MEDSTorchDataConfig.yaml"].node
+cs.store(group="datamodule/config", name="MEDSTorchDataConfig", node=MEDSTorchDataConfig)
+cfg_node = cs.repo["datamodule"]["config"]["MEDSTorchDataConfig.yaml"].node
 with open_dict(cfg_node):
     cfg_node["_target_"] = "meds_torchdata.MEDSTorchDataConfig"
 
 
 @hydra.main(version_base=None, config_path=str(CONFIGS), config_name="_pretrain")
 def pretrain(cfg: DictConfig):
-    D = instantiate(cfg.dataset)
+    D = instantiate(cfg.datamodule)
     metadata_df = pl.read_parquet(D.config.tensorized_cohort_dir / code_metadata_filepath, use_pyarrow=True)
     D.vocab_size = metadata_df.select(pl.col("code/vocab_index")).max().item() + 1
 
