@@ -2,8 +2,10 @@ input_dir: ${oc.env:RAW_MEDS_DIR}
 output_dir: ${oc.env:MTD_INPUT_DIR}
 
 stages:
-  - add_time_interval_tokens:
-      time_delta:
+  - add_time_derived_measurements:
+      age: null
+      time_of_day: null
+      timeline_tokens:
         time_unit: years
   - count_codes:
       aggregations:
@@ -32,28 +34,29 @@ stages:
         - name: values/quantiles
           quantiles: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     _base_stage: aggregate_code_metadata
-  - quantile_binning:
-      custom_quantiles:
-        TIME//DELTA//TOKEN:
-          values/quantile/1: 0.00000190258 # 1 minute
-          values/quantile/2: 0.00000951293 # 5 minutes
-          values/quantile/3: 0.00001902587 # 10 minutes
-          values/quantile/4: 0.00005707762 # 30 minutes
-          values/quantile/5: 0.00011415525 # 1 hour
-          values/quantile/6: 0.00034246575 # 3 hours
-          values/quantile/7: 0.0006849315 # 6 hours
-          values/quantile/8: 0.00136986301 # 12 hours
-          values/quantile/9: 0.00273972602 # 1 day
-          values/quantile/10: 0.00547945205 # 2 days
-          values/quantile/11: 0.0109589041 # 4 days
-          values/quantile/12: 0.01917808219 # 7 days
-          values/quantile/13: 0.03835616438 # 14 days
-          values/quantile/14: 0.08219178082 # 30 days
-          values/quantile/15: 0.16438356164 # 60 days
-          values/quantile/16: 0.32876712328 # 120 days
-          values/quantile/17: 1 # 1 year
-          values/quantile/18: 2 # 2 years
-          values/quantile/19: 5 # 5 years
-          values/quantile/20: 10 # 10 years
-          values/quantile/21: 20 # 20 years
-          values/quantile/22: 40 # 40 years
+  - bin_numeric_values:
+      do_drop_numeric_value: True
+      custom_bins:
+        TIMELINE//DELTA//years:
+          1_minute: 0.00000190258
+          5_minutes: 0.00000951293
+          10_minutes: 0.00001902587
+          30_minutes: 0.00005707762
+          1_hour: 0.00011415525
+          3_hours: 0.00034246575
+          6_hours: 0.0006849315
+          12_hours: 0.00136986301
+          1_day: 0.00273972602
+          2_days: 0.00547945205
+          4_days: 0.0109589041
+          7_days: 0.01917808219
+          14_days: 0.03835616438
+          30_days: 0.08219178082
+          60_days: 0.16438356164
+          120_days: 0.32876712328
+          1_year: 1
+          2_years: 2
+          5_years: 5
+          10_years: 10
+          20_years: 20
+          40_years: 40
