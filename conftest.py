@@ -2,7 +2,9 @@
 
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock
@@ -94,9 +96,26 @@ def sample_batch(pytorch_dataset: MEDSPytorchDataset) -> MEDSTorchBatch:
     return next(iter(dataloader))
 
 
-@pytest.fixture(scope="session", autouse=True)
+@contextmanager
+def print_warnings(caplog: pytest.LogCaptureFixture):
+    """Captures all logged warnings within this context block and prints them upon exit.
+
+    This is useful in doctests, where you want to show printed outputs for documentation and testing purposes.
+    """
+
+    n_current_records = len(caplog.records)
+
+    with caplog.at_level("WARNING"):
+        yield
+    # Print all captured warnings upon exit
+    for record in caplog.records[n_current_records:]:
+        print(f"Warning: {record.getMessage()}")
+
+
+@pytest.fixture(autouse=True)
 def _setup_doctest_namespace(
     doctest_namespace: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
     simple_static_MEDS: Path,
     simple_static_MEDS_dataset_with_task: Path,
     sample_batch: MEDSTorchBatch,
@@ -105,6 +124,7 @@ def _setup_doctest_namespace(
 ):
     doctest_namespace.update(
         {
+            "print_warnings": partial(print_warnings, caplog),
             "MagicMock": MagicMock,
             "Mock": Mock,
             "datetime": datetime,

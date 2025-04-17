@@ -151,6 +151,35 @@ class NextCodeMetrics(Metric):
         >>> M(logits, batch)
         {'Accuracy/top_1': tensor(0.6667), 'Accuracy/top_2': tensor(1.), 'Accuracy/top_3': tensor(1.),
          'perplexity': tensor(3.1896)}
+
+    You can also run on a single `top_k`:
+
+        >>> M = NextCodeMetrics(top_k=1, vocab_size=4)
+
+    If `top_k` is not an int or a list of ints, an error is raised:
+
+        >>> M = NextCodeMetrics(top_k=[1, "foo"], vocab_size=4)
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid type for top_k. Want list[int] | int, got <class 'list'> ([1, 'foo']).
+
+    If the max `top_k` is greater than the vocab size, a warning is logged and the `top_k` is filtered to only
+    those valid `top_k` values:
+
+        >>> with print_warnings():
+        ...     M = NextCodeMetrics(top_k=[1, 2, 3], vocab_size=3)
+        Warning: Top-k accuracy requested for k (3 >= vocab_size (3). This is not a valid metric. Filtering to
+        only requested k < 3.
+        >>> sorted(M.accuracies.keys())
+        ['Accuracy/top_1', 'Accuracy/top_2']
+
+    If no valid `top_k` is requested, a warning is logged and the `top_k` is set to 1:
+
+        >>> with print_warnings():
+        ...     M = NextCodeMetrics(top_k=[], vocab_size=2)
+        Warning: No valid top-k accuracy requested. Adding top-k of 1.
+        >>> sorted(M.accuracies.keys())
+        ['Accuracy/top_1']
     """
 
     def __init__(self, top_k: list[int] | int, vocab_size: int, ignore_index: int = 0, **base_metric_kwargs):
@@ -162,9 +191,11 @@ class NextCodeMetrics(Metric):
             case list() | ListConfig() if all(isinstance(k, int) for k in top_k):
                 pass
             case _:
-                raise ValueError(f"Invalid type for top_k. Want list[int] | int, got {type(top_k)}")
+                raise ValueError(
+                    f"Invalid type for top_k. Want list[int] | int, got {type(top_k)} ({top_k})."
+                )
 
-        if max(top_k) >= vocab_size:
+        if top_k and (max(top_k) >= vocab_size):
             logger.warning(
                 f"Top-k accuracy requested for k ({max(top_k)} >= vocab_size ({vocab_size}). "
                 f"This is not a valid metric. Filtering to only requested k < {vocab_size}."
