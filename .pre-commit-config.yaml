@@ -22,7 +22,7 @@ repos:
 
   # python code formatting, linting, and import sorting using ruff
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.5
+    rev: v0.11.6
     hooks:
       # Run the formatter
       - id: ruff-format
@@ -63,9 +63,7 @@ repos:
           - mdformat-gfm-alerts
           - mdformat-tables
           - mdformat_frontmatter
-          - mdformat-black
           - mdformat-config
-          - mdformat-shfmt
           - mdformat-mkdocs
           - mdformat-toc
 
