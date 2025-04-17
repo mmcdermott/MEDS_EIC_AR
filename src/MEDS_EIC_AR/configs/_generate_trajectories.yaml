@@ -1,0 +1,16 @@
+defaults:
+  - datamodule: generate_trajectories
+  - trainer: default
+
+model_initialization_dir: ???
+generation_context_size: ???
+output_dir: ???
+
+pretrained_model_config: ${load_yaml_file:${model_initialization_dir}/config.yaml}
+ckpt_path: ${model_initialization_dir}/best_model.ckpt
+
+log_dir: ${output_dir}/.logs
+
+hydra:
+  run:
+    dir: "${log_dir}"

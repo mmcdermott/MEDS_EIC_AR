@@ -10,6 +10,7 @@ from typing import Any
 from unittest.mock import MagicMock, Mock
 
 import pytest
+from meds_testing_helpers.dataset import MEDSDataset
 from meds_torchdata import MEDSPytorchDataset, MEDSTorchBatch, MEDSTorchDataConfig
 from torch.utils.data import DataLoader
 
@@ -50,6 +51,36 @@ def preprocessed_dataset(simple_static_MEDS: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
+def dataset_config(preprocessed_dataset: Path) -> MEDSTorchDataConfig:
+    """Fixture to create a dataset configuration."""
+    return MEDSTorchDataConfig(tensorized_cohort_dir=preprocessed_dataset, max_seq_len=10)
+
+
+@pytest.fixture(scope="session")
+def pytorch_dataset(dataset_config: MEDSTorchDataConfig) -> MEDSPytorchDataset:
+    """Fixture to create a PyTorch dataset."""
+    return MEDSPytorchDataset(dataset_config, split="train")
+
+
+@pytest.fixture(scope="session")
+def sample_batch(pytorch_dataset: MEDSPytorchDataset) -> MEDSTorchBatch:
+    """Fixture to create a sample batch."""
+    dataloader = DataLoader(pytorch_dataset, batch_size=2, shuffle=False, collate_fn=pytorch_dataset.collate)
+    return next(iter(dataloader))
+
+
+@pytest.fixture(scope="session")
+def preprocessed_dataset_with_task(
+    preprocessed_dataset: Path, simple_static_MEDS_dataset_with_task: Path
+) -> tuple[Path, Path, str]:
+    D = MEDSDataset(root_dir=simple_static_MEDS_dataset_with_task)
+    if len(D.task_names) != 1:  # pragma: no cover
+        raise ValueError("Expected only one task in the dataset.")
+
+    yield preprocessed_dataset, D.task_root_dir, D.task_names[0]
+
+
+@pytest.fixture(scope="session")
 def pretrained_model(preprocessed_dataset: Path) -> Path:
     with tempfile.TemporaryDirectory() as model_dir:
         model_dir = Path(model_dir)
@@ -78,22 +109,38 @@ def pretrained_model(preprocessed_dataset: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
-def dataset_config(preprocessed_dataset: Path) -> MEDSTorchDataConfig:
-    """Fixture to create a dataset configuration."""
-    return MEDSTorchDataConfig(tensorized_cohort_dir=preprocessed_dataset, max_seq_len=10)
+def generated_trajectories(
+    pretrained_model: Path, preprocessed_dataset_with_task: tuple[Path, Path, str]
+) -> Path:
+    tensorized_cohort_dir, task_root_dir, task_name = preprocessed_dataset_with_task
+    model_initialization_dir = pretrained_model
 
+    with tempfile.TemporaryDirectory() as output_dir:
+        output_dir = Path(output_dir)
 
-@pytest.fixture(scope="session")
-def pytorch_dataset(dataset_config: MEDSTorchDataConfig) -> MEDSPytorchDataset:
-    """Fixture to create a PyTorch dataset."""
-    return MEDSPytorchDataset(dataset_config, split="train")
+        cmd = [
+            "MEICAR_generate_trajectories",
+            f"output_dir={output_dir!s}",
+            f"model_initialization_dir={model_initialization_dir!s}",
+            f"datamodule.config.tensorized_cohort_dir={tensorized_cohort_dir!s}",
+            f"datamodule.config.task_labels_dir={(task_root_dir / task_name)!s}",
+            "datamodule.batch_size=2",
+            "trainer=demo",
+        ]
 
+        out = subprocess.run(cmd, capture_output=True, check=False)
 
-@pytest.fixture(scope="session")
-def sample_batch(pytorch_dataset: MEDSPytorchDataset) -> MEDSTorchBatch:
-    """Fixture to create a sample batch."""
-    dataloader = DataLoader(pytorch_dataset, batch_size=2, shuffle=False, collate_fn=pytorch_dataset.collate)
-    return next(iter(dataloader))
+        err_lines = [
+            "Command failed:",
+            "Stdout:",
+            out.stdout.decode(),
+            "Stderr:",
+            out.stderr.decode(),
+        ]
+
+        if out.returncode != 0:
+            raise ValueError("\n".join([*err_lines, f"Return code: {out.returncode}"]))
+        yield output_dir
 
 
 @contextmanager

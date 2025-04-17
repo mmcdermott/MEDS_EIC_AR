@@ -23,6 +23,8 @@ class MEICARModule(L.LightningModule):
         self.optimizer_factory = optimizer
         self.LR_scheduler_factory = LR_scheduler
 
+        self.save_hyperparameters()
+
     def _log_metrics(
         self, loss: torch.Tensor, outputs: CausalLMOutputWithPast, batch: MEDSTorchBatch, stage: str
     ):

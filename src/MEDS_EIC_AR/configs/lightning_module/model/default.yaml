@@ -4,5 +4,5 @@ gpt_kwargs:
   num_hidden_layers: 2
   num_attention_heads: 2
   hidden_size: 4
-  max_position_embeddings: ${datamodule.config.max_seq_len}
+  max_position_embeddings: ???
   vocab_size: ???
