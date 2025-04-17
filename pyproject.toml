@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
   "polars~=1.26.0", "pyarrow", "hydra-core", "numpy", "meds==0.3.3", "filelock", "pytest",
-  "meds_testing_helpers~=0.2.6", "MEDS_transforms~=0.4.0", "meds-torch-data~=0.5.0", "transformers", "torch",
+  "meds_testing_helpers~=0.2.6", "MEDS_transforms~=0.4.2", "meds-torch-data~=0.5.0", "transformers", "torch",
   "torchmetrics", "lightning~=2.5.1"
 ]
 
@@ -41,10 +41,6 @@ Issues = "https://github.com/mmcdermott/MEDS_EIC_AR/issues"
 MEICAR_process_data = "MEDS_EIC_AR.preprocessing.__main__:process_data"
 # Model training
 MEICAR_pretrain = "MEDS_EIC_AR.__main__:pretrain"
-
-[project.entry-points."MEDS_transforms.stages"]
-add_time_interval_tokens = "MEDS_EIC_AR.preprocessing.add_time_interval_tokens:map_fntr"
-quantile_binning = "MEDS_EIC_AR.preprocessing.quantile_binning:main"
 
 [tool.pytest.ini_options]
 addopts = [
