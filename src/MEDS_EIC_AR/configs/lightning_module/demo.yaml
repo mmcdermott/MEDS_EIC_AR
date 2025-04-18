@@ -1,6 +1,7 @@
 defaults:
   - default
   - override model: demo
+  - override LR_scheduler: null
   - _self_
 
 metrics:

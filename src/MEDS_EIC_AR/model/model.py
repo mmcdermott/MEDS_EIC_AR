@@ -30,21 +30,18 @@ class Model(torch.nn.Module):
             include 'max_position_embeddings', 'vocab_size', 'hidden_size', etc.
 
     Examples:
-        >>> import polars as pl
-        >>> metadata_df = pl.read_parquet(preprocessed_dataset / "metadata" / "codes.parquet")
-        >>> vocab_size = metadata_df.select(pl.col("code/vocab_index")).max().item() + 1
-        >>> print(f"Vocab size: {vocab_size}")
-        Vocab size: 39
         >>> _ = torch.manual_seed(0)
         >>> model = Model({
         ...     "num_hidden_layers": 2,
         ...     "num_attention_heads": 2,
         ...     "hidden_size": 4,
         ...     "max_position_embeddings": 10,
-        ...     "vocab_size": vocab_size,
+        ...     "vocab_size": dataset_config.vocab_size,
         ... })
         >>> model.max_seq_len
         10
+        >>> model.vocab_size
+        39
         >>> loss, outputs = model(sample_batch)
         >>> print(loss)
         tensor(3.6660, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
@@ -58,6 +55,23 @@ class Model(torch.nn.Module):
                 [[ 0.0203,  ...,  0.0193], ..., [ 0.0145, ...,  0.0163]]],
                dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
+        >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
+        >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
+        HF_model.gpt_neox.embed_in.weight (torch.Size([39, 4])): Parameter containing:
+        tensor([[-0.0247, -0.0222,  0.0160,  0.0219],
+                ...,
+                [-0.0050, -0.0061, -0.0358,  0.0136]],
+               dtype=torch.float16,
+               requires_grad=True)
+        >>> print(f"Sample parameter grad?: {sample_param.grad}")
+        Sample parameter grad?: None
+        >>> loss.backward()
+        >>> print(f"Sample parameter grad?: {sample_param.grad}")
+        Sample parameter grad?:
+        tensor([[ 0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00],
+                ...,
+                [ 6.4240e-03, -5.7495e-02, -2.8915e-02,  7.9956e-02]],
+               dtype=torch.float16)
     """
 
     HF_model_config: GPTNeoXConfig
