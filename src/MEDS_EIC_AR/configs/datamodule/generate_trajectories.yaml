@@ -4,6 +4,6 @@ defaults:
 
 config:
   task_labels_dir: ???
-  max_seq_len: ${generation_context_size}
+  max_seq_len: ${_generation_context_size}
   seq_sampling_strategy: TO_END
   padding_side: LEFT

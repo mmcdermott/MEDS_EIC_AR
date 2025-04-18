@@ -82,12 +82,12 @@ def preprocessed_dataset_with_task(
 
 @pytest.fixture(scope="session")
 def pretrained_model(preprocessed_dataset: Path) -> Path:
-    with tempfile.TemporaryDirectory() as model_dir:
-        model_dir = Path(model_dir)
+    with tempfile.TemporaryDirectory() as output_dir:
+        output_dir = Path(output_dir)
 
         cmd = [
             "MEICAR_pretrain",
-            f"model_dir={model_dir!s}",
+            f"output_dir={output_dir!s}",
             f"datamodule.config.tensorized_cohort_dir={preprocessed_dataset!s}",
             "datamodule.batch_size=2",
             "trainer=demo",
@@ -105,7 +105,7 @@ def pretrained_model(preprocessed_dataset: Path) -> Path:
 
         if out.returncode != 0:
             raise ValueError("\n".join([*err_lines, f"Return code: {out.returncode}"]))
-        yield model_dir
+        yield output_dir
 
 
 @pytest.fixture(scope="session")

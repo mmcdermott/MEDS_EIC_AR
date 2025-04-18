@@ -11,6 +11,7 @@ from MEDS_transforms.runner import load_yaml_file  # noqa: F401
 from omegaconf import DictConfig, OmegaConf
 
 from .lightning import MEICARModule
+from .utils import resolve_generation_context_size  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ MEDSTorchDataConfig.add_to_config_store("datamodule/config")
 def pretrain(cfg: DictConfig):
     st = datetime.now(tz=UTC)
 
-    OmegaConf.save(cfg, Path(cfg.model_dir) / "config.yaml")
+    OmegaConf.save(cfg, Path(cfg.output_dir) / "config.yaml")
 
     D = instantiate(cfg.datamodule)
 
@@ -41,7 +42,7 @@ def pretrain(cfg: DictConfig):
     if not best_ckpt_path.is_file():
         raise ValueError("No best checkpoint reported.")
 
-    output_fp = Path(cfg.model_dir) / "best_model.ckpt"
+    output_fp = Path(cfg.output_dir) / "best_model.ckpt"
     shutil.copyfile(best_ckpt_path, output_fp)
 
     best_score = trainer.checkpoint_callback.best_model_score
@@ -56,13 +57,12 @@ def generate_trajectories(cfg: DictConfig):
 
     D = instantiate(cfg.datamodule)
 
-    M = instantiate(cfg.lightning_module)
     M = MEICARModule.load_from_checkpoint(cfg.ckpt_path)
     M.eval()
 
     trainer = instantiate(cfg.trainer)
 
-    trainer.predict(D)
+    trainer.predict(M, D)
 
     raise NotImplementedError("Trajectory generation is not implemented yet.")
 
