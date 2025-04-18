@@ -1,7 +1,0 @@
-defaults:
-  - default
-  - _self_
-
-model:
-  gpt_kwargs:
-    max_position_embeddings: ${datamodule.config.max_seq_len}

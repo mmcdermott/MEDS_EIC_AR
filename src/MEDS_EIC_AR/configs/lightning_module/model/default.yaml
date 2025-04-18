@@ -1,8 +1,9 @@
 _target_: MEDS_EIC_AR.model.Model
 
 gpt_kwargs:
-  num_hidden_layers: 2
-  num_attention_heads: 2
-  hidden_size: 4
+  num_hidden_layers: ???
+  num_attention_heads: ???
+  hidden_size: ???
+  intermediate_size: ${prod:${.hidden_size},4}
   max_position_embeddings: ???
   vocab_size: ???

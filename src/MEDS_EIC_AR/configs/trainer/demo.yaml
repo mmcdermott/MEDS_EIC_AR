@@ -7,3 +7,5 @@ accelerator: cpu
 devices: 1
 max_epochs: 2
 deterministic: True
+detect_anomaly: True
+overfit_batches: 2

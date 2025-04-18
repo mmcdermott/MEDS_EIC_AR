@@ -5,6 +5,7 @@ from omegaconf import DictConfig
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
+    GenerationConfig,
     GPTNeoXConfig,
     GPTNeoXForCausalLM,
 )
@@ -42,6 +43,8 @@ class Model(torch.nn.Module):
         ...     "max_position_embeddings": 10,
         ...     "vocab_size": vocab_size,
         ... })
+        >>> model.max_seq_len
+        10
         >>> loss, outputs = model(sample_batch)
         >>> print(loss)
         tensor(3.6367, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
@@ -79,6 +82,11 @@ class Model(torch.nn.Module):
         else:
             self.HF_model = AutoModelForCausalLM.from_config(self.HF_model_config)
 
+    @property
+    def max_seq_len(self) -> int:
+        """The maximum sequence length of the model."""
+        return self.HF_model_config.max_position_embeddings
+
     def forward(self, batch: MEDSTorchBatch) -> tuple[torch.Tensor, CausalLMOutputWithPast]:
         outputs = self.HF_model(input_ids=batch.code, attention_mask=(batch.code == batch.PAD_INDEX))
         loss = F.cross_entropy(
@@ -88,4 +96,20 @@ class Model(torch.nn.Module):
         return loss, outputs
 
     def generate(self, batch: MEDSTorchBatch, **kwargs) -> torch.Tensor:
-        raise NotImplementedError("The generate method is not implemented.")
+        inputs = batch.code
+        attention_mask = inputs == batch.PAD_INDEX
+
+        generation_config = GenerationConfig(
+            max_length=self.max_seq_len,
+            do_sample=True,
+            num_beams=1,  # no beam search
+            temperature=1.0,
+            pad_token_id=batch.PAD_INDEX,
+        )
+
+        return self.HF_model.generate(
+            inputs,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+            **kwargs,
+        )

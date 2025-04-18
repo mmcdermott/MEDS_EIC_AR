@@ -11,7 +11,7 @@ from MEDS_transforms.runner import load_yaml_file  # noqa: F401
 from omegaconf import DictConfig, OmegaConf
 
 from .lightning import MEICARModule
-from .utils import resolve_generation_context_size  # noqa: F401
+from .utils import prod, resolve_generation_context_size  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +62,8 @@ def generate_trajectories(cfg: DictConfig):
 
     trainer = instantiate(cfg.trainer)
 
-    val_predictions = trainer.predict(model=M, dataloaders=D.val_dataloader())
-    held_out_predictions = trainer.predict(model=M, dataloaders=D.test_dataloader())
+    val_predictions = trainer.predict(model=M, dataloaders=D.val_dataloader())  # noqa: F841
+    held_out_predictions = trainer.predict(model=M, dataloaders=D.test_dataloader())  # noqa: F841
 
     raise NotImplementedError("Trajectory generation is not implemented yet.")
 

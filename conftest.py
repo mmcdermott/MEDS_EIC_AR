@@ -87,10 +87,9 @@ def pretrained_model(preprocessed_dataset: Path) -> Path:
 
         cmd = [
             "MEICAR_pretrain",
+            "--config-name=_demo_pretrain",
             f"output_dir={output_dir!s}",
             f"datamodule.config.tensorized_cohort_dir={preprocessed_dataset!s}",
-            "datamodule.batch_size=2",
-            "trainer=demo",
         ]
 
         out = subprocess.run(cmd, capture_output=True, check=False)

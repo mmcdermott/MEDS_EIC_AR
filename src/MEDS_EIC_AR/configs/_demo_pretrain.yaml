@@ -1,0 +1,10 @@
+defaults:
+  - _pretrain
+  - override lightning_module: demo
+  - override trainer: demo
+
+max_seq_len: 10
+
+datamodule:
+  batch_size: 2
+  num_workers: 0

@@ -3,6 +3,30 @@ from omegaconf import DictConfig
 
 
 @OmegaConfResolver
+def prod(x: int, y: int) -> int:
+    """Returns the closest integer to the product of x and y.
+
+    This function can be used in omega conf configs as a resolved function.
+
+    Args:
+        x: The first integer.
+        y: The second integer.
+
+    Returns:
+        The closest integer to the product of x and y.
+
+    Examples:
+        >>> prod(2, 3)
+        6
+        >>> prod(2, 3.5)
+        7
+        >>> prod(2.49, 3)
+        7
+    """
+    return round(x * y)
+
+
+@OmegaConfResolver
 def resolve_generation_context_size(seq_lens: DictConfig) -> int:
     """Resolves the target generation context (input) size for the model.
 
