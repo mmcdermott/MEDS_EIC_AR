@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import torch.nn.functional as F
 from meds_torchdata import MEDSTorchBatch
@@ -11,10 +13,13 @@ from transformers import (
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+logger = logging.getLogger(__name__)
+
 try:
     import flash_attn  # noqa: F401
 
     HAS_FLASH_ATTN = True
+    logger.info("FlashAttention is available.")
 except ImportError:
     HAS_FLASH_ATTN = False
 
@@ -50,17 +55,15 @@ class Model(torch.nn.Module):
         >>> print(f"Logits shape: {outputs.logits.shape}")
         Logits shape: torch.Size([2, 9, 39])
         >>> print(outputs.logits)
-        tensor([[[ 0.0197, ...,  0.0197], ..., [ 0.0138, ...,  0.0166]],
+        tensor([[[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.3763e-02, ...,  1.6571e-02]],
         <BLANKLINE>
-                [[ 0.0203,  ...,  0.0193], ..., [ 0.0145, ...,  0.0163]]],
+                [[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.4458e-02, ...,  1.6281e-02]]],
                dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
         >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
         HF_model.gpt_neox.embed_in.weight (torch.Size([39, 4])): Parameter containing:
-        tensor([[-0.0247, -0.0222,  0.0160,  0.0219],
-                ...,
-                [-0.0050, -0.0061, -0.0358,  0.0136]],
+        tensor([[-0.0247, -0.0222,  0.0160,  0.0219], ..., [-0.0050, -0.0061, -0.0358,  0.0136]],
                dtype=torch.float16,
                requires_grad=True)
         >>> print(f"Sample parameter grad?: {sample_param.grad}")
@@ -70,7 +73,7 @@ class Model(torch.nn.Module):
         Sample parameter grad?:
         tensor([[ 0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00],
                 ...,
-                [ 6.4240e-03, -5.7495e-02, -2.8915e-02,  7.9956e-02]],
+                [ 1.5251e-02, -6.2347e-02, -3.1921e-02,  7.9102e-02]],
                dtype=torch.float16)
     """
 
@@ -89,6 +92,7 @@ class Model(torch.nn.Module):
             setattr(self.HF_model_config, key, val)
 
         if HAS_FLASH_ATTN:
+            logger.info("Using FlashAttention 2 for the model.")
             self.HF_model = AutoModelForCausalLM.from_config(
                 self.HF_model_config, attn_implementation="flash_attention_2"
             )
@@ -215,17 +219,18 @@ class Model(torch.nn.Module):
         )
         torch._assert(~all_samples_pad.any(), all_samples_pad_msg)
 
-    def _check_outputs(self, loss: torch.FloatTensor):
-        """Checks the outputs for various validity properties.
+    def _check_outputs(self, loss: torch.FloatTensor, outputs: CausalLMOutputWithPast):
+        """Logs a warning if the loss is inf or nan.
+
+        This does not raise an error because when this mode is enabled, typically detect anomaly is on in the
+        lightning trainer, and that gives more information about these issues than a generic assertion would.
 
         Validity checks:
             - The loss is not inf or nan.
+            - The logits contain inf or nan values.
 
         Args:
             loss: The loss tensor.
-
-        Raises:
-            AssertionError: If the loss contains inf or nan values.
 
         Examples:
             >>> model = Model({
@@ -235,30 +240,87 @@ class Model(torch.nn.Module):
             ...     "max_position_embeddings": 3,
             ...     "vocab_size": 10,
             ... })
-            >>> model._check_outputs(torch.FloatTensor([[0.1, 0.2], [0.3, 0.4]])) # no errors
-            >>> model._check_outputs(torch.FloatTensor([[0.1, float("inf")], [0.3, 0.4]]))
-            Traceback (most recent call last):
-                ...
-            AssertionError: Loss contains inf values.
-            >>> model._check_outputs(torch.FloatTensor([[0.1, float("nan")], [0.3, 0.4]]))
-            Traceback (most recent call last):
-                ...
-            AssertionError: Loss contains nan values.
+            >>> fake_output_valid = Mock(logits=torch.FloatTensor([[0.1, 0.2], [0.3, 0.4]]))
+            >>> model._check_outputs(torch.tensor(0.4), fake_output_valid) # no errors
+            >>> with print_warnings():
+            ...     model._check_outputs(torch.tensor(float("inf")), fake_output_valid)
+            ...     model._check_outputs(torch.tensor(float("nan")), fake_output_valid)
+            Warning: Loss contains inf values.
+            Warning: Loss contains nan values.
+            >>> fake_output_inf = Mock(logits=torch.FloatTensor([[float("inf"), 0.2], [0.3, 0.4]]))
+            >>> fake_output_nan = Mock(logits=torch.FloatTensor([[0.4, float("nan")], [0.3, float("nan")]]))
+            >>> with print_warnings():
+            ...     model._check_outputs(torch.tensor(0.4), fake_output_inf)
+            ...     model._check_outputs(torch.tensor(0.4), fake_output_nan)
+            Warning: Logits contains 1/4 inf values.
+            Warning: Logits contains 2/4 nan values.
         """
-        torch._assert(~torch.isinf(loss).any(), "Loss contains inf values.")
-        torch._assert(~torch.isnan(loss).any(), "Loss contains nan values.")
+
+        def _val(tensor: torch.Tensor) -> int | bool | float:
+            return tensor.detach().cpu().numpy().item()
+
+        if _val(torch.isinf(loss).any()):
+            logger.warning("Loss contains inf values.")
+        if _val(torch.isnan(loss).any()):
+            logger.warning("Loss contains nan values.")
+
+        logits = outputs.logits
+        inf_count = _val(torch.isinf(logits).sum())
+        if inf_count > 0:
+            logger.warning(f"Logits contains {inf_count}/{logits.numel()} inf values.")
+        nan_count = _val(torch.isnan(logits).sum())
+        if nan_count > 0:
+            logger.warning(f"Logits contains {nan_count}/{logits.numel()} nan values.")
+
+    def _hf_inputs(self, batch: MEDSTorchBatch) -> dict[str, torch.Tensor]:
+        """Converts the MEDSTorchBatch to a dictionary of inputs for the Hugging Face model.
+
+        HF relevant input keys:
+            - input_ids: The input sequence of token IDs. Captured in `batch.code`.
+            - attention_mask: A mask to avoid attending to padding tokens. See the
+              [documentation](https://huggingface.co/docs/transformers/en/model_doc/gpt_neox#transformers.GPTNeoXModel.forward.attention_mask)
+              for more details. Should be a tensor of shape `(batch_size, seq_len)` (same as `input_ids`) with
+              0s for tokens that are masked and 1s for tokens that are not masked. This means it is given by
+              `batch.code != batch.PAD_INDEX` as whenever the code is not a padding token, it should be
+              attended to.
+
+        Args:
+            batch: The input batch of data.
+
+        Returns:
+            A dictionary of inputs for the Hugging Face model.
+
+        Examples:
+            >>> model = Model({
+            ...     "num_hidden_layers": 2,
+            ...     "num_attention_heads": 2,
+            ...     "hidden_size": 4,
+            ...     "max_position_embeddings": 3,
+            ...     "vocab_size": 10,
+            ... })
+            >>> batch = Mock(code=torch.LongTensor([[0, 3, 1], [0, 0, 2]]), PAD_INDEX=0)
+            >>> model._hf_inputs(batch)
+            {'input_ids': tensor([[0, 3, 1],
+                                  [0, 0, 2]]),
+             'attention_mask': tensor([[False,  True,  True],
+                                       [False, False,  True]])}
+        """
+        return {
+            "input_ids": batch.code,
+            "attention_mask": (batch.code != batch.PAD_INDEX),
+        }
 
     def _forward_demo(self, batch: MEDSTorchBatch) -> tuple[torch.FloatTensor, CausalLMOutputWithPast]:
         """A demo forward pass that adds more checks and assertions."""
 
         self._check_inputs(batch)
         out = self._forward(batch)
-        self._check_outputs(out[0])
+        self._check_outputs(*out)
 
         return out
 
     def _forward(self, batch: MEDSTorchBatch) -> tuple[torch.FloatTensor, CausalLMOutputWithPast]:
-        outputs = self.HF_model(input_ids=batch.code, attention_mask=(batch.code == batch.PAD_INDEX))
+        outputs = self.HF_model(**self._hf_inputs(batch))
         loss = F.cross_entropy(
             outputs.logits[:, :-1].transpose(2, 1), batch.code[:, 1:], ignore_index=batch.PAD_INDEX
         )
@@ -266,8 +328,7 @@ class Model(torch.nn.Module):
         return loss, outputs
 
     def generate(self, batch: MEDSTorchBatch, **kwargs) -> torch.Tensor:
-        inputs = batch.code
-        attention_mask = inputs == batch.PAD_INDEX
+        for_hf = self._hf_inputs(batch)
 
         generation_config = GenerationConfig(
             max_length=self.max_seq_len,
@@ -278,8 +339,8 @@ class Model(torch.nn.Module):
         )
 
         return self.HF_model.generate(
-            inputs,
-            attention_mask=attention_mask,
+            for_hf.pop("input_ids"),
             generation_config=generation_config,
+            **for_hf,
             **kwargs,
         )
