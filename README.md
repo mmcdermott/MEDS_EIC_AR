@@ -82,4 +82,49 @@ the config path and name directly in the normal hydra manner.
 
 ### 3. Zero-shot Inference
 
+Zero-shot inference consists of two steps:
+
+1. Given a task cohort and a pre-trained model, for each sample in the task cohort, generate future
+    trajectories from those inputs forward with the pre-trained model and save them to disk in a pseudo-MEDS
+    format.
+2. Resolve these generated trajectories into concrete, probabilistic predictions for the task cohort.
+
+#### 3.1 Generate Trajectories for a task spec.
+
+You can directly generate trajectories using the `MEICAR_generate_trajectories` command. This requires a few
+more configuration parameters than the pre-training step, so let's go through those:
+
+1. You need to specify the task labels directory in the `datamodule.config.task_labels_dir` parameter.
+2. You need to specify the model initialization directory in the `model_initialization_dir` parameter. This
+    is the output directory of the pre-train step.
+3. You need to specify how you want to trade-off between allowed input context size and the maximum possible
+    generated trajectory length. The former allows you to use more of the patient's record, but the latter
+    controls how far into the future you can predict. This can be configured with one of three parameters in
+    the `seq_lens` part of the config. If you set:
+    - `seq_lens.generation_context_size`, that will be the maximum length of the input context, and the
+        remaining length of the pretrained model's maximum sequence length will be used for generation.
+    - `seq_lens.max_generated_trajectory_len`, that will be the maximum length of the generated trajectory,
+        and the remaining length of the pretrained model's maximum sequence length will be used for the
+        input.
+    - `seq_lens.frac_seq_len_as_context`, that will be the fraction of the pretrained model's maximum
+        sequence length that will be used for the input context, and the remaining length will be used for
+        generation. This is set by default to 0.25, which means that 25% of the maximum sequence length will
+        be used for the input context, and 75% will be used for generation. If you wish to use another mode
+        on the command line, be sure to set this to `null` to disable it.
+
+With that in mind, you can run the following command to generate trajectories for a task cohort:
+
+```bash
+MEICAR_generate_trajectories \
+    output_dir="$GENERATED_TRAJECTORIES_DIR" \
+    model_initialization_dir="$PRETRAINED_MODEL_DIR" \
+    datamodule.config.tensorized_cohort_dir="$FINAL_DATA_DIR" \
+    datamodule.config.task_labels_dir="$TASK_ROOT_DIR/$TASK_NAME" \
+    datamodule.batch_size=32
+```
+
+Not yet implemented.
+
+#### 3.2 Resolve Trajectories into Predictions.
+
 Not yet implemented.
