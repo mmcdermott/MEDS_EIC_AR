@@ -1,5 +1,6 @@
 defaults:
   - default
+  - _self_
 
 do_demo: True
 
@@ -7,3 +8,8 @@ gpt_kwargs:
   num_hidden_layers: 2
   num_attention_heads: 2
   hidden_size: 8
+
+  # No dropout in demo mode
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  classifier_dropout: 0.0

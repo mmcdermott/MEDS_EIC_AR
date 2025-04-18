@@ -2,8 +2,10 @@ defaults:
   - _pretrain
   - override lightning_module: demo
   - override trainer: demo
+  - _self_
 
 max_seq_len: 10
+seed: 1
 
 datamodule:
   batch_size: 2

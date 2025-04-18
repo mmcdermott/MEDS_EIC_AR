@@ -6,11 +6,12 @@ from pathlib import Path
 
 import hydra
 from hydra.utils import instantiate
+from lightning.pytorch import seed_everything
 from meds_torchdata import MEDSTorchDataConfig
 from MEDS_transforms.runner import load_yaml_file  # noqa: F401
 from omegaconf import DictConfig, OmegaConf
 
-from .lightning import MEICARModule
+from .training import MEICARModule
 from .utils import prod, resolve_generation_context_size  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,9 @@ def pretrain(cfg: DictConfig):
         model={"gpt_kwargs": {"vocab_size": D.config.vocab_size}},
         metrics={"vocab_size": D.config.vocab_size},
     )
+
+    if M.model.do_demo or cfg.get("seed", None):
+        seed_everything(cfg.get("seed", 1), workers=True)
 
     trainer = instantiate(cfg.trainer)
 

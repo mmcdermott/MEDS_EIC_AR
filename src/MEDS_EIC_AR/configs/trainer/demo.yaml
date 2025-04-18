@@ -9,3 +9,6 @@ max_epochs: 2
 deterministic: True
 detect_anomaly: True
 overfit_batches: 2
+precision: "32-true"
+
+log_every_n_steps: 1

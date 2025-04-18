@@ -62,6 +62,7 @@ class Model(torch.nn.Module):
 
     HF_model_config: GPTNeoXConfig
     HF_model: GPTNeoXForCausalLM
+    do_demo: bool
 
     def __init__(self, gpt_kwargs: dict | DictConfig, do_demo: bool = False):
         super().__init__()

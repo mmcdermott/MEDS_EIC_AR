@@ -6,6 +6,8 @@ model_initialization_dir: ???
 _generation_context_size: ${resolve_generation_context_size:${seq_lens}}
 output_dir: ???
 
+seed: null
+
 pretrained_model_config: ${load_yaml_file:${model_initialization_dir}/config.yaml}
 ckpt_path: ${model_initialization_dir}/best_model.ckpt
 
