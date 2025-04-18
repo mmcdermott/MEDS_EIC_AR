@@ -1,5 +1,7 @@
 _target_: MEDS_EIC_AR.model.Model
 
+do_demo: False
+
 gpt_kwargs:
   num_hidden_layers: ???
   num_attention_heads: ???

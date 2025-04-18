@@ -28,8 +28,12 @@ class MEICARModule(L.LightningModule):
     def _log_metrics(
         self, loss: torch.Tensor, outputs: CausalLMOutputWithPast, batch: MEDSTorchBatch, stage: str
     ):
-        self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log_dict({f"{stage}/{k}": v for k, v in self.metrics(outputs.logits, batch).items()})
+        batch_size = batch.batch_size
+        self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
+        self.log_dict(
+            {f"{stage}/{k}": v for k, v in self.metrics(outputs.logits, batch).items()},
+            batch_size=batch_size,
+        )
 
     def training_step(self, batch: MEDSTorchBatch):
         loss, outputs = self.model(batch)
