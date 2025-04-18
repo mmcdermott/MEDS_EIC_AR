@@ -54,3 +54,7 @@ class MEICARModule(L.LightningModule):
             }
         else:
             return optimizer
+
+    def predict_step(self, batch: MEDSTorchBatch):
+        """Produces generated trajectories for a given batch of data."""
+        return self.model.generate(batch)

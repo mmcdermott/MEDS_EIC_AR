@@ -36,7 +36,7 @@ def pretrain(cfg: DictConfig):
 
     trainer = instantiate(cfg.trainer)
 
-    trainer.fit(M, D)
+    trainer.fit(model=M, datamodule=D)
 
     best_ckpt_path = Path(trainer.checkpoint_callback.best_model_path)
     if not best_ckpt_path.is_file():
@@ -62,7 +62,8 @@ def generate_trajectories(cfg: DictConfig):
 
     trainer = instantiate(cfg.trainer)
 
-    trainer.predict(M, D)
+    val_predictions = trainer.predict(model=M, dataloaders=D.val_dataloader())
+    held_out_predictions = trainer.predict(model=M, dataloaders=D.test_dataloader())
 
     raise NotImplementedError("Trajectory generation is not implemented yet.")
 

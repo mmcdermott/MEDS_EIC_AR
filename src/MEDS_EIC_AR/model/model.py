@@ -86,3 +86,6 @@ class Model(torch.nn.Module):
         )
 
         return loss, outputs
+
+    def generate(self, batch: MEDSTorchBatch, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("The generate method is not implemented.")
