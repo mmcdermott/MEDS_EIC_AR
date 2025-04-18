@@ -75,6 +75,10 @@ class Model(torch.nn.Module):
                 ...,
                 [ 1.5251e-02, -6.2347e-02, -3.1921e-02,  7.9102e-02]],
                dtype=torch.float16)
+        >>> for name, param in model.named_parameters():
+        ...     if param.grad is not None:
+        ...         if not torch.isfinite(param.grad).all().detach().cpu().numpy().item():
+        ...             raise ValueError(f"Gradient for {name} is not finite.")
     """
 
     HF_model_config: GPTNeoXConfig
