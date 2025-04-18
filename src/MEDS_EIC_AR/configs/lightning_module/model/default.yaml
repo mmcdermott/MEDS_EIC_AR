@@ -1,6 +1,7 @@
 _target_: MEDS_EIC_AR.model.Model
 
 do_demo: False
+precision: ${trainer.precision}
 
 gpt_kwargs:
   # Model Shape

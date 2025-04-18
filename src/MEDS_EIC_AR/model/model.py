@@ -1,4 +1,5 @@
 import logging
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,20 @@ except ImportError:
     HAS_FLASH_ATTN = False
 
 
+def _val(tensor: torch.Tensor) -> int | bool | float:
+    """Returns the value of a scalar-tensor as a Python scalar.
+
+    Examples:
+        >>> _val(torch.tensor(1))
+        1
+        >>> _val(torch.tensor(1.0))
+        1.0
+        >>> _val(torch.tensor(False))
+        False
+    """
+    return tensor.detach().cpu().item()
+
+
 class Model(torch.nn.Module):
     """A basic GPT-NeoX like model for pre-training an autoregressive, "everything-is-code" model.
 
@@ -42,7 +57,7 @@ class Model(torch.nn.Module):
         ...     "hidden_size": 4,
         ...     "max_position_embeddings": 10,
         ...     "vocab_size": dataset_config.vocab_size,
-        ... })
+        ... }, precision="16-true")
         >>> model.max_seq_len
         10
         >>> model.vocab_size
@@ -77,15 +92,25 @@ class Model(torch.nn.Module):
                dtype=torch.float16)
         >>> for name, param in model.named_parameters():
         ...     if param.grad is not None:
-        ...         if not torch.isfinite(param.grad).all().detach().cpu().numpy().item():
+        ...         if not _val(torch.isfinite(param.grad).all()):
         ...             raise ValueError(f"Gradient for {name} is not finite.")
     """
 
     HF_model_config: GPTNeoXConfig
     HF_model: GPTNeoXForCausalLM
     do_demo: bool
+    precision: str
 
-    def __init__(self, gpt_kwargs: dict | DictConfig, do_demo: bool = False):
+    PRECISION_TO_MODEL_WEIGHTS_DTYPE: ClassVar[dict[str, torch.dtype]] = {
+        "32-true": torch.float32,
+        "16-true": torch.float16,
+        "16-mixed": torch.float32,
+        "bf16-true": torch.bfloat16,
+        "bf16-mixed": torch.float32,
+        "transformer-engine": torch.bfloat16,
+    }
+
+    def __init__(self, gpt_kwargs: dict | DictConfig, precision: str = "32-true", do_demo: bool = False):
         super().__init__()
 
         self.HF_model_config: GPTNeoXConfig = AutoConfig.from_pretrained("EleutherAI/gpt-neox-20b")
@@ -95,13 +120,13 @@ class Model(torch.nn.Module):
                 raise ValueError(f"Config for HF model gpt-neox does not have attribute {key}")
             setattr(self.HF_model_config, key, val)
 
+        extra_kwargs = {"torch_dtype": self.PRECISION_TO_MODEL_WEIGHTS_DTYPE.get(precision)}
+
         if HAS_FLASH_ATTN:
             logger.info("Using FlashAttention 2 for the model.")
-            self.HF_model = AutoModelForCausalLM.from_config(
-                self.HF_model_config, attn_implementation="flash_attention_2"
-            )
-        else:
-            self.HF_model = AutoModelForCausalLM.from_config(self.HF_model_config)
+            extra_kwargs["attn_implementation"] = "flash_attention_2"
+
+        self.HF_model = AutoModelForCausalLM.from_config(self.HF_model_config, **extra_kwargs)
 
         self.do_demo = do_demo
         if self.do_demo:
@@ -223,6 +248,45 @@ class Model(torch.nn.Module):
         )
         torch._assert(~all_samples_pad.any(), all_samples_pad_msg)
 
+    def _check_parameters(self):
+        """Logs a warning about the finiteness of any parameters in the model.
+
+        This is only used for advanced debugging. It does not raise an error because when this mode is
+        enabled, typically detect anomaly is on in the lightning trainer, and that gives more information
+        about these issues than a generic assertion would.
+
+        Validity checks:
+            - The parameters are not nan.
+            - The parameters are not inf.
+
+        Examples:
+            >>> model = Model({
+            ...     "num_hidden_layers": 2,
+            ...     "num_attention_heads": 2,
+            ...     "hidden_size": 4,
+            ...     "max_position_embeddings": 3,
+            ...     "vocab_size": 10,
+            ... })
+            >>> model.HF_model.gpt_neox.layers[1].attention.query_key_value.bias.shape
+            torch.Size([12])
+            >>> model.HF_model.gpt_neox.layers[1].attention.query_key_value.bias = torch.nn.Parameter(
+            ...     torch.tensor([float("nan"), 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.])
+            ... )
+            >>> with print_warnings():
+            ...     model._check_parameters()
+            Warning: Parameter HF_model.gpt_neox.layers.1.attention.query_key_value.bias contains 1/12 nan
+                values.
+        """
+
+        for n, p in self.named_parameters():
+            num_nan = _val(torch.isnan(p).sum())
+            num_inf = _val(torch.isinf(p).sum())
+
+            if num_nan > 0:
+                logger.warning(f"Parameter {n} contains {num_nan}/{p.numel()} nan values.")
+            if num_inf > 0:
+                logger.warning(f"Parameter {n} contains {num_inf}/{p.numel()} inf values.")
+
     def _check_outputs(self, loss: torch.FloatTensor, outputs: CausalLMOutputWithPast):
         """Logs a warning if the loss is inf or nan.
 
@@ -259,9 +323,6 @@ class Model(torch.nn.Module):
             Warning: Logits contains 1/4 inf values.
             Warning: Logits contains 2/4 nan values.
         """
-
-        def _val(tensor: torch.Tensor) -> int | bool | float:
-            return tensor.detach().cpu().numpy().item()
 
         if _val(torch.isinf(loss).any()):
             logger.warning("Loss contains inf values.")
@@ -318,6 +379,7 @@ class Model(torch.nn.Module):
         """A demo forward pass that adds more checks and assertions."""
 
         self._check_inputs(batch)
+        self._check_parameters()
         out = self._forward(batch)
         self._check_outputs(*out)
 
