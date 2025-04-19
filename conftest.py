@@ -14,6 +14,9 @@ from meds_testing_helpers.dataset import MEDSDataset
 from meds_torchdata import MEDSPytorchDataset, MEDSTorchBatch, MEDSTorchDataConfig
 from torch.utils.data import DataLoader
 
+from MEDS_EIC_AR.model.model import Model
+from MEDS_EIC_AR.training.module import MEICARModule
+
 
 @pytest.fixture(scope="session")
 def preprocessed_dataset(simple_static_MEDS: Path) -> Path:
@@ -108,6 +111,18 @@ def pretrained_model(preprocessed_dataset: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
+def pretrained_GPT_model(pretrained_model: Path) -> Model:
+    """Returns the HF model backbone of the pre-trained MEICAR Lightning Module."""
+
+    ckpt_path = pretrained_model / "best_model.ckpt"
+    if not ckpt_path.is_file():
+        raise ValueError("No best checkpoint reported.")
+
+    module = MEICARModule.load_from_checkpoint(ckpt_path)
+    return module.model
+
+
+@pytest.fixture(scope="session")
 def generated_trajectories(
     pretrained_model: Path, preprocessed_dataset_with_task: tuple[Path, Path, str]
 ) -> Path:
@@ -167,6 +182,8 @@ def _setup_doctest_namespace(
     sample_batch: MEDSTorchBatch,
     preprocessed_dataset: Path,
     dataset_config: MEDSTorchDataConfig,
+    pretrained_GPT_model: Model,
+    pytorch_dataset: MEDSPytorchDataset,
 ):
     doctest_namespace.update(
         {
@@ -180,5 +197,7 @@ def _setup_doctest_namespace(
             "preprocessed_dataset": preprocessed_dataset,
             "sample_batch": sample_batch,
             "dataset_config": dataset_config,
+            "pretrained_GPT_model": pretrained_GPT_model,
+            "pytorch_dataset": pytorch_dataset,
         }
     )

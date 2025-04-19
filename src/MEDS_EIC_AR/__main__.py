@@ -11,6 +11,7 @@ from meds_torchdata import MEDSTorchDataConfig
 from MEDS_transforms.runner import load_yaml_file  # noqa: F401
 from omegaconf import DictConfig, OmegaConf
 
+from .generation import format_trajectories, get_timeline_end_token_idx
 from .training import MEICARModule
 from .utils import prod, resolve_generation_context_size  # noqa: F401
 
@@ -29,9 +30,11 @@ def pretrain(cfg: DictConfig):
 
     D = instantiate(cfg.datamodule)
 
+    gpt_kwargs = {"vocab_size": D.config.vocab_size, "eos_token_id": get_timeline_end_token_idx(D.config)}
+
     M = instantiate(
         cfg.lightning_module,
-        model={"gpt_kwargs": {"vocab_size": D.config.vocab_size}},
+        model={"gpt_kwargs": gpt_kwargs},
         metrics={"vocab_size": D.config.vocab_size},
     )
 
@@ -62,14 +65,12 @@ def generate_trajectories(cfg: DictConfig):
     D = instantiate(cfg.datamodule)
 
     M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path))
-
     M.eval()
 
     trainer = instantiate(cfg.trainer)
 
-    val_predictions = trainer.predict(model=M, dataloaders=D.val_dataloader())  # noqa: F841
-    held_out_predictions = trainer.predict(model=M, dataloaders=D.test_dataloader())  # noqa: F841
-
-    raise NotImplementedError("Trajectory generation is not implemented yet.")
+    predictions = trainer.predict(model=M, dataloaders=D.test_dataloader())
+    prediction_df = format_trajectories(D.test_dataset, predictions)
+    prediction_df.write_parquet(Path(cfg.output_dir) / "trajectories.parquet", use_pyarrow=True)
 
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")

@@ -4,7 +4,7 @@ defaults:
   - override trainer: demo
   - _self_
 
-max_seq_len: 10
+max_seq_len: 20
 seed: 1
 
 datamodule:

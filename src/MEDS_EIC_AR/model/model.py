@@ -134,7 +134,11 @@ class Model(torch.nn.Module):
         else:
             self.forward = self._forward
 
-        self.hparams = {"gpt_kwargs": gpt_kwargs, "precision": precision, "do_demo": do_demo}
+        self.hparams = {
+            "gpt_kwargs": gpt_kwargs,
+            "precision": precision,
+            "do_demo": do_demo,
+        }
 
     @property
     def max_seq_len(self) -> int:
@@ -396,19 +400,64 @@ class Model(torch.nn.Module):
         return loss, outputs
 
     def generate(self, batch: MEDSTorchBatch, **kwargs) -> torch.Tensor:
+        """Generates a sequence of tokens from the model using the HF generation mixin.
+
+        Examples:
+            >>> _ = torch.manual_seed(0)
+            >>> model = Model({
+            ...     "num_hidden_layers": 2,
+            ...     "num_attention_heads": 2,
+            ...     "hidden_size": 4,
+            ...     "max_position_embeddings": 10,
+            ...     "vocab_size": dataset_config.vocab_size,
+            ... }, precision="16-true")
+
+        This model has a maximum sequence length of 10. If we check, our sample batch has a sequence length of
+        9:
+
+            >>> sample_batch.code.shape
+            torch.Size([2, 9])
+
+        This means that by default, the model will generate 1 token:
+
+            >>> print(model.generate(sample_batch))
+            tensor([[13],
+                    [31]])
+
+        If we create a model with a maximum sequence length of 20, we can generate 11 tokens:
+
+            >>> _ = torch.manual_seed(0)
+            >>> model = Model({
+            ...     "num_hidden_layers": 2,
+            ...     "num_attention_heads": 2,
+            ...     "hidden_size": 4,
+            ...     "max_position_embeddings": 20,
+            ...     "vocab_size": dataset_config.vocab_size,
+            ... }, precision="16-true")
+            >>> print(model.generate(sample_batch))
+            tensor([[13,  8, 27, 19,  6, 16, 29, 28, 35, 25,  9],
+                    [31, 17, 24, 34, 33,  8, 21, 20, 10, 33,  3]])
+        """
+
         for_hf = self._hf_inputs(batch)
 
         generation_config = GenerationConfig(
-            max_length=self.max_seq_len,
+            max_new_tokens=self.max_seq_len - batch.code.shape[1],
             do_sample=True,
             num_beams=1,  # no beam search
             temperature=1.0,
             pad_token_id=batch.PAD_INDEX,
+            bos_token_id=None,
+            eos_token_id=self.HF_model.config.eos_token_id,
         )
 
-        return self.HF_model.generate(
+        output_ids = self.HF_model.generate(
             for_hf.pop("input_ids"),
             generation_config=generation_config,
             **for_hf,
             **kwargs,
         )
+
+        input_seq_len = batch.code.shape[1]
+
+        return output_ids[:, input_seq_len:]
