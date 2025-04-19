@@ -52,6 +52,8 @@ Issues = "https://github.com/mmcdermott/MEDS_EIC_AR/issues"
 MEICAR_process_data = "MEDS_EIC_AR.preprocessing.__main__:process_data"
 # Model training
 MEICAR_pretrain = "MEDS_EIC_AR.__main__:pretrain"
+# Generation
+MEICAR_generate_trajectories = "MEDS_EIC_AR.__main__:generate_trajectories"
 
 [tool.pytest.ini_options]
 addopts = [
@@ -94,4 +96,4 @@ select = [
 "__init__.py" = ["F401"]  # Unused imports in __init__ files
 
 [tool.ruff.lint.pep8-naming]
-extend-ignore-names = ["*MEDS*", "F", "L", "M", "D", "LR_*"]  # Ignore MEDS in variable names
+extend-ignore-names = ["*MEDS*", "F", "L", "M", "D", "LR_*", "*GPT*"]  # Ignore MEDS in variable names

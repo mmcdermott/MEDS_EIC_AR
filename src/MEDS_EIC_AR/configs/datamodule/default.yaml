@@ -1,5 +1,7 @@
 defaults:
   - config: MEDSTorchDataConfig # Added in the structured config store
+  - _self_
+
 _target_: "meds_torchdata.extensions.lightning_datamodule.Datamodule"
 
 batch_size: ???

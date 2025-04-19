@@ -1,0 +1,8 @@
+defaults:
+  - default
+  - _self_
+
+gpt_kwargs:
+  num_hidden_layers: 3
+  num_attention_heads: 12
+  hidden_size: 1024
