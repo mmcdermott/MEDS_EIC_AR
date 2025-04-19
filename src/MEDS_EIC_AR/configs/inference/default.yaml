@@ -1,0 +1,5 @@
+generate_for_splits:
+  - tuning
+  - held_out
+
+N_trajectories_per_task_sample: 20

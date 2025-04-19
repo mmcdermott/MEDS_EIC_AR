@@ -1,6 +1,7 @@
 defaults:
   - datamodule: generate_trajectories
   - trainer: default
+  - inference: default
 
 model_initialization_dir: ???
 _generation_context_size: ${resolve_generation_context_size:${seq_lens}}
@@ -10,6 +11,8 @@ seed: null
 
 pretrained_model_config: ${load_yaml_file:${model_initialization_dir}/config.yaml}
 ckpt_path: ${model_initialization_dir}/best_model.ckpt
+
+do_overwrite: False
 
 seq_lens:
   max_generated_trajectory_len: null

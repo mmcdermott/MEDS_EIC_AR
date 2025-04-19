@@ -1,5 +1,33 @@
+from hashlib import sha256
+
 from MEDS_transforms.configs.utils import OmegaConfResolver
 from omegaconf import DictConfig
+
+
+def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
+    """Generates a hash-based seed for reproducibility.
+
+    This function generates a hash-based seed using the provided seed, split, and sample values. It is
+    designed to be used in conjunction with OmegaConf for configuration management.
+
+    Args:
+        seed: The original seed value. THIS WILL NOT OVERWRITE THE OUTPUT. Rather, this just ensures the
+            sequence of seeds chosen can be deterministically updated by changing a base parameter.
+        split: The split identifier.
+        sample: The sample index.
+
+    Returns:
+        A hash-based seed value.
+
+    Examples:
+        >>> hash_based_seed(42, "train", 0)
+        1508872876
+        >>> hash_based_seed(None, "held_out", 1)
+        3132876237
+    """
+
+    hash_str = f"{seed}_{split}_{sample}"
+    return int(sha256(hash_str.encode()).hexdigest(), 16) % (2**32 - 1)
 
 
 @OmegaConfResolver

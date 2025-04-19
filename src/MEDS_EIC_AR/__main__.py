@@ -7,13 +7,14 @@ from pathlib import Path
 import hydra
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
+from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchDataConfig
 from MEDS_transforms.runner import load_yaml_file  # noqa: F401
 from omegaconf import DictConfig, OmegaConf
 
 from .generation import format_trajectories, get_timeline_end_token_idx
 from .training import MEICARModule
-from .utils import prod, resolve_generation_context_size  # noqa: F401
+from .utils import hash_based_seed, prod, resolve_generation_context_size  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,38 @@ def generate_trajectories(cfg: DictConfig):
 
     trainer = instantiate(cfg.trainer)
 
-    predictions = trainer.predict(model=M, dataloaders=D.test_dataloader())
-    prediction_df = format_trajectories(D.test_dataset, predictions)
-    prediction_df.write_parquet(Path(cfg.output_dir) / "trajectories.parquet", use_pyarrow=True)
+    inference = cfg.inference
+
+    if cfg.get("seed", None):
+        seed_everything(cfg.get("seed", 1), workers=True)
+
+    for split in inference.generate_for_splits:
+        if split == train_split:
+            dataloader = D.train_dataloader()
+        elif split == tuning_split:
+            dataloader = D.val_dataloader()
+        elif split == held_out_split:
+            dataloader = D.test_dataloader()
+        else:
+            raise ValueError(f"Unknown split {split}.")
+
+        for sample in range(inference.N_trajectories_per_task_sample):
+            out_fp = Path(cfg.output_dir) / split / f"{sample}.parquet"
+            out_fp.parent.mkdir(parents=True, exist_ok=True)
+
+            if out_fp.is_file() and not cfg.do_overwrite:
+                logger.info(f"Skipping {out_fp} as it already exists.")
+                continue
+            else:
+                out_fp.parent.mkdir(parents=True, exist_ok=True)
+
+            seed = hash_based_seed(cfg.get("seed", None), split, sample)
+
+            logger.info(f"Generating trajectories for {split} sample {sample} to {out_fp} with seed {seed}.")
+
+            seed_everything(seed, workers=True)
+            predictions = trainer.predict(model=M, dataloaders=dataloader, seed=seed)
+            predictions_df = format_trajectories(dataloader.dataset, predictions)
+            predictions_df.write_parquet(out_fp, use_pyarrow=True)
 
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")

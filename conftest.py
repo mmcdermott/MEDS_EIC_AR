@@ -154,6 +154,7 @@ def generated_trajectories(
 
         cmd = [
             "MEICAR_generate_trajectories",
+            "--config-name=_demo_generate_trajectories",
             f"output_dir={output_dir!s}",
             f"model_initialization_dir={model_initialization_dir!s}",
             f"datamodule.config.tensorized_cohort_dir={tensorized_cohort_dir!s}",
