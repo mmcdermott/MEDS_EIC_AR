@@ -211,6 +211,13 @@ class NextCodeMetrics(Metric):
         )
         self.perplexity = Perplexity(ignore_index=ignore_index)
 
+        self.hparams = {
+            "top_k": top_k,
+            "vocab_size": vocab_size,
+            "ignore_index": ignore_index,
+            **base_metric_kwargs,
+        }
+
     def update(self, logits: torch.Tensor, batch: MEDSTorchBatch):
         """Update the metric with the current batch and logits, sliced to match targets and predictions.
 

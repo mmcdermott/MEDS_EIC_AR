@@ -1,0 +1,10 @@
+defaults:
+  - default
+  - _self_
+
+generate_for_splits:
+  - train
+  - tuning
+  - held_out
+
+N_trajectories_per_task_sample: 2

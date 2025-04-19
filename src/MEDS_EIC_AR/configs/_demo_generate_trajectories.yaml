@@ -1,0 +1,8 @@
+defaults:
+  - _generate_trajectories
+  - override inference: demo
+  - override trainer: demo
+  - _self_
+
+do_overwrite: True
+seed: 1
