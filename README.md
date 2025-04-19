@@ -111,8 +111,13 @@ more configuration parameters than the pre-training step, so let's go through th
         generation. This is set by default to 0.25, which means that 25% of the maximum sequence length will
         be used for the input context, and 75% will be used for generation. If you wish to use another mode
         on the command line, be sure to set this to `null` to disable it.
+4. Lastly, you need to specify how many trajectories per task sample you wish to generate, and for which
+    splits you wish to generate samples. You can do this via the `inference.generate_for_splits` and
+    `inference.N_trajectories_per_task_sample` parameters. The former is a list of splits to generate and the
+    latter is the number of trajectories to generate per task sample. The default is to generate 20
+    trajectories for each task sample in the tuning and held out splits.
 
-With that in mind, you can run the following command to generate trajectories for a task cohort:
+After these are set, you can run the following command to generate trajectories for a task cohort:
 
 ```bash
 MEICAR_generate_trajectories \
@@ -123,7 +128,11 @@ MEICAR_generate_trajectories \
     datamodule.batch_size=32
 ```
 
-Not yet implemented.
+This will generate trajectories for the task cohort and save them in the format:
+`$GENERATED_TRAJECTORIES_DIR/$SPLIT/$SAMPLE.parquet`.
+
+See the documentation for [`format_trajectories`](src/MEDS_EIC_AR/generation/format_trajectories.py) for more
+details on the format of the generated trajectories.
 
 #### 3.2 Resolve Trajectories into Predictions.
 
