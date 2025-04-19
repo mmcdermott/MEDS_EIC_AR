@@ -24,7 +24,7 @@ def test_generate_trajectories_runs(generated_trajectories: Path):
         assert len(samps) == 2, f"Expected 2 trajectories for split {sp}, but found {len(samps)}."
 
         try:
-            assert_frame_equal(samps[0], samps[1], check_exact=True)
+            assert_frame_equal(samps["0"], samps["1"], check_exact=True)
             samps_equal = True
         except AssertionError:
             samps_equal = False
@@ -32,4 +32,4 @@ def test_generate_trajectories_runs(generated_trajectories: Path):
         assert not samps_equal, f"Trajectories for distinct samples in split {sp} are equal!"
 
         subjects = {samp: set(df["subject_id"]) for samp, df in samps.items()}
-        assert subjects[0] == subjects[1], f"Subjects in samples {0} and {1} for split {sp} do not match!"
+        assert subjects["0"] == subjects["1"], f"Subjects in samples for split {sp} do not match!"

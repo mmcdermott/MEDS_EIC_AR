@@ -100,7 +100,7 @@ def generate_trajectories(cfg: DictConfig):
             logger.info(f"Generating trajectories for {split} sample {sample} to {out_fp} with seed {seed}.")
 
             seed_everything(seed, workers=True)
-            predictions = trainer.predict(model=M, dataloaders=dataloader, seed=seed)
+            predictions = trainer.predict(model=M, dataloaders=dataloader)
             predictions_df = format_trajectories(dataloader.dataset, predictions)
             predictions_df.write_parquet(out_fp, use_pyarrow=True)
 
