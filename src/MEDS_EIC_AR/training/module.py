@@ -1,4 +1,5 @@
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import lightning as L
 import torch
@@ -10,6 +11,77 @@ from .metrics import NextCodeMetrics
 
 
 class MEICARModule(L.LightningModule):
+    """A LightningModule for training and evaluating the MEICAR model."""
+
+    @classmethod
+    def load_from_checkpoint(cls, ckpt_path: Path | None = None) -> "MEICARModule":
+        """Loads the full lightning module from a checkpoint.
+
+        Args:
+            ckpt_path: Path to the checkpoint file.
+
+        Returns:
+            The loaded MEICARModule instance.
+
+        Raises:
+            KeyError: If the checkpoint does not contain the expected hyperparameters.
+
+        Examples:
+            >>> model = Model({
+            ...     "num_hidden_layers": 2,
+            ...     "num_attention_heads": 2,
+            ...     "hidden_size": 4,
+            ...     "max_position_embeddings": 3,
+            ...     "vocab_size": 10,
+            ... })
+            >>> metrics = NextCodeMetrics(top_k=[1, 2, 3], vocab_size=4)
+            >>> module = MEICARModule(model=model, metrics=metrics, optimizer=None)
+
+        In pytorch lightning, saving and loading checkpoints is done using the `Trainer` class. We'll make one
+        and attach the module to it for testing purposes:
+
+            >>> trainer = L.Trainer(logger=False)
+            >>> trainer.strategy.connect(module)
+
+        We'll grab the models current parameters so we can compare after loading
+
+            >>> import copy
+            >>> model_params = copy.deepcopy(module.state_dict())
+
+        Now, we can save the checkpoint to a temporary file and load it back in:
+
+            >>> with tempfile.NamedTemporaryFile(suffix=".ckpt") as f:
+            ...     trainer.save_checkpoint(f.name)
+            ...     loaded_module = MEICARModule.load_from_checkpoint(f.name)
+
+        We can check that the loaded module has the same parameters as the original:
+
+            >>> if loaded_module.state_dict().keys() != model_params.keys():
+            ...     print("Loaded module has different parameter names than the original!")
+            ... else:
+            ...     print("Loaded module has the same parameter names as the original!")
+            Loaded module has the same parameter names as the original!
+            >>> for k, v in model_params.items():
+            ...     assert torch.equal(v, loaded_module.state_dict()[k]), f"Parameter {k} does not match"
+        """
+
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        hparams = checkpoint.get("hyper_parameters", {})
+
+        for k in ["model", "metrics", "optimizer", "LR_scheduler"]:
+            if k not in hparams:
+                raise KeyError(f"Checkpoint does not contain {k} hyperparameters. Got {list(hparams.keys())}")
+
+        model = Model(**hparams["model"])
+        metrics = NextCodeMetrics(**hparams["metrics"])
+        optimizer = hparams["optimizer"]
+        LR_scheduler = hparams["LR_scheduler"]
+
+        return super().load_from_checkpoint(
+            ckpt_path, model=model, metrics=metrics, optimizer=optimizer, LR_scheduler=LR_scheduler
+        )
+
     def __init__(
         self,
         model: Model,
@@ -25,7 +97,8 @@ class MEICARModule(L.LightningModule):
 
         self.save_hyperparameters(
             {
-                "model.HF_model_config": model.HF_model_config,
+                "model": model.hparams,
+                "metrics": metrics.hparams,
                 "optimizer": optimizer,
                 "LR_scheduler": LR_scheduler,
             }

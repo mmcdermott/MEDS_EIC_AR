@@ -61,7 +61,8 @@ def generate_trajectories(cfg: DictConfig):
 
     D = instantiate(cfg.datamodule)
 
-    M = MEICARModule.load_from_checkpoint(cfg.ckpt_path)
+    M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path))
+
     M.eval()
 
     trainer = instantiate(cfg.trainer)

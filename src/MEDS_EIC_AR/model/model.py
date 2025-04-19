@@ -134,6 +134,8 @@ class Model(torch.nn.Module):
         else:
             self.forward = self._forward
 
+        self.hparams = {"gpt_kwargs": gpt_kwargs, "precision": precision, "do_demo": do_demo}
+
     @property
     def max_seq_len(self) -> int:
         """The maximum sequence length of the model."""
