@@ -7,7 +7,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from meds_testing_helpers.dataset import MEDSDataset
@@ -54,9 +54,34 @@ def preprocessed_dataset(simple_static_MEDS: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
+def preprocessed_dataset_with_task(
+    preprocessed_dataset: Path,
+    simple_static_MEDS_dataset_with_task: Path,
+) -> tuple[Path, Path, str]:
+    D = MEDSDataset(root_dir=simple_static_MEDS_dataset_with_task)
+
+    if len(D.task_names) != 1:  # pragma: no cover
+        raise ValueError("Expected only one task in the dataset.")
+
+    yield preprocessed_dataset, D.task_root_dir, D.task_names[0]
+
+
+@pytest.fixture(scope="session")
 def dataset_config(preprocessed_dataset: Path) -> MEDSTorchDataConfig:
     """Fixture to create a dataset configuration."""
     return MEDSTorchDataConfig(tensorized_cohort_dir=preprocessed_dataset, max_seq_len=10)
+
+
+@pytest.fixture(scope="session")
+def dataset_config_with_task(preprocessed_dataset_with_task: tuple[Path, Path, str]) -> MEDSTorchDataConfig:
+    """Fixture to create a dataset configuration."""
+    cohort_dir, tasks_dir, task_name = preprocessed_dataset_with_task
+    return MEDSTorchDataConfig(
+        tensorized_cohort_dir=cohort_dir,
+        max_seq_len=10,
+        task_labels_dir=(tasks_dir / task_name),
+        seq_sampling_strategy="to_end",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -66,21 +91,16 @@ def pytorch_dataset(dataset_config: MEDSTorchDataConfig) -> MEDSPytorchDataset:
 
 
 @pytest.fixture(scope="session")
+def pytorch_dataset_with_task(dataset_config_with_task: MEDSTorchDataConfig) -> MEDSPytorchDataset:
+    """Fixture to create a PyTorch dataset with task labels."""
+    return MEDSPytorchDataset(dataset_config_with_task, split="train")
+
+
+@pytest.fixture(scope="session")
 def sample_batch(pytorch_dataset: MEDSPytorchDataset) -> MEDSTorchBatch:
     """Fixture to create a sample batch."""
     dataloader = DataLoader(pytorch_dataset, batch_size=2, shuffle=False, collate_fn=pytorch_dataset.collate)
     return next(iter(dataloader))
-
-
-@pytest.fixture(scope="session")
-def preprocessed_dataset_with_task(
-    preprocessed_dataset: Path, simple_static_MEDS_dataset_with_task: Path
-) -> tuple[Path, Path, str]:
-    D = MEDSDataset(root_dir=simple_static_MEDS_dataset_with_task)
-    if len(D.task_names) != 1:  # pragma: no cover
-        raise ValueError("Expected only one task in the dataset.")
-
-    yield preprocessed_dataset, D.task_root_dir, D.task_names[0]
 
 
 @pytest.fixture(scope="session")
@@ -184,10 +204,12 @@ def _setup_doctest_namespace(
     dataset_config: MEDSTorchDataConfig,
     pretrained_GPT_model: Model,
     pytorch_dataset: MEDSPytorchDataset,
+    pytorch_dataset_with_task: MEDSPytorchDataset,
 ):
     doctest_namespace.update(
         {
             "print_warnings": partial(print_warnings, caplog),
+            "patch": patch,
             "MagicMock": MagicMock,
             "Mock": Mock,
             "datetime": datetime,
@@ -199,5 +221,6 @@ def _setup_doctest_namespace(
             "dataset_config": dataset_config,
             "pretrained_GPT_model": pretrained_GPT_model,
             "pytorch_dataset": pytorch_dataset,
+            "pytorch_dataset_with_task": pytorch_dataset_with_task,
         }
     )

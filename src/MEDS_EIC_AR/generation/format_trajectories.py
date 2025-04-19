@@ -5,9 +5,9 @@ import polars as pl
 import torch
 from meds import code_field, numeric_value_field, prediction_time_field, subject_id_field, time_field
 from meds_torchdata import MEDSPytorchDataset
+from MEDS_transforms.stages.add_time_derived_measurements.utils import normalize_time_unit
 
-TIME_DELTA_UNIT = "year"
-TIMELINE_DELTA_TOKEN = "TIMELINE//DELTA//years"
+TIMELINE_DELTA_TOKEN = "TIMELINE//DELTA"
 TASK_SAMPLE_ID_COL = "_task_sample_id"
 
 
@@ -92,13 +92,178 @@ def format_trajectory_batch(
     """Formats a single batch of generated outputs into a MEDS-like dataframe format.
 
     Args:
-        schema_chunk: The chunk of the dataset's schema dataframe corresponding to this generated batch.
+        schema_chunk: The chunk of the dataset's schema dataframe corresponding to this generated batch. This
+            dataframe must have the following columns:
+              - `"subject_id"`: The subject ID of the patient.
+              - `"prediction_time"`: The time after which no data can be ingested for this prediction. This
+                is, implicitly, assumed to be the start time of the generated window. TODO(mmd): This
+                assumption may not always be valid, and we don't have an exposed endpoint for the true time of
+                the last event in the input!
+              - `"task_sample_id"`: The task sample ID of the patient. This is a unique identifier for the
+                task sample, which is useful as there may be different task samples for the same patient, and
+                we don't wish our generated trajectories to intersect.
         generated_code_indices: The generated codes for this batch.
         code_information: The code information mapping from code indices to their string representations and
             numeric value means.
 
     Returns:
         A polars dataframe containing this batch of generated trajectory data in a MEDS-like format.
+
+    Examples:
+        >>> schema_df = pl.DataFrame({
+        ...     "_task_sample_id": [1, 2, 3, 4, 5],
+        ...     "subject_id": [1, 2, 3, 1, 4],
+        ...     "prediction_time": [
+        ...         datetime(1993, 1, 1),
+        ...         datetime(2000, 1, 2),
+        ...         datetime(1973, 1, 3),
+        ...         datetime(2002, 10, 12),
+        ...         datetime(2002, 10, 12),
+        ...     ],
+        ... })
+        >>> generated_code_indices = torch.LongTensor([
+        ...     [2, 4, 5, 4, 3, 4, 5, 5, 1, 6],
+        ...     [1, 7, 9, 0, 0, 0, 0, 0, 0, 0],
+        ...     [4, 7, 3, 6, 1, 9, 0, 0, 0, 0],
+        ...     [6, 1, 8, 9, 0, 0, 0, 0, 0, 0],
+        ...     [9, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ... ])
+        >>> code_information = {
+        ...     1: CodeInformation(code='TIMELINE//DELTA//years//value_A', value_prob=1.0, value_mean=1.0),
+        ...     2: CodeInformation(code='TIMELINE//DELTA//years//value_A', value_prob=1.0, value_mean=0.1),
+        ...     3: CodeInformation(code='TIMELINE//DELTA//years//value_A', value_prob=1.0, value_mean=0.001),
+        ...     4: CodeInformation(code='HR', value_prob=0.0, value_mean=None),
+        ...     5: CodeInformation(code='TEMP//A', value_prob=1.0, value_mean=99.0),
+        ...     6: CodeInformation(code='TEMP//B', value_prob=1.0, value_mean=101.0),
+        ...     7: CodeInformation(code='TEMP//C', value_prob=1.0, value_mean=96.8),
+        ...     8: CodeInformation(code='DX//1', value_prob=0.0, value_mean=None),
+        ...     9: CodeInformation(code='TIMELINE//END', value_prob=0.0, value_mean=None)
+        ... }
+
+    With this setup, we are generating the following strings of events for these patients:
+
+        >>> schema_df
+        shape: (5, 3)
+        ┌─────────────────┬────────────┬─────────────────────┐
+        │ _task_sample_id ┆ subject_id ┆ prediction_time     │
+        │ ---             ┆ ---        ┆ ---                 │
+        │ i64             ┆ i64        ┆ datetime[μs]        │
+        ╞═════════════════╪════════════╪═════════════════════╡
+        │ 1               ┆ 1          ┆ 1993-01-01 00:00:00 │
+        │ 2               ┆ 2          ┆ 2000-01-02 00:00:00 │
+        │ 3               ┆ 3          ┆ 1973-01-03 00:00:00 │
+        │ 4               ┆ 1          ┆ 2002-10-12 00:00:00 │
+        │ 5               ┆ 4          ┆ 2002-10-12 00:00:00 │
+        └─────────────────┴────────────┴─────────────────────┘
+
+    For task sample 1 (starting at 1993-01-01), we generate:
+      - (2) A timeline delta of 0.1 years, which is 35.6 days. Event time: ~1993-02-06, 12:30
+      - (4) A HR event, with no numeric value.
+      - (5) A TEMP//A event, with a numeric value of 99.0.
+      - (4) A HR event, with no numeric value.
+      - (3) A timeline delta of 0.001 years, which is 0.0365 days (8.7 hours). Event time: ~1993-02-06, 21:20
+      - (4) A HR event, with no numeric value.
+      - (5) A TEMP//A event, with a numeric value of 99.0.
+      - (5) A TEMP//A event, with a numeric value of 99.0.
+      - (1) A timeline delta of 1.0 year. Event time: ~1994-02-06, 21:20
+      - (6) A TEMP//B event, with a numeric value of 101.0.
+    For task sample 2 (starting at 2000-01-02), we generate:
+      - (1) A timeline delta of 1.0 year. Event time: ~2001-01-02
+      - (7) A TEMP//C event, with a numeric value of 96.8.
+      - (9) A TIMELINE//END event, with no numeric value.
+    For task sample 3 (starting at 1973-01-03), we generate the following:
+      - (4) A HR event, with no numeric value.
+      - (7) A TEMP//C event, with a numeric value of 96.8.
+      - (3) A timeline delta of 0.001 years, which is 0.0365 days (8.7 hours). Event time: ~1973-01-03, 08:45
+      - (6) A TEMP//B event, with a numeric value of 101.0.
+      - (1) A timeline delta of 1.0 year. Event time: ~1974-01-03, 08:45
+      - (9) A TIMELINE//END event, with no numeric value.
+    For task sample 4 (starting at 2002-10-12), we generate:
+      - (6) A TEMP//B event, with a numeric value of 101.0.
+      - (1) A timeline delta of 1.0 year. Event time: ~2003-10-12
+      - (8) A DX//1 event, with no numeric value.
+      - (9) A TIMELINE//END event, with no numeric value.
+    For task sample 5 (starting at 2002-10-12), we generate:
+      - (9) A TIMELINE//END event, with no numeric value.
+
+        >>> _ = pl.Config().set_tbl_rows(-1)
+        >>> format_trajectory_batch(schema_df, generated_code_indices, code_information)
+        shape: (24, 5)
+        ┌─────────────────┬────────────┬─────────────────────────┬─────────────────────────┬───────────────┐
+        │ _task_sample_id ┆ subject_id ┆ time                    ┆ code                    ┆ numeric_value │
+        │ ---             ┆ ---        ┆ ---                     ┆ ---                     ┆ ---           │
+        │ i64             ┆ i64        ┆ datetime[μs]            ┆ str                     ┆ f32           │
+        ╞═════════════════╪════════════╪═════════════════════════╪═════════════════════════╪═══════════════╡
+        │ 1               ┆ 1          ┆ 1993-02-06 12:34:52.608 ┆ TIMELINE//DELTA//years/ ┆ 0.1           │
+        │                 ┆            ┆                         ┆ /value_…                ┆               │
+        │ 1               ┆ 1          ┆ 1993-02-06 12:34:52.608 ┆ HR                      ┆ null          │
+        │ 1               ┆ 1          ┆ 1993-02-06 12:34:52.608 ┆ TEMP//A                 ┆ 99.0          │
+        │ 1               ┆ 1          ┆ 1993-02-06 12:34:52.608 ┆ HR                      ┆ null          │
+        │ 1               ┆ 1          ┆ 1993-02-06              ┆ TIMELINE//DELTA//years/ ┆ 0.001         │
+        │                 ┆            ┆ 21:20:49.534080         ┆ /value_…                ┆               │
+        │ 1               ┆ 1          ┆ 1993-02-06              ┆ HR                      ┆ null          │
+        │                 ┆            ┆ 21:20:49.534080         ┆                         ┆               │
+        │ 1               ┆ 1          ┆ 1993-02-06              ┆ TEMP//A                 ┆ 99.0          │
+        │                 ┆            ┆ 21:20:49.534080         ┆                         ┆               │
+        │ 1               ┆ 1          ┆ 1993-02-06              ┆ TEMP//A                 ┆ 99.0          │
+        │                 ┆            ┆ 21:20:49.534080         ┆                         ┆               │
+        │ 1               ┆ 1          ┆ 1994-02-07              ┆ TIMELINE//DELTA//years/ ┆ 1.0           │
+        │                 ┆            ┆ 03:09:35.614080         ┆ /value_…                ┆               │
+        │ 1               ┆ 1          ┆ 1994-02-07              ┆ TEMP//B                 ┆ 101.0         │
+        │                 ┆            ┆ 03:09:35.614080         ┆                         ┆               │
+        │ 2               ┆ 2          ┆ 2001-01-01 05:48:46.080 ┆ TIMELINE//DELTA//years/ ┆ 1.0           │
+        │                 ┆            ┆                         ┆ /value_…                ┆               │
+        │ 2               ┆ 2          ┆ 2001-01-01 05:48:46.080 ┆ TEMP//C                 ┆ 96.800003     │
+        │ 2               ┆ 2          ┆ 2001-01-01 05:48:46.080 ┆ TIMELINE//END           ┆ null          │
+        │ 3               ┆ 3          ┆ 1973-01-03 00:00:00     ┆ HR                      ┆ null          │
+        │ 3               ┆ 3          ┆ 1973-01-03 00:00:00     ┆ TEMP//C                 ┆ 96.800003     │
+        │ 3               ┆ 3          ┆ 1973-01-03              ┆ TIMELINE//DELTA//years/ ┆ 0.001         │
+        │                 ┆            ┆ 08:45:56.926080         ┆ /value_…                ┆               │
+        │ 3               ┆ 3          ┆ 1973-01-03              ┆ TEMP//B                 ┆ 101.0         │
+        │                 ┆            ┆ 08:45:56.926080         ┆                         ┆               │
+        │ 3               ┆ 3          ┆ 1974-01-03              ┆ TIMELINE//DELTA//years/ ┆ 1.0           │
+        │                 ┆            ┆ 14:34:43.006080         ┆ /value_…                ┆               │
+        │ 3               ┆ 3          ┆ 1974-01-03              ┆ TIMELINE//END           ┆ null          │
+        │                 ┆            ┆ 14:34:43.006080         ┆                         ┆               │
+        │ 4               ┆ 1          ┆ 2002-10-12 00:00:00     ┆ TEMP//B                 ┆ 101.0         │
+        │ 4               ┆ 1          ┆ 2003-10-12 05:48:46.080 ┆ TIMELINE//DELTA//years/ ┆ 1.0           │
+        │                 ┆            ┆                         ┆ /value_…                ┆               │
+        │ 4               ┆ 1          ┆ 2003-10-12 05:48:46.080 ┆ DX//1                   ┆ null          │
+        │ 4               ┆ 1          ┆ 2003-10-12 05:48:46.080 ┆ TIMELINE//END           ┆ null          │
+        │ 5               ┆ 4          ┆ 2002-10-12 00:00:00     ┆ TIMELINE//END           ┆ null          │
+        └─────────────────┴────────────┴─────────────────────────┴─────────────────────────┴───────────────┘
+
+    This function is robust to the unit string used for the timeline delta tokens, provided it conforms to the
+    set recognized in
+    [`MEDS_transforms.stages.add_time_derived_measurements.utils.normalize_time_unit`](https://meds-transforms.readthedocs.io/en/latest/api/MEDS_transforms/stages/add_time_derived_measurements/utils/#MEDS_transforms.stages.add_time_derived_measurements.utils.normalize_time_unit).
+    However, note that as time deltas are based on aggregate units (not calendar units), they won't
+    necessarily universally correspond to true calendar months or years.
+
+        >>> code_information = {
+        ...     1: CodeInformation(code='TIMELINE//DELTA//s//A', value_prob=1.0, value_mean=1.0),
+        ...     2: CodeInformation(code='TIMELINE//DELTA//days//A', value_prob=1.0, value_mean=1.0),
+        ...     3: CodeInformation(code='TIMELINE//DELTA//wks//B', value_prob=1.0, value_mean=1.0),
+        ...     4: CodeInformation(code='TIMELINE//DELTA//mos//C', value_prob=1.0, value_mean=1.0),
+        ...     5: CodeInformation(code='TIMELINE//DELTA//yrs//C', value_prob=1.0, value_mean=1.0),
+        ... }
+        >>> schema_df = pl.DataFrame({
+        ...     "_task_sample_id": [1], "subject_id": [1], "prediction_time": [datetime(1993, 1, 1)],
+        ... })
+        >>> generated_code_indices = torch.LongTensor([[1, 2, 3, 4, 5]])
+        >>> format_trajectory_batch(schema_df, generated_code_indices, code_information)
+        shape: (5, 5)
+        ┌─────────────────┬────────────┬─────────────────────────┬─────────────────────────┬───────────────┐
+        │ _task_sample_id ┆ subject_id ┆ time                    ┆ code                    ┆ numeric_value │
+        │ ---             ┆ ---        ┆ ---                     ┆ ---                     ┆ ---           │
+        │ i64             ┆ i64        ┆ datetime[μs]            ┆ str                     ┆ f32           │
+        ╞═════════════════╪════════════╪═════════════════════════╪═════════════════════════╪═══════════════╡
+        │ 1               ┆ 1          ┆ 1993-01-01 00:00:01     ┆ TIMELINE//DELTA//s//A   ┆ 1.0           │
+        │ 1               ┆ 1          ┆ 1993-01-02 00:00:01     ┆ TIMELINE//DELTA//days// ┆ 1.0           │
+        │                 ┆            ┆                         ┆ A                       ┆               │
+        │ 1               ┆ 1          ┆ 1993-01-09 00:00:01     ┆ TIMELINE//DELTA//wks//B ┆ 1.0           │
+        │ 1               ┆ 1          ┆ 1993-02-08 10:29:07     ┆ TIMELINE//DELTA//mos//C ┆ 1.0           │
+        │ 1               ┆ 1          ┆ 1994-02-08 16:17:53.080 ┆ TIMELINE//DELTA//yrs//C ┆ 1.0           │
+        └─────────────────┴────────────┴─────────────────────────┴─────────────────────────┴───────────────┘
     """
 
     batch_size = generated_code_indices.shape[0]
@@ -107,9 +272,9 @@ def format_trajectory_batch(
 
     rows = []
     for i in range(batch_size):
-        subject_id = schema_chunk.select(subject_id_field)[i]
-        time = schema_chunk.select(time_field)[i]
-        task_sample_id = schema_chunk.select(TASK_SAMPLE_ID_COL)[i]
+        subject_id = schema_chunk.select(subject_id_field)[i].item()
+        time = schema_chunk.select(prediction_time_field)[i].item()
+        task_sample_id = schema_chunk.select(TASK_SAMPLE_ID_COL)[i].item()
 
         for code_idx in generated_code_indices[i]:
             if code_idx == 0:
@@ -120,7 +285,10 @@ def format_trajectory_batch(
             value_mean = code_info.value_mean
 
             if code.startswith(TIMELINE_DELTA_TOKEN):
-                time += timedelta(**{TIME_DELTA_UNIT: value_mean})
+                unit = code.split("//")[-2]
+                _, seconds_in_unit = normalize_time_unit(unit)
+                seconds = value_mean * seconds_in_unit
+                time += timedelta(seconds=seconds)
 
             rows.append(
                 {
@@ -157,6 +325,66 @@ def format_trajectories(
 
     Returns:
         A polars dataframe containing the generated trajectories in a MEDS-like format.
+
+    Raises:
+        ValueError: If the passed dataset does not yield code info with values strictly either always
+            occurring or never occurring.
+
+    Examples:
+        >>> generated_code_indices = [
+        ...     torch.LongTensor([[31, 4, 15, 4, 3, 4, 15, 15, 33, 16], [32, 17, 33, 16, 1, 37, 0, 0, 0, 0]]),
+        ...     torch.LongTensor([[36, 17, 37], [37, 0, 0]]),
+        ... ]
+        >>> _ = pl.Config().set_tbl_rows(-1)
+        >>> format_trajectories(pytorch_dataset_with_task, generated_code_indices)
+        shape: (20, 5)
+        ┌─────────────────┬────────────┬─────────────────────┬─────────────────────────────┬───────────────┐
+        │ _task_sample_id ┆ subject_id ┆ time                ┆ code                        ┆ numeric_value │
+        │ ---             ┆ ---        ┆ ---                 ┆ ---                         ┆ ---           │
+        │ i64             ┆ i64        ┆ datetime[μs]        ┆ str                         ┆ f32           │
+        ╞═════════════════╪════════════╪═════════════════════╪═════════════════════════════╪═══════════════╡
+        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ TIMELINE//DELTA//years//val ┆ 0.000003      │
+        │                 ┆            ┆                     ┆ ue_…                        ┆               │
+        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ DISCHARGE                   ┆ null          │
+        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
+        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ DISCHARGE                   ┆ null          │
+        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ ADMISSION//PULMONARY        ┆ null          │
+        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ DISCHARGE                   ┆ null          │
+        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
+        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
+        │ 0               ┆ 239684     ┆ 2010-05-11          ┆ TIMELINE//DELTA//years//val ┆ 0.00004       │
+        │                 ┆            ┆ 18:22:52.400010     ┆ ue_…                        ┆               │
+        │ 0               ┆ 239684     ┆ 2010-05-11          ┆ HR//value_[107.5,107.7)     ┆ 107.5         │
+        │                 ┆            ┆ 18:22:52.400010     ┆                             ┆               │
+        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ TIMELINE//DELTA//years//val ┆ 0.000015      │
+        │                 ┆            ┆ 18:37:43.999983     ┆ ue_…                        ┆               │
+        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ HR//value_[107.7,112.5)     ┆ 108.349998    │
+        │                 ┆            ┆ 18:37:43.999983     ┆                             ┆               │
+        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ TIMELINE//DELTA//years//val ┆ 0.00004       │
+        │                 ┆            ┆ 18:58:56.399993     ┆ ue_…                        ┆               │
+        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ HR//value_[107.5,107.7)     ┆ 107.5         │
+        │                 ┆            ┆ 18:58:56.399993     ┆                             ┆               │
+        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ ADMISSION//CARDIAC          ┆ null          │
+        │                 ┆            ┆ 18:58:56.399993     ┆                             ┆               │
+        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ TIMELINE//END               ┆ null          │
+        │                 ┆            ┆ 18:58:56.399993     ┆                             ┆               │
+        │ 2               ┆ 239684     ┆ 2042-03-22          ┆ TIMELINE//DELTA//years//val ┆ 31.861664     │
+        │                 ┆            ┆ 00:22:49.901777     ┆ ue_…                        ┆               │
+        │ 2               ┆ 239684     ┆ 2042-03-22          ┆ HR//value_[107.7,112.5)     ┆ 108.349998    │
+        │                 ┆            ┆ 00:22:49.901777     ┆                             ┆               │
+        │ 2               ┆ 239684     ┆ 2042-03-22          ┆ TIMELINE//END               ┆ null          │
+        │                 ┆            ┆ 00:22:49.901777     ┆                             ┆               │
+        │ 3               ┆ 1195293    ┆ 2010-06-20 19:30:00 ┆ TIMELINE//END               ┆ null          │
+        └─────────────────┴────────────┴─────────────────────┴─────────────────────────────┴───────────────┘
+
+    If the dataset yields invalid code information, an error will be thrown:
+
+        >>> with patch("MEDS_EIC_AR.generation.format_trajectories.get_code_information") as mock:
+        ...     mock.return_value = {1: CodeInformation(code='HR', value_prob=0.5, value_mean=106.0)}
+        ...     format_trajectories("fake dataset", generated_code_indices)
+        Traceback (most recent call last):
+          ...
+        ValueError: Code HR has a value probability of 0.5, which is not 0.0 or 1.0. This is not supported.
     """
 
     code_information = get_code_information(dataset)
@@ -169,7 +397,7 @@ def format_trajectories(
             )
 
     output_schema = (
-        dataset.schema_df.select(subject_id_field, pl.col(prediction_time_field).alias(time_field)).clone()
+        dataset.schema_df.select(subject_id_field, prediction_time_field).clone()
     ).with_row_index(TASK_SAMPLE_ID_COL)
 
     batches_as_df = []
