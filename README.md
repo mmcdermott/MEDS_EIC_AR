@@ -52,10 +52,6 @@ You can exert more fine-grained control on the filtering with the following envi
     final vocabulary? Note that this excludes some sentinel codes which are always retained.
 2. `MIN_EVENTS_PER_SUBJECT`: How many events must a subject have to be included in the final dataset?
 
-> [!WARNING]
-> I suspect this is not actually working yet. Tests currently just ensure it does not crash; not that the
-> entire output of the pipeline looks as expected.
-
 ### 2. Pre-train the model
 
 You can pre-train the model using the `MEICAR_pretrain` command. To use this, let us assume you have a new
@@ -77,8 +73,8 @@ though you will more likely materialize an experimental configuration file to di
 the config path and name directly in the normal hydra manner.
 
 > [!WARNING]
-> I suspect this is not actually working yet. Tests currently just ensure it does not crash; not that the
-> entire output of the pipeline looks as expected.
+> Tests here only validate that the model runs without errors and (in demo mode) runs without producing nans
+> or invalid values. It has not yet been assessed to ensure it runs to convergence, etc.
 
 ### 3. Zero-shot Inference
 
@@ -133,6 +129,11 @@ This will generate trajectories for the task cohort and save them in the format:
 
 See the documentation for [`format_trajectories`](src/MEDS_EIC_AR/generation/format_trajectories.py) for more
 details on the format of the generated trajectories.
+
+> [!WARNING]
+> The tests here only validate that this runs without errors and produces trajectory files that are valid,
+> non-identical across different samples, and containing the right subjects. It has not yet been assessed to
+> ensure full correctness.
 
 #### 3.2 Resolve Trajectories into Predictions.
 
