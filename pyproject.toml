@@ -54,6 +54,8 @@ MEICAR_process_data = "MEDS_EIC_AR.preprocessing.__main__:process_data"
 MEICAR_pretrain = "MEDS_EIC_AR.__main__:pretrain"
 # Generation
 MEICAR_generate_trajectories = "MEDS_EIC_AR.__main__:generate_trajectories"
+# Prediction
+MEICAR_predict = "MEDS_EIC_AR.__main__:predict_from_trajectories"
 
 [tool.pytest.ini_options]
 addopts = [

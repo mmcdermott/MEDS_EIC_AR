@@ -105,3 +105,8 @@ def generate_trajectories(cfg: DictConfig):
             predictions_df.write_parquet(out_fp, use_pyarrow=True)
 
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")
+
+
+@hydra.main(version_base=None, config_path=str(CONFIGS), config_name="_predict_from_trajectories")
+def predict_from_trajectories(cfg: DictConfig):
+    raise NotImplementedError("This function is not implemented yet.")

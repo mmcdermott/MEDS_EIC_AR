@@ -1,0 +1,13 @@
+defaults:
+  - _self_
+
+trajectories_dir: ???
+output_dir: ???
+task_configuration_file: ???
+predicates_file: null
+
+log_dir: ${output_dir}/.logs
+
+hydra:
+  run:
+    dir: "${log_dir}"
