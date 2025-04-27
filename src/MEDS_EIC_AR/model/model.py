@@ -276,11 +276,13 @@ class Model(torch.nn.Module):
             >>> model.HF_model.gpt_neox.layers[1].attention.query_key_value.bias.shape
             torch.Size([12])
             >>> model.HF_model.gpt_neox.layers[1].attention.query_key_value.bias = torch.nn.Parameter(
-            ...     torch.tensor([float("nan"), 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.])
+            ...     torch.tensor([float("nan"), 0., float("inf"), 0., 0., 0., 0., 0., 0., 0., 0., 0.])
             ... )
             >>> with print_warnings():
             ...     model._check_parameters()
             Warning: Parameter HF_model.gpt_neox.layers.1.attention.query_key_value.bias contains 1/12 nan
+                values.
+            Warning: Parameter HF_model.gpt_neox.layers.1.attention.query_key_value.bias contains 1/12 inf
                 values.
         """
 
