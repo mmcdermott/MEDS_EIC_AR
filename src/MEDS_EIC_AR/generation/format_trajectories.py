@@ -264,6 +264,14 @@ def format_trajectory_batch(
         │ 1               ┆ 1          ┆ 1993-02-08 10:29:07     ┆ TIMELINE//DELTA//mos//C ┆ 1.0           │
         │ 1               ┆ 1          ┆ 1994-02-08 16:17:53.080 ┆ TIMELINE//DELTA//yrs//C ┆ 1.0           │
         └─────────────────┴────────────┴─────────────────────────┴─────────────────────────┴───────────────┘
+
+    Note than an error is raised if the schema chunk does not have the same batch size as the generated
+    tokens:
+
+        >>> format_trajectory_batch(schema_df[:0], generated_code_indices, code_information)
+        Traceback (most recent call last):
+            ...
+        ValueError: Batch size 1 does not match schema chunk size 0
     """
 
     batch_size = generated_code_indices.shape[0]
