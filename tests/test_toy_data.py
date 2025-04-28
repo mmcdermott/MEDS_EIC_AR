@@ -2,9 +2,62 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 from meds import held_out_split, train_split, tuning_split
 from meds_testing_helpers.dataset import MEDSDataset
+
+
+def generate_transition_probs_matrix(transition_spec: str) -> np.ndarray:
+    """Takes a spec of the form 'A -> B -> A; A -> C; C -> D -> E -> C' and generates transition probs for it.
+
+    Args:
+        transition_spec: A string representing the transition specification. All possible transitions are
+            divided equally between options.
+
+    Returns:
+        A numpy array representing the transition probabilities.
+
+    Examples:
+        >>> generate_transition_probs_matrix("A -> B -> A")
+        array([[0.0, 1.0],
+               [1.0, 0.0]])
+        >>> generate_transition_probs_matrix("A -> B -> C -> A; A -> D; D -> D -> B")
+        array([[0.0, 0.5, 0.0, 0.5],
+               [0.0, 0.0, 1.0, 0.0],
+               [1.0, 0.0, 0.0, 0.0],
+               [0.0, 0.5, 0.0, 0.5]])
+    """
+
+    # Split the transition specification into individual transitions
+    transitions = transition_spec.split(";")
+
+    # Create a mapping of states to indices
+    states = set()
+    for transition in transitions:
+        parts = transition.split("->")
+        for part in parts:
+            states.add(part.strip())
+
+    states = sorted(states)
+    state_to_index = {state: index for index, state in enumerate(states)}
+
+    # Initialize the transition probability matrix
+    num_states = len(states)
+    transition_probs = np.zeros((num_states, num_states))
+
+    # Fill the transition probability matrix
+    for transition in transitions:
+        parts = [part.strip() for part in transition.split("->")]
+        num_parts = len(set(parts))
+        prob_per_transition = 1.0 / (num_parts - 1)
+
+        for i in range(num_parts - 1):
+            from_state = state_to_index[parts[i]]
+            to_state = state_to_index[parts[i + 1]]
+            transition_probs[from_state, to_state] += prob_per_transition
+
+    return transition_probs
 
 
 def generate_toy_shard(num_subjects: int, measurements_per_subject: int) -> pl.DataFrame:
@@ -20,6 +73,7 @@ def generate_toy_shard(num_subjects: int, measurements_per_subject: int) -> pl.D
     Examples:
         >>> generate_toy_shard(2, 5)
     """
+
     raise NotImplementedError("This function is not implemented yet.")
 
 
