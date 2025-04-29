@@ -19,6 +19,42 @@ from MEDS_EIC_AR.training.module import MEICARModule
 
 
 @pytest.fixture(scope="session")
+def preprocessed_dataset_with_reshard(simple_static_MEDS: Path) -> Path:
+    """Fixture to create a preprocessed dataset."""
+
+    with tempfile.TemporaryDirectory() as test_root:
+        test_root = Path(test_root)
+
+        input_dir = simple_static_MEDS
+        interemediate_dir = test_root / "intermediate"
+        output_dir = test_root / "output"
+
+        cmd = [
+            "MEICAR_process_data",
+            f"input_dir={input_dir!s}",
+            f"intermediate_dir={interemediate_dir!s}",
+            f"output_dir={output_dir!s}",
+            "do_demo=True",
+            "do_reshard=True",
+        ]
+
+        out = subprocess.run(cmd, capture_output=True, check=False)
+
+        err_lines = [
+            "Command failed:",
+            "Stdout:",
+            out.stdout.decode(),
+            "Stderr:",
+            out.stderr.decode(),
+        ]
+
+        if out.returncode != 0:
+            raise ValueError("\n".join([*err_lines, f"Return code: {out.returncode}"]))
+
+        yield output_dir
+
+
+@pytest.fixture(scope="session")
 def preprocessed_dataset(simple_static_MEDS: Path) -> Path:
     """Fixture to create a preprocessed dataset."""
 
