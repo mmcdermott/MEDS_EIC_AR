@@ -412,7 +412,7 @@ class Model(torch.nn.Module):
             ...     "hidden_size": 4,
             ...     "max_position_embeddings": 10,
             ...     "vocab_size": dataset_config.vocab_size,
-            ... }, precision="16-true")
+            ... }, precision="32-true")
 
         This model has a maximum sequence length of 10. If we check, our sample batch has a sequence length of
         9:
@@ -435,10 +435,10 @@ class Model(torch.nn.Module):
             ...     "hidden_size": 4,
             ...     "max_position_embeddings": 20,
             ...     "vocab_size": dataset_config.vocab_size,
-            ... }, precision="16-true")
+            ... }, precision="32-true")
             >>> print(model.generate(sample_batch))
-            tensor([[13,  8, 27, 19,  6, 16, 29, 28, 35, 25,  9],
-                    [31, 17, 24, 34, 33,  8, 21, 20, 10, 33,  3]])
+            tensor([[13,  8, 27, 19,  6, 16, 29, 37, 35, 25,  9],
+                    [31,  9, 24, 34, 33,  8, 21, 20, 10, 33,  3]])
         """
 
         for_hf = self._hf_inputs(batch)
