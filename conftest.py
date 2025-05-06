@@ -136,7 +136,7 @@ def pytorch_dataset_with_task(dataset_config_with_task: MEDSTorchDataConfig) -> 
 def sample_batch(pytorch_dataset: MEDSPytorchDataset) -> MEDSTorchBatch:
     """Fixture to create a sample batch."""
     dataloader = DataLoader(pytorch_dataset, batch_size=2, shuffle=False, collate_fn=pytorch_dataset.collate)
-    return next(iter(dataloader))
+    return list(dataloader)[1]
 
 
 @pytest.fixture(scope="session")
