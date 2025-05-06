@@ -7,6 +7,7 @@ from pathlib import Path
 import hydra
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
+from lightning.pytorch.loggers import WandbLogger
 from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchDataConfig
 from MEDS_transforms.runner import load_yaml_file  # noqa: F401
@@ -43,6 +44,9 @@ def pretrain(cfg: DictConfig):
         seed_everything(cfg.get("seed", 1), workers=True)
 
     trainer = instantiate(cfg.trainer)
+
+    if isinstance(trainer.logger, WandbLogger):
+        trainer.logger.watch(M, log="all", log_graph=True)
 
     trainer.fit(model=M, datamodule=D)
 
