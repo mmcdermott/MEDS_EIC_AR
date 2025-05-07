@@ -39,9 +39,14 @@ dependencies = [
 [tool.setuptools_scm]
 
 [project.optional-dependencies]
+# Extensions
+flash_attn = ["flash-attn"]
+wandb = ["wandb"]
+mlflow = ["mlflow"]
+
+# Core Development
 dev = ["pre-commit<4", "ruff"]
 tests = ["pytest-cov", "pretty_print_directory>=0.1.2"]
-flash_attn = ["flash-attn"]
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_EIC_AR"
