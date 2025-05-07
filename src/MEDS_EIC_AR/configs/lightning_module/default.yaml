@@ -1,7 +1,7 @@
 defaults:
   - model: small
   - metrics: default
-  - optimizer: adam
+  - optimizer: adamw
   - LR_scheduler: get_cosine_schedule_with_warmup
   - _self_
 

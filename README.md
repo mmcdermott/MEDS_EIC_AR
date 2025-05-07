@@ -178,7 +178,8 @@ follows:
 │   │   ├── demo.yaml
 │   │   └── small.yaml
 │   └── optimizer
-│       └── adam.yaml
+│       ├── adam.yaml
+│       └── adamw.yaml
 └── trainer
     ├── callbacks
     │   ├── default.yaml

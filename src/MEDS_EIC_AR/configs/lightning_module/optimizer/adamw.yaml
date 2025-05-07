@@ -1,0 +1,9 @@
+_target_: torch.optim.AdamW
+_partial_: true
+
+lr: 5.0e-4 # starting point (common LR for transformers)
+weight_decay: 0.01 # recommended for regularization
+eps: 1.0e-8 # default epsilon
+betas: [0.9, 0.999] # default betas (standard)
+amsgrad: false # default amsgrad (standard)
+fused: false # default fused (standard)
