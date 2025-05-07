@@ -1,7 +1,8 @@
 model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
+
   dirpath: ${trainer.default_root_dir}/checkpoints # directory to save the model file
-  monitor: "tuning/loss"
+  monitor: "tuning/loss_epoch"
   verbose: False # verbosity mode
   save_last: True # additionally always save an exact copy of the last checkpoint to a file last.ckpt
   save_top_k: 5 # save k best models (determined by above metric)
