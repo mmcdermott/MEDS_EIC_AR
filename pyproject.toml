@@ -40,7 +40,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pre-commit<4", "ruff"]
-tests = ["pytest-cov"]
+tests = ["pytest-cov", "pretty_print_directory>=0.1.2"]
 flash_attn = ["flash-attn"]
 
 [project.urls]

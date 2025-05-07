@@ -248,6 +248,7 @@ def _setup_doctest_namespace(
             "print_warnings": partial(print_warnings, caplog),
             "patch": patch,
             "MagicMock": MagicMock,
+            "Path": Path,
             "Mock": Mock,
             "datetime": datetime,
             "tempfile": tempfile,
