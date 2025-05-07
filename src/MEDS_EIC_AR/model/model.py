@@ -49,6 +49,9 @@ class Model(torch.nn.Module):
         gpt_kwargs: A dictionary of keyword arguments to pass to the GPTNeoXConfig constructor. These can
             include 'max_position_embeddings', 'vocab_size', 'hidden_size', etc.
 
+    Raises:
+        ValueError: If the gpt_kwargs contains a key that is not supported.
+
     Examples:
         >>> _ = torch.manual_seed(0)
         >>> model = Model({
@@ -58,10 +61,26 @@ class Model(torch.nn.Module):
         ...     "max_position_embeddings": 10,
         ...     "vocab_size": dataset_config.vocab_size,
         ... }, precision="16-true")
+
+    Once created, we can use the simple helpers `max_seq_len` and `vocab_size` to access the corresponding
+    elements of the model config:
+
         >>> model.max_seq_len
         10
         >>> model.vocab_size
         39
+
+    We can also run the model on a sample batch of data. This `sample_batch` is defined in our `conftest.py`
+    file and is a MEDSTorchBatch object. The only feature of this batch that we use in this model is the
+    `code` key.
+
+        >>> sample_batch
+        MEDSTorchBatch(code=tensor([[38,  5, 36,  3, 13, 29, 35,  4, 37],
+                                    [38,  5, 36,  2, 22, 25, 35,  4, 37]]),
+                       ...)
+
+    We run over the batch in the normal way, which internally calls the `forward` method of the model:
+
         >>> loss, outputs = model(sample_batch)
         >>> print(loss)
         tensor(3.6660, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
@@ -75,12 +94,18 @@ class Model(torch.nn.Module):
                 [[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.4458e-02, ...,  1.6281e-02]]],
                dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
+
+    The models parameters can be accessed in the normal way.
+
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
         >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
         HF_model.gpt_neox.embed_in.weight (torch.Size([39, 4])): Parameter containing:
         tensor([[-0.0247, -0.0222,  0.0160,  0.0219], ..., [-0.0050, -0.0061, -0.0358,  0.0136]],
                dtype=torch.float16,
                requires_grad=True)
+
+    Let's validate that they have gradients that can be realized via `.backward()` as normal:
+
         >>> print(f"Sample parameter grad?: {sample_param.grad}")
         Sample parameter grad?: None
         >>> loss.backward()
@@ -90,10 +115,20 @@ class Model(torch.nn.Module):
                 ...,
                 [ 1.5251e-02, -6.2347e-02, -3.1921e-02,  7.9102e-02]],
                dtype=torch.float16)
+
+    With a single backward pass, we should not get any infinite gradients:
+
         >>> for name, param in model.named_parameters():
         ...     if param.grad is not None:
         ...         if not _val(torch.isfinite(param.grad).all()):
         ...             raise ValueError(f"Gradient for {name} is not finite.")
+
+    Model errors are raised if we pass invalid GPT kwargs to the constructor:
+
+        >>> Model({"foobar": 2})
+        Traceback (most recent call last):
+            ...
+        ValueError: Config for HF model gpt-neox does not have attribute foobar
     """
 
     HF_model_config: GPTNeoXConfig
