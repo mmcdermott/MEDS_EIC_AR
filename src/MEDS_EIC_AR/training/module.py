@@ -1,8 +1,10 @@
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Literal
 
 import lightning as L
 import torch
+from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -105,24 +107,32 @@ class MEICARModule(L.LightningModule):
         )
 
     def _log_metrics(
-        self, loss: torch.Tensor, outputs: CausalLMOutputWithPast, batch: MEDSTorchBatch, stage: str
+        self,
+        loss: torch.Tensor,
+        outputs: CausalLMOutputWithPast,
+        batch: MEDSTorchBatch,
+        stage: Literal[train_split, tuning_split, held_out_split],
     ):
         batch_size = batch.batch_size
-        self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
+
+        is_train = stage == train_split
+
+        self.log(f"{stage}/loss", loss, on_step=is_train, on_epoch=True, prog_bar=True, batch_size=batch_size)
         self.log_dict(
             {f"{stage}/{k}": v for k, v in self.metrics(outputs.logits, batch).items()},
             batch_size=batch_size,
+            on_step=is_train,
         )
 
     def training_step(self, batch: MEDSTorchBatch):
         loss, outputs = self.model(batch)
-        self._log_metrics(loss, outputs, batch, "train")
+        self._log_metrics(loss, outputs, batch, train_split)
 
         return loss
 
     def validation_step(self, batch):
         loss, outputs = self.model(batch)
-        self._log_metrics(loss, outputs, batch, "tuning")
+        self._log_metrics(loss, outputs, batch, tuning_split)
 
         return loss
 
@@ -143,7 +153,7 @@ class MEICARModule(L.LightningModule):
             # ReduceLROnPlateau requires observing stable trends to make a conclusion about LR decay, so an
             # epcoh level interval is more appropriate.
 
-            LR_config["monitor"] = "tuning/loss_epoch"
+            LR_config["monitor"] = "tuning/loss"
             LR_config["strict"] = True
             LR_config["interval"] = "epoch"
         else:

@@ -39,7 +39,7 @@ def run_and_check(cmd: list[str]) -> dict[str, str]:
     if cmd_out.returncode == 0:
         return
 
-    err = [f"Command failed with code {out.returncode}", "Stdout:", out["stdout"], "Stderr:", out["stderr"]]
+    err = [f"Command yielded code {cmd_out.returncode}", "Stdout:", out["stdout"], "Stderr:", out["stderr"]]
     raise ValueError("\n".join(err))
 
 
