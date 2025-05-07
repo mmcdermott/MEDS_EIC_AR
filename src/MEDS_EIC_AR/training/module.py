@@ -129,14 +129,30 @@ class MEICARModule(L.LightningModule):
     def configure_optimizers(self):
         optimizer = self.optimizer_factory(self.parameters())
 
-        if self.LR_scheduler_factory is not None:
-            scheduler = self.LR_scheduler_factory(optimizer)
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {"scheduler": scheduler, "monitor": "tuning/loss_epoch"},
-            }
-        else:
+        if self.LR_scheduler_factory is None:
             return optimizer
+
+        scheduler = self.LR_scheduler_factory(optimizer)
+
+        LR_config = {
+            "scheduler": scheduler,
+            "frequency": 1,
+        }
+
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            # ReduceLROnPlateau requires observing stable trends to make a conclusion about LR decay, so an
+            # epcoh level interval is more appropriate.
+
+            LR_config["monitor"] = "tuning/loss_epoch"
+            LR_config["strict"] = True
+            LR_config["interval"] = "epoch"
+        else:
+            # All other schedulers operate at a step level as they do not monitor the loss to make a
+            # conclusion about LR decay.
+
+            LR_config["interval"] = "step"
+
+        return {"optimizer": optimizer, "lr_scheduler": LR_config}
 
     def predict_step(self, batch: MEDSTorchBatch):
         """Produces generated trajectories for a given batch of data."""

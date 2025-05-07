@@ -31,7 +31,7 @@ def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
 
 
 @OmegaConfResolver
-def prod(x: int, y: int) -> int:
+def int_prod(x: int, y: int) -> int:
     """Returns the closest integer to the product of x and y.
 
     This function can be used in omega conf configs as a resolved function.
@@ -44,11 +44,11 @@ def prod(x: int, y: int) -> int:
         The closest integer to the product of x and y.
 
     Examples:
-        >>> prod(2, 3)
+        >>> int_prod(2, 3)
         6
-        >>> prod(2, 3.5)
+        >>> int_prod(2, 3.5)
         7
-        >>> prod(2.49, 3)
+        >>> int_prod(2.49, 3)
         7
     """
     return round(x * y)

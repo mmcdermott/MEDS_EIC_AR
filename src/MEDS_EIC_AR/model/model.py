@@ -116,6 +116,8 @@ class Model(torch.nn.Module):
         self.HF_model_config: GPTNeoXConfig = AutoConfig.from_pretrained("EleutherAI/gpt-neox-20b")
 
         for key, val in gpt_kwargs.items():
+            if key == "attention_head_dim":
+                continue
             if not hasattr(self.HF_model_config, key):
                 raise ValueError(f"Config for HF model gpt-neox does not have attribute {key}")
             setattr(self.HF_model_config, key, val)

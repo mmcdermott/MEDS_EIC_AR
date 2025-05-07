@@ -1,0 +1,6 @@
+_target_: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+_partial_: true
+
+T_0: ${int_prod:0.1,${trainer.max_steps}} # number of steps before restart
+T_mult: 2 # multiplicative increase in epochs between restarts
+eta_min: 1e-6 # minimum learning rate

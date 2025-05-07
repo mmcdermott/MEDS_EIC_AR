@@ -14,7 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from .generation import format_trajectories, get_timeline_end_token_idx
 from .training import MEICARModule
-from .utils import hash_based_seed, prod, resolve_generation_context_size  # noqa: F401
+from .utils import hash_based_seed, int_prod, resolve_generation_context_size  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
