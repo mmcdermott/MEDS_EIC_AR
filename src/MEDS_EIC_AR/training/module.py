@@ -133,7 +133,7 @@ class MEICARModule(L.LightningModule):
             scheduler = self.LR_scheduler_factory(optimizer)
             return {
                 "optimizer": optimizer,
-                "lr_scheduler": {"scheduler": scheduler, "monitor": "tuning/loss"},
+                "lr_scheduler": {"scheduler": scheduler, "monitor": "tuning/loss_epoch"},
             }
         else:
             return optimizer
