@@ -401,11 +401,12 @@ class Model(torch.nn.Module):
 
         return loss, outputs
 
-    def generate(self, batch: MEDSTorchBatch, **kwargs) -> torch.Tensor:
+    def generate(self, batch: MEDSTorchBatch, do_sample: bool = True, **kwargs) -> torch.Tensor:
         """Generates a sequence of tokens from the model using the HF generation mixin.
 
         Examples:
             >>> _ = torch.manual_seed(0)
+            >>> torch.use_deterministic_algorithms(True)
             >>> model = Model({
             ...     "num_hidden_layers": 2,
             ...     "num_attention_heads": 2,
@@ -422,9 +423,9 @@ class Model(torch.nn.Module):
 
         This means that by default, the model will generate 1 token:
 
-            >>> print(model.generate(sample_batch))
-            tensor([[13],
-                    [31]])
+            >>> print(model.generate(sample_batch, do_sample=False))
+            tensor([[2],
+                    [2]])
 
         If we create a model with a maximum sequence length of 20, we can generate 11 tokens:
 
@@ -436,16 +437,21 @@ class Model(torch.nn.Module):
             ...     "max_position_embeddings": 20,
             ...     "vocab_size": dataset_config.vocab_size,
             ... }, precision="32-true")
-            >>> print(model.generate(sample_batch))
-            tensor([[13,  8, 27, 19,  6, 16, 29, 37, 35, 25,  9],
-                    [31,  9, 24, 34, 33,  8, 21, 20, 10, 33,  3]])
+            >>> print(model.generate(sample_batch, do_sample=False))
+            tensor([[ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
+                    [ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]])
+
+        Note that here, as we've turned sampling off for determinism in these testing algorithms, the
+        generated samples are clearly visibly not meaningful. This is completely expected because we are
+        working with a model that has just been randomly initialized. What if we try with a model that has
+        undergone a (tiny) bit of pre-training? TODO(generation test).
         """
 
         for_hf = self._hf_inputs(batch)
 
         generation_config = GenerationConfig(
             max_new_tokens=self.max_seq_len - batch.code.shape[1],
-            do_sample=True,
+            do_sample=do_sample,
             num_beams=1,  # no beam search
             temperature=1.0,
             pad_token_id=batch.PAD_INDEX,
