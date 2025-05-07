@@ -23,7 +23,9 @@ class MEICARModule(L.LightningModule):
             ckpt_path: Path to the checkpoint file.
 
         Returns:
-            The loaded MEICARModule instance.
+            The loaded MEICARModule instance, with all hyperparameters matching _except_ for the optimizer
+            factory and LR scheduler which are discarded, as we can't tell from the saved data alone what
+            classes they should be.
 
         Raises:
             KeyError: If the checkpoint does not contain the expected hyperparameters.
@@ -77,18 +79,18 @@ class MEICARModule(L.LightningModule):
 
         model = Model(**hparams["model"])
         metrics = NextCodeMetrics(**hparams["metrics"])
-        optimizer = hparams["optimizer"]
-        LR_scheduler = hparams["LR_scheduler"]
+        optimizer = hparams["optimizer"]  # noqa: F841
+        LR_scheduler = hparams["LR_scheduler"]  # noqa: F841
 
         return super().load_from_checkpoint(
-            ckpt_path, model=model, metrics=metrics, optimizer=optimizer, LR_scheduler=LR_scheduler
+            ckpt_path, model=model, metrics=metrics, optimizer=None, LR_scheduler=None
         )
 
     def __init__(
         self,
         model: Model,
         metrics: NextCodeMetrics,
-        optimizer: Callable[[Iterator[torch.nn.parameter.Parameter]], torch.optim.Optimizer],
+        optimizer: Callable[[Iterator[torch.nn.parameter.Parameter]], torch.optim.Optimizer] | None = None,
         LR_scheduler: Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler._LRScheduler] | None = None,
     ):
         super().__init__()
@@ -101,8 +103,8 @@ class MEICARModule(L.LightningModule):
             {
                 "model": model.hparams,
                 "metrics": metrics.hparams,
-                "optimizer": optimizer,
-                "LR_scheduler": LR_scheduler,
+                "optimizer": self.optimizer_factory.keywords if self.optimizer_factory else None,
+                "LR_scheduler": self.LR_scheduler_factory.keywords if self.LR_scheduler_factory else None,
             }
         )
 
@@ -137,6 +139,9 @@ class MEICARModule(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
+        if self.optimizer_factory is None:
+            raise ValueError("Optimizer factory is not set. Cannot configure optimizers.")
+
         optimizer = self.optimizer_factory(self.parameters())
 
         if self.LR_scheduler_factory is None:
