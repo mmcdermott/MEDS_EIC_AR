@@ -39,6 +39,11 @@ MEICAR_process_data input_dir="$RAW_MEDS_DIR" \
     output_dir="$FINAL_DATA_DIR"
 ```
 
+> [!NOTE]
+> If your data is not sharded by split at the outset, you will need to add the `do_reshard=True` command line
+> parameter to the `MEICAR_process_data` command, which ensures the system reshards the data to be sub-sharded
+> by split before beginning pre-processing.
+
 You can also run this in demo mode, which lowers the filtering thresholds significantly so the script does not
 filter out all data:
 
