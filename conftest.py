@@ -18,75 +18,83 @@ from MEDS_EIC_AR.model.model import Model
 from MEDS_EIC_AR.training.module import MEICARModule
 
 
-@pytest.fixture(scope="session")
-def preprocessed_dataset_with_reshard(simple_static_MEDS: Path) -> Path:
-    """Fixture to create a preprocessed dataset."""
+def run_and_check(cmd: list[str]) -> dict[str, str]:
+    """Runs a command and checks the output.
 
-    with tempfile.TemporaryDirectory() as test_root:
-        test_root = Path(test_root)
+    Args:
+        cmd: The command to run. This should be a list of strings, which will be run through subprocess.run in
+            shell=False mode.
 
-        input_dir = simple_static_MEDS
-        interemediate_dir = test_root / "intermediate"
-        output_dir = test_root / "output"
+    Raises:
+        ValueError: If the command fails.
 
-        cmd = [
+    Returns:
+        A dictionary with the keys "stdout" and "stderr", containing the output of the command.
+    """
+
+    cmd_out = subprocess.run(cmd, capture_output=True, check=False)
+
+    out = {"stdout": cmd_out.stdout.decode(), "stderr": cmd_out.stderr.decode()}
+
+    if cmd_out.returncode == 0:
+        return
+
+    err = [f"Command failed with code {out.returncode}", "Stdout:", out["stdout"], "Stderr:", out["stderr"]]
+    raise ValueError("\n".join(err))
+
+
+def run_process_data(input_dir: Path, root_dir: Path, do_demo: bool = True, do_reshard: bool = False) -> Path:
+    """Runs the pre-process code and returns the output directory.
+
+    Args:
+        input_dir: The input directory to process.
+        root_dir: This is the root dir of the output data, and the intermediate dir is set to
+            `root_dir / "intermediate"` and the output dir is set to `root_dir / "output"`.
+        do_demo: Whether to run the demo mode.
+        do_reshard: Whether to run the resharding step.
+
+    Returns:
+        The output directory (`root_dir / "output"`).
+
+    Raises:
+        ValueError: If the command fails.
+    """
+
+    interemediate_dir = root_dir / "intermediate"
+    output_dir = root_dir / "output"
+
+    run_and_check(
+        [
             "MEICAR_process_data",
             f"input_dir={input_dir!s}",
             f"intermediate_dir={interemediate_dir!s}",
             f"output_dir={output_dir!s}",
-            "do_demo=True",
-            "do_reshard=True",
+            f"do_demo={do_demo}",
+            f"do_reshard={do_reshard}",
         ]
+    )
 
-        out = subprocess.run(cmd, capture_output=True, check=False)
-
-        err_lines = [
-            "Command failed:",
-            "Stdout:",
-            out.stdout.decode(),
-            "Stderr:",
-            out.stderr.decode(),
-        ]
-
-        if out.returncode != 0:
-            raise ValueError("\n".join([*err_lines, f"Return code: {out.returncode}"]))
-
-        yield output_dir
+    return output_dir
 
 
 @pytest.fixture(scope="session")
-def preprocessed_dataset(simple_static_MEDS: Path) -> Path:
+def preprocessed_dataset_with_reshard(
+    simple_static_MEDS: Path, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
     """Fixture to create a preprocessed dataset."""
 
-    with tempfile.TemporaryDirectory() as test_root:
-        test_root = Path(test_root)
+    test_root = tmp_path_factory.mktemp("preprocessed_dataset_with_reshard")
 
-        input_dir = simple_static_MEDS
-        interemediate_dir = test_root / "intermediate"
-        output_dir = test_root / "output"
+    return run_process_data(simple_static_MEDS, test_root, do_reshard=True)
 
-        cmd = [
-            "MEICAR_process_data",
-            f"input_dir={input_dir!s}",
-            f"intermediate_dir={interemediate_dir!s}",
-            f"output_dir={output_dir!s}",
-            "do_demo=True",
-        ]
 
-        out = subprocess.run(cmd, capture_output=True, check=False)
+@pytest.fixture(scope="session")
+def preprocessed_dataset(simple_static_MEDS: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Fixture to create a preprocessed dataset."""
 
-        err_lines = [
-            "Command failed:",
-            "Stdout:",
-            out.stdout.decode(),
-            "Stderr:",
-            out.stderr.decode(),
-        ]
+    test_root = tmp_path_factory.mktemp("preprocessed_dataset")
 
-        if out.returncode != 0:
-            raise ValueError("\n".join([*err_lines, f"Return code: {out.returncode}"]))
-
-        yield output_dir
+    return run_process_data(simple_static_MEDS, test_root)
 
 
 @pytest.fixture(scope="session")
@@ -140,30 +148,19 @@ def sample_batch(pytorch_dataset: MEDSPytorchDataset) -> MEDSTorchBatch:
 
 
 @pytest.fixture(scope="session")
-def pretrained_model(preprocessed_dataset: Path) -> Path:
-    with tempfile.TemporaryDirectory() as output_dir:
-        output_dir = Path(output_dir)
+def pretrained_model(preprocessed_dataset: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    output_dir = tmp_path_factory.mktemp("pretrained_model")
 
-        cmd = [
+    run_and_check(
+        [
             "MEICAR_pretrain",
             "--config-name=_demo_pretrain",
             f"output_dir={output_dir!s}",
             f"datamodule.config.tensorized_cohort_dir={preprocessed_dataset!s}",
         ]
+    )
 
-        out = subprocess.run(cmd, capture_output=True, check=False)
-
-        err_lines = [
-            "Command failed:",
-            "Stdout:",
-            out.stdout.decode(),
-            "Stderr:",
-            out.stderr.decode(),
-        ]
-
-        if out.returncode != 0:
-            raise ValueError("\n".join([*err_lines, f"Return code: {out.returncode}"]))
-        yield output_dir
+    return output_dir
 
 
 @pytest.fixture(scope="session")
@@ -180,15 +177,17 @@ def pretrained_GPT_model(pretrained_model: Path) -> Model:
 
 @pytest.fixture(scope="session")
 def generated_trajectories(
-    pretrained_model: Path, preprocessed_dataset_with_task: tuple[Path, Path, str]
+    pretrained_model: Path,
+    preprocessed_dataset_with_task: tuple[Path, Path, str],
+    tmp_path_factory: pytest.TempPathFactory,
 ) -> Path:
     tensorized_cohort_dir, task_root_dir, task_name = preprocessed_dataset_with_task
     model_initialization_dir = pretrained_model
 
-    with tempfile.TemporaryDirectory() as output_dir:
-        output_dir = Path(output_dir)
+    output_dir = tmp_path_factory.mktemp("generated_trajectories")
 
-        cmd = [
+    run_and_check(
+        [
             "MEICAR_generate_trajectories",
             "--config-name=_demo_generate_trajectories",
             f"output_dir={output_dir!s}",
@@ -198,20 +197,9 @@ def generated_trajectories(
             "datamodule.batch_size=2",
             "trainer=demo",
         ]
+    )
 
-        out = subprocess.run(cmd, capture_output=True, check=False)
-
-        err_lines = [
-            "Command failed:",
-            "Stdout:",
-            out.stdout.decode(),
-            "Stderr:",
-            out.stderr.decode(),
-        ]
-
-        if out.returncode != 0:
-            raise ValueError("\n".join([*err_lines, f"Return code: {out.returncode}"]))
-        yield output_dir
+    return output_dir
 
 
 @contextmanager
