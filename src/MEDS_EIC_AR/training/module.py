@@ -1,3 +1,6 @@
+import copy
+import logging
+import re
 from collections.abc import Callable, Iterator
 from functools import partial
 from pathlib import Path
@@ -12,6 +15,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..model import Model
 from .metrics import NextCodeMetrics
+
+logger = logging.getLogger(__name__)
 
 
 def _factory_to_dict(factory: partial | None) -> dict[str, Any] | None:
@@ -235,11 +240,157 @@ class MEICARModule(L.LightningModule):
 
         return loss
 
+    @staticmethod
+    def _is_norm_bias_param(n: str) -> bool:
+        """Checks if a parameter name corresponds to a bias or normalization layer.
+
+        Args:
+            n: The name of the parameter.
+
+        Returns:
+            True if the parameter is a bias or normalization layer, False otherwise.
+
+        Examples:
+            >>> MEICARModule._is_norm_bias_param("model.decoder.bias")
+            True
+            >>> MEICARModule._is_norm_bias_param("model.layernorm.weight")
+            True
+            >>> MEICARModule._is_norm_bias_param("model.LayerNorm12.weight")
+            True
+            >>> MEICARModule._is_norm_bias_param("model.decoder.weight")
+            False
+            >>> MEICARModule._is_norm_bias_param("model.HF_model.gpt_neox.final_layer_norm.weight")
+            True
+        """
+        return bool(re.search(r"(bias|layer(_?)norm(\d*)\.weight)", n, re.IGNORECASE))
+
+    def _norm_bias_param_names(self) -> Iterator[str]:
+        """Yields the names of parameters corresponding to the bias and normalization layers.
+
+        These parameters should not be subject to weight decay by the optimizer.
+
+        Examples:
+            >>> list(pretrained_module._norm_bias_param_names())
+            ['model.HF_model.gpt_neox.layers.0.input_layernorm.weight',
+             'model.HF_model.gpt_neox.layers.0.input_layernorm.bias',
+             'model.HF_model.gpt_neox.layers.0.post_attention_layernorm.weight',
+             'model.HF_model.gpt_neox.layers.0.post_attention_layernorm.bias',
+             'model.HF_model.gpt_neox.layers.0.attention.query_key_value.bias',
+             'model.HF_model.gpt_neox.layers.0.attention.dense.bias',
+             'model.HF_model.gpt_neox.layers.0.mlp.dense_h_to_4h.bias',
+             'model.HF_model.gpt_neox.layers.0.mlp.dense_4h_to_h.bias',
+             'model.HF_model.gpt_neox.layers.1.input_layernorm.weight',
+             'model.HF_model.gpt_neox.layers.1.input_layernorm.bias',
+             'model.HF_model.gpt_neox.layers.1.post_attention_layernorm.weight',
+             'model.HF_model.gpt_neox.layers.1.post_attention_layernorm.bias',
+             'model.HF_model.gpt_neox.layers.1.attention.query_key_value.bias',
+             'model.HF_model.gpt_neox.layers.1.attention.dense.bias',
+             'model.HF_model.gpt_neox.layers.1.mlp.dense_h_to_4h.bias',
+             'model.HF_model.gpt_neox.layers.1.mlp.dense_4h_to_h.bias',
+             'model.HF_model.gpt_neox.final_layer_norm.weight',
+             'model.HF_model.gpt_neox.final_layer_norm.bias']
+        """
+
+        for name, _ in self.named_parameters():
+            if self._is_norm_bias_param(name):
+                yield name
+
+    def _norm_bias_params(self) -> Iterator[torch.nn.parameter.Parameter]:
+        """Yields the parameters corresponding to the bias and normalization layers.
+
+        These parameters should not be subject to weight decay by the optimizer.
+        """
+
+        for name in self._norm_bias_param_names():
+            yield self.get_parameter(name)
+
+    def _non_norm_bias_param_names(self) -> Iterator[str]:
+        """Yields the names of parameters corresponding to the non-bias and non-normalization layers.
+
+        These parameters should be subject to weight decay by the optimizer.
+
+        Examples:
+            >>> list(pretrained_module._non_norm_bias_param_names())
+            ['model.HF_model.gpt_neox.embed_in.weight',
+             'model.HF_model.gpt_neox.layers.0.attention.query_key_value.weight',
+             'model.HF_model.gpt_neox.layers.0.attention.dense.weight',
+             'model.HF_model.gpt_neox.layers.0.mlp.dense_h_to_4h.weight',
+             'model.HF_model.gpt_neox.layers.0.mlp.dense_4h_to_h.weight',
+             'model.HF_model.gpt_neox.layers.1.attention.query_key_value.weight',
+             'model.HF_model.gpt_neox.layers.1.attention.dense.weight',
+             'model.HF_model.gpt_neox.layers.1.mlp.dense_h_to_4h.weight',
+             'model.HF_model.gpt_neox.layers.1.mlp.dense_4h_to_h.weight',
+             'model.HF_model.embed_out.weight']
+        """
+
+        for name, _ in self.named_parameters():
+            if not self._is_norm_bias_param(name):
+                yield name
+
+    def _non_norm_bias_params(self) -> Iterator[torch.nn.parameter.Parameter]:
+        """Yields the parameters corresponding to the non-bias and non-normalization layers.
+
+        These parameters should be subject to weight decay by the optimizer.
+        """
+
+        for name in self._non_norm_bias_param_names():
+            yield self.get_parameter(name)
+
+    @property
+    def weight_decay(self) -> float | None:
+        """Returns the weight decay value for the optimizer.
+
+        This is used to set the weight decay value for the optimizer. If the optimizer factory does not
+        contain a weight decay parameter, this will return None.
+
+        Examples:
+            >>> opt_factory = _dict_to_factory({"_target_": "torch.optim.adam.Adam", "weight_decay": 0.01})
+            >>> metrics = NextCodeMetrics(top_k=[1], vocab_size=4)
+            >>> MEICARModule(model=Model({}), metrics=metrics, optimizer=opt_factory).weight_decay
+            0.01
+        """
+        if self.optimizer_factory is None:
+            return None
+        else:
+            return _factory_to_dict(self.optimizer_factory).get("weight_decay", None)
+
+    @property
+    def optimizer_no_decay_factory(
+        self,
+    ) -> Callable[[Iterator[torch.nn.parameter.Parameter]], torch.optim.Optimizer]:
+        """Returns a factory function for creating an optimizer with no weight decay.
+
+        This function is used to create an optimizer that does not apply weight decay to the bias and
+        normalization parameters of the model. It is identical to the main optimizer factory, but with weight
+        decay set to 0.0
+
+        Examples:
+            >>> opt_factory = _dict_to_factory({"_target_": "torch.optim.adam.Adam", "weight_decay": 0.01})
+            >>> model = Model({})
+            >>> metrics = NextCodeMetrics(top_k=[1, 2, 3], vocab_size=4)
+            >>> module = MEICARModule(model=model, metrics=metrics, optimizer=opt_factory)
+            >>> print(_factory_to_dict(module.optimizer_no_decay_factory))
+            {'_target_': 'torch.optim.adam.Adam', 'weight_decay': 0.0}
+        """
+
+        new_factory = copy.deepcopy(self.optimizer_factory)
+        if "weight_decay" in new_factory.keywords:
+            new_factory.keywords["weight_decay"] = 0.0
+        else:
+            logger.warning("No weight decay parameter found in optimizer factory. No changes made.")
+
+        return new_factory
+
     def configure_optimizers(self):
         if self.optimizer_factory is None:
             raise ValueError("Optimizer factory is not set. Cannot configure optimizers.")
 
-        optimizer = self.optimizer_factory(self.parameters())
+        params = [
+            {"params": self._non_norm_bias_params(), "weight_decay": self.weight_decay},
+            {"params": self._norm_bias_params(), "weight_decay": 0.0},
+        ]
+
+        optimizer = self.optimizer_no_decay_factory(params)
 
         if self.LR_scheduler_factory is None:
             return optimizer

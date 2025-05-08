@@ -164,15 +164,21 @@ def pretrained_model(preprocessed_dataset: Path, tmp_path_factory: pytest.TempPa
 
 
 @pytest.fixture(scope="session")
-def pretrained_GPT_model(pretrained_model: Path) -> Model:
-    """Returns the HF model backbone of the pre-trained MEICAR Lightning Module."""
+def pretrained_module(pretrained_model: Path) -> MEICARModule:
+    """Returns the pre-trained MEICAR Lightning Module."""
 
     ckpt_path = pretrained_model / "best_model.ckpt"
     if not ckpt_path.is_file():
         raise ValueError("No best checkpoint reported.")
 
-    module = MEICARModule.load_from_checkpoint(ckpt_path)
-    return module.model
+    return MEICARModule.load_from_checkpoint(ckpt_path)
+
+
+@pytest.fixture(scope="session")
+def pretrained_GPT_model(pretrained_module: MEICARModule) -> Model:
+    """Returns the HF model backbone of the pre-trained MEICAR Lightning Module."""
+
+    return pretrained_module.model
 
 
 @pytest.fixture(scope="session")
@@ -228,6 +234,7 @@ def _setup_doctest_namespace(
     preprocessed_dataset: Path,
     dataset_config: MEDSTorchDataConfig,
     pretrained_GPT_model: Model,
+    pretrained_module: MEICARModule,
     pytorch_dataset: MEDSPytorchDataset,
     pytorch_dataset_with_task: MEDSPytorchDataset,
 ):
@@ -246,6 +253,7 @@ def _setup_doctest_namespace(
             "sample_batch": sample_batch,
             "dataset_config": dataset_config,
             "pretrained_GPT_model": pretrained_GPT_model,
+            "pretrained_module": pretrained_module,
             "pytorch_dataset": pytorch_dataset,
             "pytorch_dataset_with_task": pytorch_dataset_with_task,
         }
