@@ -1,7 +1,9 @@
 from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
+import hydra
 import lightning as L
 import torch
 from meds import held_out_split, train_split, tuning_split
@@ -10,6 +12,101 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..model import Model
 from .metrics import NextCodeMetrics
+
+
+def _factory_to_dict(factory: partial | None) -> dict[str, Any] | None:
+    """Extracts a sufficient dictionary for reconstructing the optimizer or LR scheduler.
+
+    Args:
+        factory: A partial function that creates an optimizer or LR scheduler. This comes from the Hydra
+            instantiation's "partial" functionality, which is used to partially initialize optimizers or LR
+            schedulers without the need to pass in the parameters or optimizers, respectively.
+
+    Returns:
+        A dictionary suitable for storing, logging, and sufficient to reconstruct the given factory function.
+        The dictionary will contain the special key "_target_" which contains the full path to the target
+        function or module to be called. The rest of the dictionary will contain the keyword arguments passed
+        in the partial. If the factory is None, returns None.
+
+    Raises:
+        TypeError: If the factory is not a partial function.
+        ValueError: If the factory partial has any positional arguments or if it uses the reserved key
+            "_target_" as a keyword argument.
+
+    Examples:
+        >>> print(_factory_to_dict(None))
+        None
+        >>> _factory_to_dict(partial(torch.optim.Adam, lr=0.001))
+        {'_target_': 'torch.optim.adam.Adam', 'lr': 0.001}
+        >>> from transformers import get_cosine_schedule_with_warmup
+        >>> _factory_to_dict(partial(get_cosine_schedule_with_warmup, num_warmup_steps=10))
+        {'_target_': 'transformers.optimization.get_cosine_schedule_with_warmup', 'num_warmup_steps': 10}
+
+    Errors include type checking and some value checks:
+
+        >>> _factory_to_dict(43)
+        Traceback (most recent call last):
+            ...
+        TypeError: Expected a partial function, got <class 'int'>
+        >>> _factory_to_dict(partial(torch.optim.Adam, 0.001))
+        Traceback (most recent call last):
+            ...
+        ValueError: Expected a partial function with no positional arguments. Got (0.001,)
+        >>> _factory_to_dict(partial(torch.optim.Adam, lr=0.001, _target_="foo"))
+        Traceback (most recent call last):
+            ...
+        ValueError: Expected a partial function with no _target_ keyword argument. Got _target_=foo
+    """
+    if factory is None:
+        return None
+
+    if not isinstance(factory, partial):
+        raise TypeError(f"Expected a partial function, got {type(factory)}")
+
+    if factory.args:
+        raise ValueError(f"Expected a partial function with no positional arguments. Got {factory.args}")
+
+    kwargs = factory.keywords.copy()
+
+    if "_target_" in kwargs:
+        raise ValueError(
+            "Expected a partial function with no _target_ keyword argument. "
+            f"Got _target_={kwargs['_target_']}"
+        )
+
+    target = f"{factory.func.__module__}.{factory.func.__qualname__}"
+
+    return {"_target_": target, **kwargs}
+
+
+def _dict_to_factory(d: dict[str, Any] | None) -> partial:
+    """Reconstructs a partial function from a dictionary.
+
+    This is actually just a wrapper around `hydra.utils.instantiate` that sets the `_partial_` flag to True,
+    so that it is clear we can use `_factory_to_dict` and `_dict_to_factory` to round-trip encode-decode the
+    partial objects instantiated by `hydra.utils.instantiate`.
+
+    Args:
+        d: A dictionary containing the target function or module to be called under the key "_target_". The
+            rest of the dictionary should contain the keyword arguments to be passed to the function.
+
+    Returns:
+        A partial function that creates an optimizer or LR scheduler.
+
+    Examples:
+        >>> d = {'_target_': 'torch.optim.adam.Adam', 'lr': 0.001}
+        >>> factory = _dict_to_factory(d)
+        >>> print(factory.func)
+        <class 'torch.optim.adam.Adam'>
+        >>> print(factory.keywords)
+        {'lr': 0.001}
+        >>> print(_factory_to_dict(factory))
+        {'_target_': 'torch.optim.adam.Adam', 'lr': 0.001}
+        >>> print(_dict_to_factory(None))
+        None
+    """
+
+    return None if d is None else hydra.utils.instantiate(d, _partial_=True)
 
 
 class MEICARModule(L.LightningModule):
@@ -79,11 +176,11 @@ class MEICARModule(L.LightningModule):
 
         model = Model(**hparams["model"])
         metrics = NextCodeMetrics(**hparams["metrics"])
-        optimizer = hparams["optimizer"]  # noqa: F841
-        LR_scheduler = hparams["LR_scheduler"]  # noqa: F841
+        optimizer = _dict_to_factory(hparams["optimizer"])
+        LR_scheduler = _dict_to_factory(hparams["LR_scheduler"])
 
         return super().load_from_checkpoint(
-            ckpt_path, model=model, metrics=metrics, optimizer=None, LR_scheduler=None
+            ckpt_path, model=model, metrics=metrics, optimizer=optimizer, LR_scheduler=LR_scheduler
         )
 
     def __init__(
@@ -103,8 +200,8 @@ class MEICARModule(L.LightningModule):
             {
                 "model": model.hparams,
                 "metrics": metrics.hparams,
-                "optimizer": self.optimizer_factory.keywords if self.optimizer_factory else None,
-                "LR_scheduler": self.LR_scheduler_factory.keywords if self.LR_scheduler_factory else None,
+                "optimizer": _factory_to_dict(self.optimizer_factory),
+                "LR_scheduler": _factory_to_dict(self.LR_scheduler_factory),
             }
         )
 
