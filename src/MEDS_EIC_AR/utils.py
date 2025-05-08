@@ -1,3 +1,4 @@
+import multiprocessing
 from hashlib import sha256
 
 from MEDS_transforms.configs.utils import OmegaConfResolver
@@ -52,6 +53,36 @@ def int_prod(x: int, y: int) -> int:
         7
     """
     return round(x * y)
+
+
+@OmegaConfResolver
+def sub(x: int, y: int) -> int:
+    """Returns the difference of x and y.
+
+    This function can be used in omega conf configs as a resolved function.
+
+    Examples:
+        >>> sub(5, 1)
+        4
+    """
+    return x - y
+
+
+@OmegaConfResolver
+def num_cores() -> int:
+    """Returns the number of CPU cores available on the machine.
+
+    This function can be used in omega conf configs as a resolved function.
+
+    Returns:
+        The number of CPU cores available on the machine.
+
+    Examples:
+        >>> with patch("multiprocessing.cpu_count", return_value=8):
+        ...     num_cores()
+        8
+    """
+    return multiprocessing.cpu_count()
 
 
 @OmegaConfResolver

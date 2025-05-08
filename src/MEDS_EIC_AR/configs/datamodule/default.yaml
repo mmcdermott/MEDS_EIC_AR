@@ -5,4 +5,4 @@ defaults:
 _target_: "meds_torchdata.extensions.lightning_datamodule.Datamodule"
 
 batch_size: ???
-num_workers: null
+num_workers: ${sub:${num_cores:},1}
