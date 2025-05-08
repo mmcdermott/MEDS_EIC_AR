@@ -99,6 +99,7 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # Unused imports in __init__ files
+"__main__.py" = ["F401"]  # Unused imports in __main__ files as we use them for OmegaConf Resolvers
 
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = ["*MEDS*", "F", "L", "M", "D", "LR_*", "*GPT*"]  # Ignore MEDS in variable names

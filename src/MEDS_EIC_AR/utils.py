@@ -1,6 +1,7 @@
 import multiprocessing
 from hashlib import sha256
 
+import torch
 from MEDS_transforms.configs.utils import OmegaConfResolver
 from omegaconf import DictConfig
 
@@ -33,16 +34,7 @@ def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
 
 @OmegaConfResolver
 def int_prod(x: int, y: int) -> int:
-    """Returns the closest integer to the product of x and y.
-
-    This function can be used in omega conf configs as a resolved function.
-
-    Args:
-        x: The first integer.
-        y: The second integer.
-
-    Returns:
-        The closest integer to the product of x and y.
+    """Returns the closest integer to the product of x and y (available as an OmegaConf resolver).
 
     Examples:
         >>> int_prod(2, 3)
@@ -56,10 +48,19 @@ def int_prod(x: int, y: int) -> int:
 
 
 @OmegaConfResolver
-def sub(x: int, y: int) -> int:
-    """Returns the difference of x and y.
+def oc_min(x: int, y: int) -> int:
+    """Returns the minimum of x and y (available as an OmegaConf resolver).
 
-    This function can be used in omega conf configs as a resolved function.
+    Examples:
+        >>> oc_min(5, 1)
+        1
+    """
+    return min(x, y)
+
+
+@OmegaConfResolver
+def sub(x: int, y: int) -> int:
+    """Returns x - y (available as an OmegaConf resolver).
 
     Examples:
         >>> sub(5, 1)
@@ -69,13 +70,20 @@ def sub(x: int, y: int) -> int:
 
 
 @OmegaConfResolver
+def num_gpus() -> int:
+    """Returns the number of GPUs available on the machine (available as an OmegaConf resolver).
+
+    Examples:
+        >>> with patch("torch.cuda.device_count", return_value=2):
+        ...     num_gpus()
+        2
+    """
+    return torch.cuda.device_count()
+
+
+@OmegaConfResolver
 def num_cores() -> int:
-    """Returns the number of CPU cores available on the machine.
-
-    This function can be used in omega conf configs as a resolved function.
-
-    Returns:
-        The number of CPU cores available on the machine.
+    """Returns the number of CPU cores available on the machine (available as an OmegaConf resolver).
 
     Examples:
         >>> with patch("multiprocessing.cpu_count", return_value=8):

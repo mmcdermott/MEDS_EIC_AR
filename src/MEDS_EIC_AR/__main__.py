@@ -9,12 +9,22 @@ from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchDataConfig
-from MEDS_transforms.runner import load_yaml_file  # noqa: F401
+from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
 
 from .generation import format_trajectories, get_timeline_end_token_idx
 from .training import MEICARModule
-from .utils import hash_based_seed, int_prod, num_cores, resolve_generation_context_size, sub  # noqa: F401
+
+# Import OmegaConf Resolvers
+from .utils import (
+    hash_based_seed,
+    int_prod,
+    num_cores,
+    num_gpus,
+    oc_min,
+    resolve_generation_context_size,
+    sub,
+)
 
 logger = logging.getLogger(__name__)
 
