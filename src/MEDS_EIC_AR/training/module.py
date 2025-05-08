@@ -296,10 +296,7 @@ class MEICARModule(L.LightningModule):
                 yield name
 
     def _norm_bias_params(self) -> Iterator[torch.nn.parameter.Parameter]:
-        """Yields the parameters corresponding to the bias and normalization layers.
-
-        These parameters should not be subject to weight decay by the optimizer.
-        """
+        """Yields the parameters corresponding to the bias and normalization layers."""
 
         for name in self._norm_bias_param_names():
             yield self.get_parameter(name)
@@ -328,10 +325,7 @@ class MEICARModule(L.LightningModule):
                 yield name
 
     def _non_norm_bias_params(self) -> Iterator[torch.nn.parameter.Parameter]:
-        """Yields the parameters corresponding to the non-bias and non-normalization layers.
-
-        These parameters should be subject to weight decay by the optimizer.
-        """
+        """Yields the parameters corresponding to the non-bias and non-normalization layers."""
 
         for name in self._non_norm_bias_param_names():
             yield self.get_parameter(name)
@@ -345,8 +339,15 @@ class MEICARModule(L.LightningModule):
 
         Examples:
             >>> opt_factory = _dict_to_factory({"_target_": "torch.optim.adam.Adam", "weight_decay": 0.01})
-            >>> metrics = NextCodeMetrics(top_k=[1], vocab_size=4)
-            >>> MEICARModule(model=Model({}), metrics=metrics, optimizer=opt_factory).weight_decay
+            >>> model = Model({
+            ...     "num_hidden_layers": 2,
+            ...     "num_attention_heads": 2,
+            ...     "hidden_size": 4,
+            ...     "max_position_embeddings": 3,
+            ...     "vocab_size": 10,
+            ... })
+            >>> metrics = NextCodeMetrics(top_k=[1, 2, 3], vocab_size=4)
+            >>> MEICARModule(model=model, metrics=metrics, optimizer=opt_factory).weight_decay
             0.01
         """
         if self.optimizer_factory is None:
@@ -366,7 +367,13 @@ class MEICARModule(L.LightningModule):
 
         Examples:
             >>> opt_factory = _dict_to_factory({"_target_": "torch.optim.adam.Adam", "weight_decay": 0.01})
-            >>> model = Model({})
+            >>> model = Model({
+            ...     "num_hidden_layers": 2,
+            ...     "num_attention_heads": 2,
+            ...     "hidden_size": 4,
+            ...     "max_position_embeddings": 3,
+            ...     "vocab_size": 10,
+            ... })
             >>> metrics = NextCodeMetrics(top_k=[1, 2, 3], vocab_size=4)
             >>> module = MEICARModule(model=model, metrics=metrics, optimizer=opt_factory)
             >>> print(_factory_to_dict(module.optimizer_no_decay_factory))
