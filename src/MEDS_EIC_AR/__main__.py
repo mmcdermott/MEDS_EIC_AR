@@ -50,6 +50,7 @@ def pretrain(cfg: DictConfig):
         cfg.lightning_module,
         model={"gpt_kwargs": gpt_kwargs},
         metrics={"vocab_size": D.config.vocab_size},
+        data_config=OmegaConf.to_container(cfg.datamodule, resolve=True),
     )
 
     if M.model.do_demo or cfg.get("seed", None):
