@@ -11,5 +11,5 @@ batch_size: ???
 # The number of dataloader workers will default to the minimum of the number of CPU cores minus 1 and the
 # number of GPUs times 8.
 num_workers: ${oc_min:${sub:${num_cores:},1},${int_prod:${num_gpus:},8}}
-# Pinning memory can improve performance when using GPUs, but it is not always necessary.
-pin_memory: false
+# Pinning memory can improve performance when using GPUs.
+pin_memory: ${gpus_available:}

@@ -17,6 +17,7 @@ from .training import MEICARModule
 
 # Import OmegaConf Resolvers
 from .utils import (
+    gpus_available,
     hash_based_seed,
     int_prod,
     num_cores,

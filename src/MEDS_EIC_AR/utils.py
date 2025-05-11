@@ -33,6 +33,21 @@ def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
 
 
 @OmegaConfResolver
+def gpus_available() -> bool:
+    """Returns True if GPUs are available on the machine (available as an OmegaConf resolver).
+
+    Examples:
+        >>> with patch("torch.cuda.is_available", return_value=True):
+        ...     gpus_available()
+        True
+        >>> with patch("torch.cuda.is_available", return_value=False):
+        ...     gpus_available()
+        False
+    """
+    return torch.cuda.is_available()
+
+
+@OmegaConfResolver
 def int_prod(x: int, y: int) -> int:
     """Returns the closest integer to the product of x and y (available as an OmegaConf resolver).
 
