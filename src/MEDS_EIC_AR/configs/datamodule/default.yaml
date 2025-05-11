@@ -4,6 +4,9 @@ defaults:
 
 _target_: "meds_torchdata.extensions.lightning_datamodule.Datamodule"
 
+config:
+  static_inclusion_mode: OMIT
+
 batch_size: ???
 # The number of dataloader workers will default to the minimum of the number of CPU cores minus 1 and the
 # number of GPUs times 8.
