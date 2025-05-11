@@ -2,8 +2,23 @@ import multiprocessing
 from hashlib import sha256
 
 import torch
+from lightning.pytorch.loggers import Logger
 from MEDS_transforms.configs.utils import OmegaConfResolver
 from omegaconf import DictConfig
+
+
+def is_mlflow_logger(logger: Logger) -> bool:
+    """This function checks if a pytorch lightning logger is an MLFlow logger.
+
+    It is protected against the case that mlflow is not installed.
+    """
+
+    try:
+        from lightning.pytorch.loggers import MLFlowLogger
+
+        return isinstance(logger, MLFlowLogger)
+    except ImportError:
+        return False
 
 
 def hash_based_seed(seed: int | None, split: str, sample: int) -> int:

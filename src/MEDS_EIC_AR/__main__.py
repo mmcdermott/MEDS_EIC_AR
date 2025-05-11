@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -20,6 +21,7 @@ from .utils import (
     gpus_available,
     hash_based_seed,
     int_prod,
+    is_mlflow_logger,
     num_cores,
     num_gpus,
     oc_min,
@@ -54,6 +56,14 @@ def pretrain(cfg: DictConfig):
         seed_everything(cfg.get("seed", 1), workers=True)
 
     trainer = instantiate(cfg.trainer)
+    if any(is_mlflow_logger(logger) for logger in trainer.loggers):
+        # We do the import only here to avoid importing mlflow if it isn't installed.
+        import mlflow
+
+        if "MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING" not in os.environ:
+            # The user can set this environment variable to enable or disable system metrics logging on their
+            # own, but if they don't, it will by default be enabled.
+            mlflow.enable_system_metrics_logging()
 
     trainer.fit(model=M, datamodule=D)
 

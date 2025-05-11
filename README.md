@@ -19,6 +19,32 @@ This is based on the [MEDS-Torch](https://github.com/Oufattole/meds-torch) model
 pip install MEDS-EIC-AR
 ```
 
+### Optional Dependencies
+
+#### WandB
+
+If you want to use WandB for logging, you can install it via:
+
+```bash
+pip install MEDS-EIC-AR[wandb]
+```
+
+#### MLFlow
+
+If you want to use MLFlow for logging, you can install it via:
+
+```bash
+pip install MEDS-EIC-AR[mlflow]
+```
+
+This will also install `psutil` and `pynvml` as dependencies, to enable MLFlow tracking of system CPU and GPU
+resources, which is enabled by default or can be controlled via the `MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING`
+environment variable. See the
+[MLFlow documentation](https://mlflow.org/docs/latest/system-metrics/#turn-onoff-system-metrics-logging) for
+more details.
+
+#### Flash Attention
+
 For using flash attention, you need to subsequently install flash attention as well. This can often be done
 via:
 

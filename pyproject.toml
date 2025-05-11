@@ -41,7 +41,7 @@ dependencies = [
 [project.optional-dependencies]
 # Extensions
 wandb = ["wandb"]
-mlflow = ["mlflow"]
+mlflow = ["mlflow", "psutil", "pynvml"]
 
 # Core Development
 dev = ["pre-commit<4", "ruff"]
