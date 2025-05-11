@@ -19,6 +19,16 @@ This is based on the [MEDS-Torch](https://github.com/Oufattole/meds-torch) model
 pip install MEDS-EIC-AR
 ```
 
+For using flash attention, you need to subsequently install flash attention as well. This can often be done
+via:
+
+```bash
+pip install flash-attn --no-build-isolation
+```
+
+If you encounter errors, see the [flash-attn](https://github.com/Dao-AILab/flash-attention) package
+documentation.
+
 ## Usage
 
 ### 1. Pre-process your data

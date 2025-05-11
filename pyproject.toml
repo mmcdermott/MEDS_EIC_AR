@@ -40,7 +40,6 @@ dependencies = [
 
 [project.optional-dependencies]
 # Extensions
-flash_attn = ["flash-attn"]
 wandb = ["wandb"]
 mlflow = ["mlflow"]
 
