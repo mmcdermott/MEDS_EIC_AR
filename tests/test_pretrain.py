@@ -102,3 +102,12 @@ def test_resumes(
     ]
 
     run_and_check(command)
+
+    version_1_log_dir = resume_from_dir / "loggers" / "csv" / "version_1"
+    assert version_1_log_dir.is_dir(), "No new log directory created after resuming."
+
+    best_model_ckpt = resume_from_dir / "best_model.ckpt"
+    assert best_model_ckpt.is_file(), "No new best model checkpoint created after resuming."
+
+    last_ckpt = resume_from_dir / "checkpoints" / "last.ckpt"
+    assert last_ckpt.is_file(), "No new last checkpoint created after resuming."

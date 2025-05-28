@@ -1,13 +1,70 @@
 from pathlib import Path
 from typing import Any
 
+from meds_torchdata.types import PaddingSide, StaticInclusionMode, SubsequenceSamplingStrategy
 from omegaconf import DictConfig, OmegaConf
 
-ALLOWED_DIFFERENCE_KEYS = {"do_resume", "output_dir", "do_overwrite", "datamodule.num_workers"}
+ALLOWED_DIFFERENCE_KEYS = {
+    "do_resume",
+    "output_dir",
+    "do_overwrite",
+    "datamodule.num_workers",
+    "trainer.logger.save_dir",
+    "trainer.callbacks.model_checkpoint.dirpath",
+    "trainer.default_root_dir",
+    "log_dir",
+}
+
+STR_ENUM_PARAMS = {
+    "seq_sampling_strategy": SubsequenceSamplingStrategy,
+    "padding_side": PaddingSide,
+    "static_inclusion_mode": StaticInclusionMode,
+}
+
+
+def resolve_enum_value(value: Any, enum_type: type) -> Any:
+    """Resolves a value to its corresponding enum type, handling both string and enum inputs.
+
+    Args:
+        value: The value to resolve, which can be a string or an instance of the enum type.
+        enum_type: The enum type to resolve the value to.
+
+    Returns:
+        The resolved enum value.
+
+    Raises:
+        ValueError: If the value cannot be resolved to the enum type.
+
+    Examples:
+        >>> resolve_enum_value("left", PaddingSide)
+        <PaddingSide.LEFT: 'left'>
+        >>> resolve_enum_value("LEFT", PaddingSide)
+        <PaddingSide.LEFT: 'left'>
+        >>> resolve_enum_value("RANDOM", SubsequenceSamplingStrategy)
+        <SubsequenceSamplingStrategy.RANDOM: 'random'>
+        >>> resolve_enum_value(SubsequenceSamplingStrategy.RANDOM, SubsequenceSamplingStrategy)
+        <SubsequenceSamplingStrategy.RANDOM: 'random'>
+        >>> resolve_enum_value(34, PaddingSide)
+        Traceback (most recent call last):
+            ...
+        ValueError: Expected 34 to be a string or PaddingSide, got int.
+    """
+    match value:
+        case str():
+            return enum_type(value.lower())
+        case enum_type():
+            return value
+        case _:
+            raise ValueError(
+                f"Expected {value} to be a string or {enum_type.__name__}, got {type(value).__name__}."
+            )
 
 
 def diff_configs(new_config: dict[str, Any], old_config: dict[str, Any]) -> dict[str, str]:
     """Compares two configurations and returns a dictionary mapping key names to any differences found.
+
+    This does one additional check beyond pure exclusion -- it looks to see if enum names match for enum
+    parameters that undergo upper-casing or lower-casing via hydra / omegaconf / strenum sheniganigans.
 
     Args:
         new_config: The new configuration to compare.
@@ -25,12 +82,25 @@ def diff_configs(new_config: dict[str, Any], old_config: dict[str, Any]) -> dict
         >>> old_cfg = {"c": 1, "b": 3}
         >>> new_cfg = {"c": 1, "b": 2}
         >>> diff_configs(new_cfg, old_cfg)
-        {'b': 'has value 3 in the old config, but 2 in the new config.'}
+        {'b': 'has value 3 (int) in the old config, but 2 (int) in the new config.'}
         >>> old_cfg = {"c": 1, "foo": {"bar": 3}}
         >>> new_cfg = {"c": 1, "b": 2, "foo": {}}
         >>> diff_configs(new_cfg, old_cfg)
         {'foo.bar': 'is present in the old config, but not in the new config.',
          'b': 'is not present in the old config, but is in the new config.'}
+
+    There are a few enum parameters that are allowed to differ in casing between the two configurations, shown
+    below:
+
+        >>> old_cfg = {
+        ...     "padding_side": "left", "seq_sampling_strategy": "RANDOM", "static_inclusion_mode": "omit"
+        ... }
+        >>> new_cfg = {
+        ...     "padding_side": "LEFT", "seq_sampling_strategy": SubsequenceSamplingStrategy.RANDOM,
+        ...     "static_inclusion_mode": "omit"
+        ... }
+        >>> diff_configs(new_cfg, old_cfg)
+        {}
     """
 
     differences = {}
@@ -45,8 +115,23 @@ def diff_configs(new_config: dict[str, Any], old_config: dict[str, Any]) -> dict
             nested_diffs = diff_configs(new_val, old_val)
             for nested_key, nested_diff in nested_diffs.items():
                 differences[f"{key}.{nested_key}"] = nested_diff
-        elif old_val != new_val:
-            differences[key] = f"has value {old_val} in the old config, but {new_val} in the new config."
+            continue
+
+        different = old_val != new_val
+
+        if key in STR_ENUM_PARAMS:
+            enum_type = STR_ENUM_PARAMS[key]
+
+            old_val_enum = resolve_enum_value(old_val, enum_type)
+            new_val_enum = resolve_enum_value(new_val, enum_type)
+
+            different = old_val_enum != new_val_enum
+
+        if different:
+            differences[key] = (
+                f"has value {old_val} ({type(old_val).__name__}) in the old config, "
+                f"but {new_val} ({type(new_val).__name__}) in the new config."
+            )
 
     for key in new_config:
         if key not in old_config:
@@ -101,8 +186,8 @@ def validate_resume_directory(output_dir: Path, cfg: DictConfig):
         Traceback (most recent call last):
             ...
         ValueError: The configuration in the output directory does not match the input:
-          - key 'datamodule.batch_size' has value 32 in the old config, but 64 in the new config.
-          - key 'max_seq_len' has value 10 in the old config, but 20 in the new config.
+          - key 'datamodule.batch_size' has value 32 (int) in the old config, but 64 (int) in the new config.
+          - key 'max_seq_len' has value 10 (int) in the old config, but 20 (int) in the new config.
           - key 'vocab_size' is present in the old config, but not in the new config.
           - key 'hidden_size' is not present in the old config, but is in the new config.
 
