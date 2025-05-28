@@ -1,8 +1,8 @@
 defaults:
   - model: small
   - metrics: default
-  - optimizer: adam
-  - LR_scheduler: reduce_LR_on_plateau
+  - optimizer: adamw
+  - LR_scheduler: get_cosine_schedule_with_warmup
   - _self_
 
 _target_: MEDS_EIC_AR.training.module.MEICARModule

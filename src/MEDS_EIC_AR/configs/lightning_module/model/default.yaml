@@ -7,8 +7,9 @@ gpt_kwargs:
   # Model Shape
   num_hidden_layers: ???
   num_attention_heads: ???
-  hidden_size: ???
-  intermediate_size: ${prod:${.hidden_size},4}
+  attention_head_dim: ???
+  hidden_size: ${int_prod:${.num_attention_heads},${.attention_head_dim}}
+  intermediate_size: ${int_prod:${.hidden_size},4}
 
   # Regularization
   attention_dropout: 0.0

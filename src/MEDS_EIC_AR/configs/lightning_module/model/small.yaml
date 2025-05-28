@@ -4,5 +4,5 @@ defaults:
 
 gpt_kwargs:
   num_hidden_layers: 3
-  num_attention_heads: 12
-  hidden_size: 1024
+  num_attention_heads: 16
+  attention_head_dim: 64

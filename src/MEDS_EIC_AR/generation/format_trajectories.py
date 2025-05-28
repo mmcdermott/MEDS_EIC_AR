@@ -3,7 +3,7 @@ from typing import NamedTuple
 
 import polars as pl
 import torch
-from meds import code_field, numeric_value_field, prediction_time_field, subject_id_field, time_field
+from meds import DataSchema, LabelSchema
 from meds_torchdata import MEDSPytorchDataset
 from MEDS_transforms.stages.add_time_derived_measurements.utils import normalize_time_unit
 
@@ -264,6 +264,14 @@ def format_trajectory_batch(
         │ 1               ┆ 1          ┆ 1993-02-08 10:29:07     ┆ TIMELINE//DELTA//mos//C ┆ 1.0           │
         │ 1               ┆ 1          ┆ 1994-02-08 16:17:53.080 ┆ TIMELINE//DELTA//yrs//C ┆ 1.0           │
         └─────────────────┴────────────┴─────────────────────────┴─────────────────────────┴───────────────┘
+
+    Note than an error is raised if the schema chunk does not have the same batch size as the generated
+    tokens:
+
+        >>> format_trajectory_batch(schema_df[:0], generated_code_indices, code_information)
+        Traceback (most recent call last):
+            ...
+        ValueError: Batch size 1 does not match schema chunk size 0
     """
 
     batch_size = generated_code_indices.shape[0]
@@ -272,8 +280,8 @@ def format_trajectory_batch(
 
     rows = []
     for i in range(batch_size):
-        subject_id = schema_chunk.select(subject_id_field)[i].item()
-        time = schema_chunk.select(prediction_time_field)[i].item()
+        subject_id = schema_chunk.select(DataSchema.subject_id_name)[i].item()
+        time = schema_chunk.select(LabelSchema.prediction_time_name)[i].item()
         task_sample_id = schema_chunk.select(TASK_SAMPLE_ID_COL)[i].item()
 
         for code_idx in generated_code_indices[i]:
@@ -293,10 +301,10 @@ def format_trajectory_batch(
             rows.append(
                 {
                     TASK_SAMPLE_ID_COL: task_sample_id,
-                    subject_id_field: subject_id,
-                    time_field: time,
-                    code_field: code,
-                    numeric_value_field: value_mean,
+                    DataSchema.subject_id_name: subject_id,
+                    DataSchema.time_name: time,
+                    DataSchema.code_name: code,
+                    DataSchema.numeric_value_name: value_mean,
                 }
             )
 
@@ -304,10 +312,10 @@ def format_trajectory_batch(
         rows,
         schema={
             TASK_SAMPLE_ID_COL: pl.Int64,
-            subject_id_field: pl.Int64,
-            time_field: pl.Datetime,
-            code_field: pl.Utf8,
-            numeric_value_field: pl.Float32,
+            DataSchema.subject_id_name: pl.Int64,
+            DataSchema.time_name: pl.Datetime,
+            DataSchema.code_name: pl.Utf8,
+            DataSchema.numeric_value_name: pl.Float32,
         },
     )
 
@@ -397,7 +405,7 @@ def format_trajectories(
             )
 
     output_schema = (
-        dataset.schema_df.select(subject_id_field, prediction_time_field).clone()
+        dataset.schema_df.select(DataSchema.subject_id_name, LabelSchema.prediction_time_name).clone()
     ).with_row_index(TASK_SAMPLE_ID_COL)
 
     batches_as_df = []

@@ -1,0 +1,64 @@
+input_dir: ${oc.env:RAW_MEDS_DIR}
+output_dir: ${oc.env:MTD_INPUT_DIR}
+
+stages:
+  - reshard_to_split:
+      n_subjects_per_shard: 10000
+  - add_time_derived_measurements:
+      age: null
+      time_of_day: null
+      timeline_tokens:
+        time_unit: years
+  - count_codes:
+      aggregations:
+        - code/n_occurrences
+        - code/n_subjects
+    _base_stage: aggregate_code_metadata
+  - filter_measurements:
+      _match_revise:
+        - _matcher: # No filter for static measurements
+            time:
+              present: False
+        - _matcher: # No filter for birth, death, admission, discharge, registration, or time intervals.
+            code:
+              regex: "MEDS_DEATH.*|MEDS_BIRTH.*|.*ADMISSION.*|.*DISCHARGE.*|.*REGISTRATION.*|.*TIME.*"
+        - _matcher:
+            time:
+              present: True
+          min_subjects_per_code: ${oc.decode:${oc.env:MIN_SUBJECTS_PER_CODE,1000}}
+  - filter_subjects:
+      min_events_per_subject: ${oc.decode:${oc.env:MIN_EVENTS_PER_SUBJECT,10}}
+      min_measurements_per_subject: null
+  - fit_quantile_binning:
+      aggregations:
+        - code/n_occurrences
+        - code/n_subjects
+        - name: values/quantiles
+          quantiles: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    _base_stage: aggregate_code_metadata
+  - bin_numeric_values:
+      do_drop_numeric_value: True
+      custom_bins:
+        TIMELINE//DELTA//years:
+          1_minute: 0.00000190258
+          5_minutes: 0.00000951293
+          10_minutes: 0.00001902587
+          30_minutes: 0.00005707762
+          1_hour: 0.00011415525
+          3_hours: 0.00034246575
+          6_hours: 0.0006849315
+          12_hours: 0.00136986301
+          1_day: 0.00273972602
+          2_days: 0.00547945205
+          4_days: 0.0109589041
+          7_days: 0.01917808219
+          14_days: 0.03835616438
+          30_days: 0.08219178082
+          60_days: 0.16438356164
+          120_days: 0.32876712328
+          1_year: 1
+          2_years: 2
+          5_years: 5
+          10_years: 10
+          20_years: 20
+          40_years: 40

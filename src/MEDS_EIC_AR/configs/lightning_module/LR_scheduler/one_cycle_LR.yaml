@@ -1,0 +1,8 @@
+_target_: torch.optim.lr_scheduler.OneCycleLR
+_partial_: true
+
+max_lr: ${..optimizer.lr} # The optimizer LR should be the maximum LR
+total_steps: ${trainer.max_steps} # automatically consistent with trainer
+pct_start: 0.1
+anneal_strategy: cosine
+final_div_factor: 1e4

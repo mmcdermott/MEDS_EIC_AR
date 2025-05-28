@@ -2,6 +2,7 @@ defaults:
   - datamodule: generate_trajectories
   - trainer: default
   - inference: default
+  - _self_
 
 model_initialization_dir: ???
 _generation_context_size: ${resolve_generation_context_size:${seq_lens}}

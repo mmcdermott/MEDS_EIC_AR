@@ -3,7 +3,7 @@
 [![PyPI - Version](https://img.shields.io/pypi/v/MEDS-EIC-AR)](https://pypi.org/project/MEDS-EIC-AR/)
 ![python](https://img.shields.io/badge/-Python_3.12-blue?logo=python&logoColor=white)
 [![codecov](https://codecov.io/gh/mmcdermott/MEDS_EIC_AR/graph/badge.svg?token=5RORKQOZF9)](https://codecov.io/gh/mmcdermott/MEDS_EIC_AR)
-[![tests](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/tests.yaml/badge.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/tests.yml)
+[![tests](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/tests.yaml/badge.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/tests.yaml)
 [![code-quality](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/code-quality-main.yaml/badge.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/actions/workflows/code-quality-main.yaml)
 [![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/mmcdermott/MEDS_EIC_AR#license)
 [![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/pulls)
@@ -18,6 +18,42 @@ This is based on the [MEDS-Torch](https://github.com/Oufattole/meds-torch) model
 ```bash
 pip install MEDS-EIC-AR
 ```
+
+### Optional Dependencies
+
+#### WandB
+
+If you want to use WandB for logging, you can install it via:
+
+```bash
+pip install MEDS-EIC-AR[wandb]
+```
+
+#### MLFlow
+
+If you want to use MLFlow for logging, you can install it via:
+
+```bash
+pip install MEDS-EIC-AR[mlflow]
+```
+
+This will also install `psutil` and `pynvml` as dependencies, to enable MLFlow tracking of system CPU and GPU
+resources, which is enabled by default or can be controlled via the `MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING`
+environment variable. See the
+[MLFlow documentation](https://mlflow.org/docs/latest/system-metrics/#turn-onoff-system-metrics-logging) for
+more details.
+
+#### Flash Attention
+
+For using flash attention, you need to subsequently install flash attention as well. This can often be done
+via:
+
+```bash
+pip install flash-attn --no-build-isolation
+```
+
+If you encounter errors, see the [flash-attn](https://github.com/Dao-AILab/flash-attention) package
+documentation.
 
 ## Usage
 
@@ -39,6 +75,11 @@ MEICAR_process_data input_dir="$RAW_MEDS_DIR" \
     output_dir="$FINAL_DATA_DIR"
 ```
 
+> [!NOTE]
+> If your data is not sharded by split at the outset, you will need to add the `do_reshard=True` command line
+> parameter to the `MEICAR_process_data` command, which ensures the system reshards the data to be sub-sharded
+> by split before beginning pre-processing.
+
 You can also run this in demo mode, which lowers the filtering thresholds significantly so the script does not
 filter out all data:
 
@@ -52,10 +93,6 @@ You can exert more fine-grained control on the filtering with the following envi
     final vocabulary? Note that this excludes some sentinel codes which are always retained.
 2. `MIN_EVENTS_PER_SUBJECT`: How many events must a subject have to be included in the final dataset?
 
-> [!WARNING]
-> I suspect this is not actually working yet. Tests currently just ensure it does not crash; not that the
-> entire output of the pipeline looks as expected.
-
 ### 2. Pre-train the model
 
 You can pre-train the model using the `MEICAR_pretrain` command. To use this, let us assume you have a new
@@ -64,8 +101,7 @@ directory to store the pretrained model artifacts called `$PRETRAINED_MODEL_DIR`
 ```bash
 MEICAR_pretrain datamodule.config.tensorized_cohort_dir="$FINAL_DATA_DIR" \
     output_dir="$PRETRAINED_MODEL_DIR" \
-    datamodule.batch_size=32 \
-    trainer.max_epochs=10
+    datamodule.batch_size=32
 ```
 
 to train the model for 10 epochs.
@@ -77,8 +113,8 @@ though you will more likely materialize an experimental configuration file to di
 the config path and name directly in the normal hydra manner.
 
 > [!WARNING]
-> I suspect this is not actually working yet. Tests currently just ensure it does not crash; not that the
-> entire output of the pipeline looks as expected.
+> Tests here only validate that the model runs without errors and (in demo mode) runs without producing nans
+> or invalid values. It has not yet been assessed to ensure it runs to convergence, etc.
 
 ### 3. Zero-shot Inference
 
@@ -134,6 +170,63 @@ This will generate trajectories for the task cohort and save them in the format:
 See the documentation for [`format_trajectories`](src/MEDS_EIC_AR/generation/format_trajectories.py) for more
 details on the format of the generated trajectories.
 
+> [!WARNING]
+> The tests here only validate that this runs without errors and produces trajectory files that are valid,
+> non-identical across different samples, and containing the right subjects. It has not yet been assessed to
+> ensure full correctness.
+
 #### 3.2 Resolve Trajectories into Predictions.
 
 Not yet implemented.
+
+## Documentation
+
+### Configuration and Controlling Model Structure
+
+This model is configured via Hydra and PyTorch lightning. The configuration structure of this repository is as
+follows:
+
+```python
+>>> print_directory("./src/MEDS_EIC_AR/configs", config=PrintConfig(file_extension=".yaml"))
+├── _demo_generate_trajectories.yaml
+├── _demo_pretrain.yaml
+├── _generate_trajectories.yaml
+├── _pretrain.yaml
+├── datamodule
+│   ├── default.yaml
+│   ├── generate_trajectories.yaml
+│   └── pretrain.yaml
+├── inference
+│   ├── default.yaml
+│   └── demo.yaml
+├── lightning_module
+│   ├── LR_scheduler
+│   │   ├── cosine_annealing_warm_restarts.yaml
+│   │   ├── get_cosine_schedule_with_warmup.yaml
+│   │   ├── one_cycle_LR.yaml
+│   │   └── reduce_LR_on_plateau.yaml
+│   ├── default.yaml
+│   ├── demo.yaml
+│   ├── metrics
+│   │   └── default.yaml
+│   ├── model
+│   │   ├── default.yaml
+│   │   ├── demo.yaml
+│   │   └── small.yaml
+│   └── optimizer
+│       ├── adam.yaml
+│       └── adamw.yaml
+└── trainer
+    ├── callbacks
+    │   ├── default.yaml
+    │   ├── early_stopping.yaml
+    │   ├── learning_rate_monitor.yaml
+    │   └── model_checkpoint.yaml
+    ├── default.yaml
+    ├── demo.yaml
+    └── logger
+        ├── csv.yaml
+        ├── mlflow.yaml
+        └── wandb.yaml
+
+```

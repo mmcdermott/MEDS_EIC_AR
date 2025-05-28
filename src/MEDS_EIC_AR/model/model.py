@@ -49,6 +49,9 @@ class Model(torch.nn.Module):
         gpt_kwargs: A dictionary of keyword arguments to pass to the GPTNeoXConfig constructor. These can
             include 'max_position_embeddings', 'vocab_size', 'hidden_size', etc.
 
+    Raises:
+        ValueError: If the gpt_kwargs contains a key that is not supported.
+
     Examples:
         >>> _ = torch.manual_seed(0)
         >>> model = Model({
@@ -58,10 +61,26 @@ class Model(torch.nn.Module):
         ...     "max_position_embeddings": 10,
         ...     "vocab_size": dataset_config.vocab_size,
         ... }, precision="16-true")
+
+    Once created, we can use the simple helpers `max_seq_len` and `vocab_size` to access the corresponding
+    elements of the model config:
+
         >>> model.max_seq_len
         10
         >>> model.vocab_size
         39
+
+    We can also run the model on a sample batch of data. This `sample_batch` is defined in our `conftest.py`
+    file and is a MEDSTorchBatch object. The only feature of this batch that we use in this model is the
+    `code` key.
+
+        >>> sample_batch
+        MEDSTorchBatch(code=tensor([[38,  5, 36,  3, 13, 29, 35,  4, 37],
+                                    [38,  5, 36,  2, 22, 25, 35,  4, 37]]),
+                       ...)
+
+    We run over the batch in the normal way, which internally calls the `forward` method of the model:
+
         >>> loss, outputs = model(sample_batch)
         >>> print(loss)
         tensor(3.6660, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
@@ -75,12 +94,18 @@ class Model(torch.nn.Module):
                 [[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.4458e-02, ...,  1.6281e-02]]],
                dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
+
+    The models parameters can be accessed in the normal way.
+
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
         >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
         HF_model.gpt_neox.embed_in.weight (torch.Size([39, 4])): Parameter containing:
         tensor([[-0.0247, -0.0222,  0.0160,  0.0219], ..., [-0.0050, -0.0061, -0.0358,  0.0136]],
                dtype=torch.float16,
                requires_grad=True)
+
+    Let's validate that they have gradients that can be realized via `.backward()` as normal:
+
         >>> print(f"Sample parameter grad?: {sample_param.grad}")
         Sample parameter grad?: None
         >>> loss.backward()
@@ -90,10 +115,20 @@ class Model(torch.nn.Module):
                 ...,
                 [ 1.5251e-02, -6.2347e-02, -3.1921e-02,  7.9102e-02]],
                dtype=torch.float16)
+
+    With a single backward pass, we should not get any infinite gradients:
+
         >>> for name, param in model.named_parameters():
         ...     if param.grad is not None:
         ...         if not _val(torch.isfinite(param.grad).all()):
         ...             raise ValueError(f"Gradient for {name} is not finite.")
+
+    Model errors are raised if we pass invalid GPT kwargs to the constructor:
+
+        >>> Model({"foobar": 2})
+        Traceback (most recent call last):
+            ...
+        ValueError: Config for HF model gpt-neox does not have attribute foobar
     """
 
     HF_model_config: GPTNeoXConfig
@@ -116,6 +151,8 @@ class Model(torch.nn.Module):
         self.HF_model_config: GPTNeoXConfig = AutoConfig.from_pretrained("EleutherAI/gpt-neox-20b")
 
         for key, val in gpt_kwargs.items():
+            if key == "attention_head_dim":
+                continue
             if not hasattr(self.HF_model_config, key):
                 raise ValueError(f"Config for HF model gpt-neox does not have attribute {key}")
             setattr(self.HF_model_config, key, val)
@@ -276,11 +313,13 @@ class Model(torch.nn.Module):
             >>> model.HF_model.gpt_neox.layers[1].attention.query_key_value.bias.shape
             torch.Size([12])
             >>> model.HF_model.gpt_neox.layers[1].attention.query_key_value.bias = torch.nn.Parameter(
-            ...     torch.tensor([float("nan"), 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.])
+            ...     torch.tensor([float("nan"), 0., float("inf"), 0., 0., 0., 0., 0., 0., 0., 0., 0.])
             ... )
             >>> with print_warnings():
             ...     model._check_parameters()
             Warning: Parameter HF_model.gpt_neox.layers.1.attention.query_key_value.bias contains 1/12 nan
+                values.
+            Warning: Parameter HF_model.gpt_neox.layers.1.attention.query_key_value.bias contains 1/12 inf
                 values.
         """
 
@@ -399,18 +438,19 @@ class Model(torch.nn.Module):
 
         return loss, outputs
 
-    def generate(self, batch: MEDSTorchBatch, **kwargs) -> torch.Tensor:
+    def generate(self, batch: MEDSTorchBatch, do_sample: bool = True, **kwargs) -> torch.Tensor:
         """Generates a sequence of tokens from the model using the HF generation mixin.
 
         Examples:
             >>> _ = torch.manual_seed(0)
+            >>> torch.use_deterministic_algorithms(True)
             >>> model = Model({
             ...     "num_hidden_layers": 2,
             ...     "num_attention_heads": 2,
             ...     "hidden_size": 4,
             ...     "max_position_embeddings": 10,
             ...     "vocab_size": dataset_config.vocab_size,
-            ... }, precision="16-true")
+            ... }, precision="32-true")
 
         This model has a maximum sequence length of 10. If we check, our sample batch has a sequence length of
         9:
@@ -420,9 +460,9 @@ class Model(torch.nn.Module):
 
         This means that by default, the model will generate 1 token:
 
-            >>> print(model.generate(sample_batch))
-            tensor([[13],
-                    [31]])
+            >>> print(model.generate(sample_batch, do_sample=False))
+            tensor([[2],
+                    [2]])
 
         If we create a model with a maximum sequence length of 20, we can generate 11 tokens:
 
@@ -433,17 +473,22 @@ class Model(torch.nn.Module):
             ...     "hidden_size": 4,
             ...     "max_position_embeddings": 20,
             ...     "vocab_size": dataset_config.vocab_size,
-            ... }, precision="16-true")
-            >>> print(model.generate(sample_batch))
-            tensor([[13,  8, 27, 19,  6, 16, 29, 28, 35, 25,  9],
-                    [31, 17, 24, 34, 33,  8, 21, 20, 10, 33,  3]])
+            ... }, precision="32-true")
+            >>> print(model.generate(sample_batch, do_sample=False))
+            tensor([[ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
+                    [ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]])
+
+        Note that here, as we've turned sampling off for determinism in these testing algorithms, the
+        generated samples are clearly visibly not meaningful. This is completely expected because we are
+        working with a model that has just been randomly initialized. What if we try with a model that has
+        undergone a (tiny) bit of pre-training? TODO(generation test).
         """
 
         for_hf = self._hf_inputs(batch)
 
         generation_config = GenerationConfig(
             max_new_tokens=self.max_seq_len - batch.code.shape[1],
-            do_sample=True,
+            do_sample=do_sample,
             num_beams=1,  # no beam search
             temperature=1.0,
             pad_token_id=batch.PAD_INDEX,

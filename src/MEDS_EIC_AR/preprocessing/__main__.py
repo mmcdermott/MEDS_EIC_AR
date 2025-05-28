@@ -23,7 +23,7 @@ def process_data(cfg: DictConfig):
     # 0. Pre-MTD pre-processing
     logger.info("Pre-MTD pre-processing")
     done_fp = intermediate_dir / ".done"
-    if done_fp.exists():
+    if done_fp.exists():  # pragma: no cover
         logger.info("Pre-MTD pre-processing already done, skipping")
     else:
         env = copy.deepcopy(os.environ)
@@ -34,7 +34,7 @@ def process_data(cfg: DictConfig):
             env["MIN_SUBJECTS_PER_CODE"] = "2"
             env["MIN_EVENTS_PER_SUBJECT"] = "1"
 
-        pipeline_config_fp = CONFIGS / "_data.yaml"
+        pipeline_config_fp = (CONFIGS / "_reshard_data.yaml") if cfg.do_reshard else (CONFIGS / "_data.yaml")
         cmd = [
             "MEDS_transform-pipeline",
             f"pipeline_config_fp={pipeline_config_fp!s}",
@@ -42,7 +42,7 @@ def process_data(cfg: DictConfig):
         logger.info(f"Running command: {' '.join(cmd)}")
 
         result = subprocess.run(cmd, env=env, capture_output=True, check=False)
-        if result.returncode != 0:
+        if result.returncode != 0:  # pragma: no cover
             logger.error("Error running MEDS_transform-pipeline")
             logger.error(result.stdout.decode())
             logger.error(result.stderr.decode())
@@ -55,7 +55,7 @@ def process_data(cfg: DictConfig):
     logger.info("Running MTD pre-processing")
     done_fp = output_dir / ".done"
 
-    if done_fp.exists():
+    if done_fp.exists():  # pragma: no cover
         logger.info("MTD pre-processing already done, skipping")
     else:
         env = copy.deepcopy(os.environ)
@@ -68,7 +68,7 @@ def process_data(cfg: DictConfig):
         logger.info(f"Running command: {' '.join(cmd)}")
 
         result = subprocess.run(cmd, env=env, capture_output=True, check=False)
-        if result.returncode != 0:
+        if result.returncode != 0:  # pragma: no cover
             logger.error("Error running MTD_preprocess")
             logger.error(result.stderr.decode())
             raise RuntimeError("Error running MTD_preprocess")
