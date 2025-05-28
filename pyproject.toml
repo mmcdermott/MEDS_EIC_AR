@@ -28,8 +28,8 @@ dependencies = [
   "filelock",
   "pytest",
   "meds_testing_helpers~=0.3.0",
-  "MEDS_transforms~=0.5.0",
-  "meds-torch-data[lightning]~=0.6.0",
+  "MEDS-transforms~=0.5.0",
+  "meds-torch-data[lightning]~=0.6.1",
   "transformers",
   "torch",
   "torchmetrics",
@@ -39,9 +39,13 @@ dependencies = [
 [tool.setuptools_scm]
 
 [project.optional-dependencies]
+# Extensions
+wandb = ["wandb"]
+mlflow = ["mlflow", "psutil", "pynvml"]
+
+# Core Development
 dev = ["pre-commit<4", "ruff"]
-tests = ["pytest-cov"]
-flash_attn = ["flash-attn"]
+tests = ["pytest-cov", "pretty_print_directory>=0.1.2"]
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_EIC_AR"
@@ -94,6 +98,7 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # Unused imports in __init__ files
+"__main__.py" = ["F401"]  # Unused imports in __main__ files as we use them for OmegaConf Resolvers
 
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = ["*MEDS*", "F", "L", "M", "D", "LR_*", "*GPT*"]  # Ignore MEDS in variable names

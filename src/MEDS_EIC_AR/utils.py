@@ -1,7 +1,24 @@
+import multiprocessing
 from hashlib import sha256
 
+import torch
+from lightning.pytorch.loggers import Logger
 from MEDS_transforms.configs.utils import OmegaConfResolver
 from omegaconf import DictConfig
+
+
+def is_mlflow_logger(logger: Logger) -> bool:
+    """This function checks if a pytorch lightning logger is an MLFlow logger.
+
+    It is protected against the case that mlflow is not installed.
+    """
+
+    try:
+        from lightning.pytorch.loggers import MLFlowLogger
+
+        return isinstance(logger, MLFlowLogger)
+    except ImportError:
+        return False
 
 
 def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
@@ -31,27 +48,79 @@ def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
 
 
 @OmegaConfResolver
-def prod(x: int, y: int) -> int:
-    """Returns the closest integer to the product of x and y.
-
-    This function can be used in omega conf configs as a resolved function.
-
-    Args:
-        x: The first integer.
-        y: The second integer.
-
-    Returns:
-        The closest integer to the product of x and y.
+def gpus_available() -> bool:
+    """Returns True if GPUs are available on the machine (available as an OmegaConf resolver).
 
     Examples:
-        >>> prod(2, 3)
+        >>> with patch("torch.cuda.is_available", return_value=True):
+        ...     gpus_available()
+        True
+        >>> with patch("torch.cuda.is_available", return_value=False):
+        ...     gpus_available()
+        False
+    """
+    return torch.cuda.is_available()
+
+
+@OmegaConfResolver
+def int_prod(x: int, y: int) -> int:
+    """Returns the closest integer to the product of x and y (available as an OmegaConf resolver).
+
+    Examples:
+        >>> int_prod(2, 3)
         6
-        >>> prod(2, 3.5)
+        >>> int_prod(2, 3.5)
         7
-        >>> prod(2.49, 3)
+        >>> int_prod(2.49, 3)
         7
     """
     return round(x * y)
+
+
+@OmegaConfResolver
+def oc_min(x: int, y: int) -> int:
+    """Returns the minimum of x and y (available as an OmegaConf resolver).
+
+    Examples:
+        >>> oc_min(5, 1)
+        1
+    """
+    return min(x, y)
+
+
+@OmegaConfResolver
+def sub(x: int, y: int) -> int:
+    """Returns x - y (available as an OmegaConf resolver).
+
+    Examples:
+        >>> sub(5, 1)
+        4
+    """
+    return x - y
+
+
+@OmegaConfResolver
+def num_gpus() -> int:
+    """Returns the number of GPUs available on the machine (available as an OmegaConf resolver).
+
+    Examples:
+        >>> with patch("torch.cuda.device_count", return_value=2):
+        ...     num_gpus()
+        2
+    """
+    return torch.cuda.device_count()
+
+
+@OmegaConfResolver
+def num_cores() -> int:
+    """Returns the number of CPU cores available on the machine (available as an OmegaConf resolver).
+
+    Examples:
+        >>> with patch("multiprocessing.cpu_count", return_value=8):
+        ...     num_cores()
+        8
+    """
+    return multiprocessing.cpu_count()
 
 
 @OmegaConfResolver

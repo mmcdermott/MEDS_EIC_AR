@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -10,12 +11,24 @@ from lightning.pytorch import seed_everything
 from lightning.pytorch.loggers import WandbLogger
 from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchDataConfig
-from MEDS_transforms.runner import load_yaml_file  # noqa: F401
+from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
 
 from .generation import format_trajectories, get_timeline_end_token_idx
 from .training import MEICARModule
-from .utils import hash_based_seed, prod, resolve_generation_context_size  # noqa: F401
+
+# Import OmegaConf Resolvers
+from .utils import (
+    gpus_available,
+    hash_based_seed,
+    int_prod,
+    is_mlflow_logger,
+    num_cores,
+    num_gpus,
+    oc_min,
+    resolve_generation_context_size,
+    sub,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +51,21 @@ def pretrain(cfg: DictConfig):
         cfg.lightning_module,
         model={"gpt_kwargs": gpt_kwargs},
         metrics={"vocab_size": D.config.vocab_size},
+        data_config=OmegaConf.to_container(cfg.datamodule, resolve=True),
     )
 
     if M.model.do_demo or cfg.get("seed", None):
         seed_everything(cfg.get("seed", 1), workers=True)
 
     trainer = instantiate(cfg.trainer)
+    if any(is_mlflow_logger(logger) for logger in trainer.loggers):
+        # We do the import only here to avoid importing mlflow if it isn't installed.
+        import mlflow
+
+        if "MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING" not in os.environ:
+            # The user can set this environment variable to enable or disable system metrics logging on their
+            # own, but if they don't, it will by default be enabled.
+            mlflow.enable_system_metrics_logging()
 
     if isinstance(trainer.logger, WandbLogger):
         trainer.logger.watch(M, log="all", log_graph=True)

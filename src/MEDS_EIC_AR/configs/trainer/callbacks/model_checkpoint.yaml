@@ -1,5 +1,6 @@
 model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
+
   dirpath: ${trainer.default_root_dir}/checkpoints # directory to save the model file
   monitor: "tuning/loss"
   verbose: False # verbosity mode

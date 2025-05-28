@@ -8,7 +8,17 @@ _target_: lightning.pytorch.trainer.Trainer
 default_root_dir: ${output_dir}
 
 min_epochs: 1 # prevents early stopping
-max_epochs: ???
+max_epochs: null # We don't control the max epochs, we control the max steps.
+
+# We'll control the model through max_steps rather than max_epochs for consistency across dataset sizes and
+# ease of setting corresponding parameters in the LR scheduler setup.
+# Recommendations in setting max_steps:
+#   * Small models (< 100M parameters): 20,000-50,000 steps
+#   * Medium models (100M-1B parameters): 50,000-200,000 steps
+#   * Large models (> 1B parameters): 200,000+ steps
+# TODO: Eventually, set up _pretrain_small.yaml, _pretrain_medium.yaml, and _pretrain_large.yaml to control
+# this and other model size parameters more easily.
+max_steps: 50000
 
 accelerator: "auto"
 devices: "auto"
