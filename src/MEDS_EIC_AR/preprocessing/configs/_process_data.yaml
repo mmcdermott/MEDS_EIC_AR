@@ -4,6 +4,7 @@ output_dir: ???
 
 log_dir: ${output_dir}/.logs
 
+do_reshard: False
 do_demo: False
 
 hydra:
