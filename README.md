@@ -230,3 +230,30 @@ follows:
         └── wandb.yaml
 
 ```
+
+## Output Files
+
+The output files of the pre-training step are stored in the directory specified by the `output_dir` parameter
+and take the following structure:
+
+```python
+>>> print_directory(pretrained_model)
+├── .logs
+│   ├── .hydra
+│   │   ├── config.yaml
+│   │   ├── hydra.yaml
+│   │   └── overrides.yaml
+│   └── __main__.log
+├── best_model.ckpt
+├── checkpoints
+│   ├── epoch=0-step=2.ckpt
+│   ├── epoch=1-step=4.ckpt
+│   └── last.ckpt
+├── config.yaml
+└── loggers
+    └── csv
+        └── version_0
+            ├── hparams.yaml
+            └── metrics.csv
+
+```
