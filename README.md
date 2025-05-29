@@ -246,7 +246,9 @@ and take the following structure:
 │   └── __main__.log
 ├── best_model.ckpt
 ├── checkpoints
+│   ├── epoch=0-step=1.ckpt
 │   ├── epoch=0-step=2.ckpt
+│   ├── epoch=1-step=3.ckpt
 │   ├── epoch=1-step=4.ckpt
 │   └── last.ckpt
 ├── config.yaml
