@@ -45,7 +45,7 @@ mlflow = ["mlflow", "psutil", "pynvml"]
 
 # Core Development
 dev = ["pre-commit<4", "ruff"]
-tests = ["pytest-cov", "pretty_print_directory>=0.1.2"]
+tests = ["pytest-cov", "pretty_print_directory>=0.1.2", "yaml_to_disk"]
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_EIC_AR"

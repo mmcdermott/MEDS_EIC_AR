@@ -14,7 +14,7 @@ from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
 
 from .generation import format_trajectories, get_timeline_end_token_idx
-from .training import MEICARModule
+from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
 from .utils import (
@@ -40,7 +40,35 @@ MEDSTorchDataConfig.add_to_config_store("datamodule/config")
 def pretrain(cfg: DictConfig):
     st = datetime.now(tz=UTC)
 
-    OmegaConf.save(cfg, Path(cfg.output_dir) / "config.yaml")
+    if cfg.do_overwrite and cfg.do_resume:
+        logger.warning(
+            "Both `do_overwrite` and `do_resume` are set to True. "
+            "Only `do_overwrite` will be used, and the output directory will be cleared."
+        )
+
+    output_dir = Path(cfg.output_dir)
+
+    if output_dir.is_file():
+        raise NotADirectoryError(f"Output directory {output_dir} is a file, not a directory.")
+
+    cfg_path = output_dir / "config.yaml"
+
+    ckpt_path = None
+
+    if cfg_path.exists():
+        if cfg.do_overwrite:
+            logger.info(f"Overwriting existing output directory {output_dir}.")
+            shutil.rmtree(output_dir, ignore_errors=True)
+        elif cfg.do_resume:
+            validate_resume_directory(output_dir, cfg)
+            ckpt_path = find_checkpoint_path(output_dir)
+        else:
+            raise FileExistsError(
+                "Output directory {output_dir} already exists and is populated. "
+                "Use `do_overwrite` or `do_resume` to proceed."
+            )
+    else:
+        OmegaConf.save(cfg, output_dir / "config.yaml")
 
     D = instantiate(cfg.datamodule)
 
@@ -66,7 +94,12 @@ def pretrain(cfg: DictConfig):
             # own, but if they don't, it will by default be enabled.
             mlflow.enable_system_metrics_logging()
 
-    trainer.fit(model=M, datamodule=D)
+    trainer_kwargs = {"model": M, "datamodule": D}
+    if ckpt_path:
+        logger.info(f"Trying to resume training from checkpoint {ckpt_path}.")
+        trainer_kwargs["ckpt_path"] = ckpt_path
+
+    trainer.fit(**trainer_kwargs)
 
     best_ckpt_path = Path(trainer.checkpoint_callback.best_model_path)
     if not best_ckpt_path.is_file():
