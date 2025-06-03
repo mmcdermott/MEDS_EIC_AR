@@ -10,6 +10,9 @@ seed: null
 
 log_dir: ${output_dir}/.logs
 
+do_overwrite: false
+do_resume: true
+
 hydra:
   run:
     dir: "${log_dir}"
