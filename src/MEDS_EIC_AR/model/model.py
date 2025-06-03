@@ -4,7 +4,7 @@ from typing import ClassVar
 import torch
 import torch.nn.functional as F
 from meds_torchdata import MEDSTorchBatch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -170,6 +170,12 @@ class Model(torch.nn.Module):
             self.forward = self._forward_demo
         else:
             self.forward = self._forward
+
+        if isinstance(gpt_kwargs, DictConfig):
+            logger.info("Converting gpt_kwargs from DictConfig to dict.")
+            gpt_kwargs = OmegaConf.to_container(gpt_kwargs, resolve=True)
+        elif not isinstance(gpt_kwargs, dict):
+            logger.warning(f"gpt_kwargs should be a dict or DictConfig, but got {type(gpt_kwargs)}.")
 
         self.hparams = {
             "gpt_kwargs": gpt_kwargs,
