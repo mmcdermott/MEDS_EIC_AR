@@ -183,7 +183,6 @@ class MEICARModule(L.LightningModule):
         metrics = NextCodeMetrics(**hparams["metrics"])
         optimizer = _dict_to_factory(hparams["optimizer"])
         LR_scheduler = _dict_to_factory(hparams["LR_scheduler"])
-        data_config = hparams.get("data_config", None)
 
         return super().load_from_checkpoint(
             ckpt_path,
@@ -191,7 +190,6 @@ class MEICARModule(L.LightningModule):
             metrics=metrics,
             optimizer=optimizer,
             LR_scheduler=LR_scheduler,
-            data_config=data_config,
         )
 
     def __init__(
@@ -200,7 +198,6 @@ class MEICARModule(L.LightningModule):
         metrics: NextCodeMetrics,
         optimizer: Callable[[Iterator[torch.nn.parameter.Parameter]], torch.optim.Optimizer] | None = None,
         LR_scheduler: Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler._LRScheduler] | None = None,
-        data_config: dict | None = None,
     ):
         super().__init__()
         self.model = model
@@ -214,7 +211,6 @@ class MEICARModule(L.LightningModule):
                 "metrics": metrics.hparams,
                 "optimizer": _factory_to_dict(self.optimizer_factory),
                 "LR_scheduler": _factory_to_dict(self.LR_scheduler_factory),
-                "data_config": data_config,
             }
         )
 
