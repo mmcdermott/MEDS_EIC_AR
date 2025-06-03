@@ -252,10 +252,11 @@ and take the following structure:
 │   ├── epoch=1-step=4.ckpt
 │   └── last.ckpt
 ├── config.yaml
-└── loggers
-    └── csv
-        └── version_0
-            ├── hparams.yaml
-            └── metrics.csv
+├── loggers
+│   └── csv
+│       └── version_0
+│           ├── hparams.yaml
+│           └── metrics.csv
+└── resolved_config.yaml
 
 ```

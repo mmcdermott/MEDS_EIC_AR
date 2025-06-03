@@ -253,11 +253,12 @@ def find_checkpoint_path(output_dir: Path) -> Path | None:
         │   ├── epoch=1-step=4.ckpt
         │   └── last.ckpt
         ├── config.yaml
-        └── loggers
-            └── csv
-                └── version_0
-                    ├── hparams.yaml
-                    └── metrics.csv
+        ├── loggers
+        │   └── csv
+        │       └── version_0
+        │           ├── hparams.yaml
+        │           └── metrics.csv
+        └── resolved_config.yaml
 
     Given the structure of an output directory as shown above, this function will return the path to the
     latest checkpoint file, leveraging `last.ckpt` if it exists, or the checkpoint file with the highest epoch

@@ -26,6 +26,7 @@ from .utils import (
     num_gpus,
     oc_min,
     resolve_generation_context_size,
+    save_resolved_config,
     sub,
 )
 
@@ -69,6 +70,7 @@ def pretrain(cfg: DictConfig):
             )
     else:
         OmegaConf.save(cfg, output_dir / "config.yaml")
+        save_resolved_config(cfg, output_dir / "resolved_config.yaml")
 
     D = instantiate(cfg.datamodule)
 

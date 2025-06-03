@@ -1,10 +1,14 @@
+import logging
 import multiprocessing
 from hashlib import sha256
+from pathlib import Path
 
 import torch
 from lightning.pytorch.loggers import Logger
 from MEDS_transforms.configs.utils import OmegaConfResolver
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+
+logger = logging.getLogger(__name__)
 
 
 def is_mlflow_logger(logger: Logger) -> bool:
@@ -306,3 +310,49 @@ def resolve_generation_context_size(seq_lens: DictConfig) -> int:
                 f"If non-null, 'frac_seq_len_as_context' must be a float between 0 and 1. Got {val}."
             )
         return min(max(round(pretrained_seq_len * val), 1), pretrained_seq_len - 1)
+
+
+def save_resolved_config(cfg: DictConfig, fp: Path) -> bool:
+    """Save a fully resolved version of an OmegaConf DictConfig.
+
+    Args:
+        cfg: The OmegaConf DictConfig to resolve and save.
+        fp: The path where the resolved configuration should be saved.
+
+    Returns:
+        True if the configuration was successfully saved, False otherwise.
+
+    This function resolves all interpolations in the provided DictConfig and saves it to the specified file
+    path. If the resolution fails, it will log a warning and do nothing. This function will not error out.
+
+    Examples:
+        >>> cfg = DictConfig({"some_other_key": "value", "key": "${some_other_key}"})
+        >>> with print_warnings(), tempfile.NamedTemporaryFile(suffix=".yaml") as tmp_file:
+        ...     saved = save_resolved_config(cfg, Path(tmp_file.name))
+        ...     contents = Path(tmp_file.name).read_text()
+        ...     print(f"Saved: {saved}")
+        ...     print("Contents:")
+        ...     print(contents)
+        Saved: True
+        Contents:
+        some_other_key: value
+        key: value
+
+    If the resolution fails, it will log a warning and return False:
+
+        >>> cfg = DictConfig({"key": "${non_existent_key}"})
+        >>> with print_warnings(), tempfile.NamedTemporaryFile(suffix=".yaml") as tmp_file:
+        ...     saved = save_resolved_config(cfg, Path(tmp_file.name))
+        ...     print(f"Saved: {saved}")
+        Saved: False
+        Warning: Could not save resolved config: Interpolation key 'non_existent_key' not found...
+    """
+
+    try:
+        # Create a copy and resolve all interpolations
+        resolved_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        OmegaConf.save(resolved_cfg, fp)
+        return True
+    except Exception as e:
+        logger.warning(f"Could not save resolved config: {e}")
+        return False
