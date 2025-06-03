@@ -6,6 +6,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import hydra
+import torch
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from meds import held_out_split, train_split, tuning_split
@@ -72,6 +73,9 @@ def pretrain(cfg: DictConfig):
         OmegaConf.save(cfg, output_dir / "config.yaml")
         save_resolved_config(cfg, output_dir / "resolved_config.yaml")
 
+    logger.info("Setting torch float32 matmul precision to 'medium'.")
+    torch.set_float32_matmul_precision("medium")
+
     D = instantiate(cfg.datamodule)
 
     gpt_kwargs = {"vocab_size": D.config.vocab_size, "eos_token_id": get_timeline_end_token_idx(D.config)}
@@ -118,6 +122,9 @@ def pretrain(cfg: DictConfig):
 @hydra.main(version_base=None, config_path=str(CONFIGS), config_name="_generate_trajectories")
 def generate_trajectories(cfg: DictConfig):
     st = datetime.now(tz=UTC)
+
+    logger.info("Setting torch float32 matmul precision to 'medium'.")
+    torch.set_float32_matmul_precision("medium")
 
     D = instantiate(cfg.datamodule)
 
