@@ -1,0 +1,6 @@
+defaults:
+  - default
+  - model: large
+  - optimizer: adamw
+  - override optimizer/lr: 5e-5
+  - _self_

@@ -1,0 +1,6 @@
+defaults:
+  - default
+  - model: micro
+  - optimizer: adamw
+  - override optimizer/lr: 3e-4
+  - _self_

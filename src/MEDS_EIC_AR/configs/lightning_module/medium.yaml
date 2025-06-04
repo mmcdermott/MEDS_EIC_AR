@@ -1,0 +1,6 @@
+defaults:
+  - default
+  - model: medium
+  - optimizer: adamw
+  - override optimizer/lr: 1e-4
+  - _self_
