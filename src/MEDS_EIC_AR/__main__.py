@@ -66,7 +66,7 @@ def pretrain(cfg: DictConfig):
             ckpt_path = find_checkpoint_path(output_dir)
         else:
             raise FileExistsError(
-                "Output directory {output_dir} already exists and is populated. "
+                f"Output directory {output_dir} already exists and is populated. "
                 "Use `do_overwrite` or `do_resume` to proceed."
             )
     else:
