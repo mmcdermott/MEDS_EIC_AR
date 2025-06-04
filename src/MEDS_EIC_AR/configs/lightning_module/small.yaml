@@ -1,6 +1,7 @@
 defaults:
   - default
   - model: small
-  - optimizer: adamw
-  - override optimizer/lr: 2e-4
   - _self_
+
+optimizer:
+  lr: 2e-4
