@@ -30,7 +30,7 @@ log_every_n_steps: 50
 
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 1
-val_check_interval: 1000
+val_check_interval: 0.2 # validate five times per epoch
 limit_val_batches: 200 # use only up to 200 validation batches to speed up training
 
 # set True to to ensure deterministic results
