@@ -23,8 +23,7 @@ max_steps: 50000
 accelerator: "auto"
 devices: "auto"
 
-# mixed precision for extra speed-up
-# precision: 16
+accumulate_grad_batches: 1 # set to 1 for no gradient accumulation, >1 for gradient accumulation
 
 log_every_n_steps: 50
 
@@ -38,4 +37,5 @@ limit_val_batches: 200 # use only up to 200 validation batches to speed up train
 deterministic: False
 
 gradient_clip_val: 1.0
+# mixed precision for extra speed-up
 precision: "16-mixed"
