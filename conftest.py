@@ -60,14 +60,14 @@ def run_process_data(input_dir: Path, root_dir: Path, do_demo: bool = True, do_r
         ValueError: If the command fails.
     """
 
-    interemediate_dir = root_dir / "intermediate"
+    intermediate_dir = root_dir / "intermediate"
     output_dir = root_dir / "output"
 
     run_and_check(
         [
             "MEICAR_process_data",
             f"input_dir={input_dir!s}",
-            f"intermediate_dir={interemediate_dir!s}",
+            f"intermediate_dir={intermediate_dir!s}",
             f"output_dir={output_dir!s}",
             f"do_demo={do_demo}",
             f"do_reshard={do_reshard}",
