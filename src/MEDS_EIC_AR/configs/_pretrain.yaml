@@ -1,5 +1,5 @@
 defaults:
-  - lightning_module: default
+  - lightning_module: ???
   - datamodule: pretrain
   - trainer: default
   - _self_

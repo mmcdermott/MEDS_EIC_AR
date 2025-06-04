@@ -1,0 +1,7 @@
+defaults:
+  - default
+  - model: medium
+  - _self_
+
+optimizer:
+  lr: 1e-4

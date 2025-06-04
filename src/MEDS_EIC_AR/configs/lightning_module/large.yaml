@@ -1,0 +1,7 @@
+defaults:
+  - default
+  - model: large
+  - _self_
+
+optimizer:
+  lr: 5e-5

@@ -24,15 +24,22 @@ configuration structure is as follows:
 │   │   └── reduce_LR_on_plateau.yaml
 │   ├── default.yaml
 │   ├── demo.yaml
+│   ├── large.yaml
+│   ├── medium.yaml
 │   ├── metrics
 │   │   └── default.yaml
+│   ├── micro.yaml
 │   ├── model
 │   │   ├── default.yaml
 │   │   ├── demo.yaml
+│   │   ├── large.yaml
+│   │   ├── medium.yaml
+│   │   ├── micro.yaml
 │   │   └── small.yaml
-│   └── optimizer
-│       ├── adam.yaml
-│       └── adamw.yaml
+│   ├── optimizer
+│   │   ├── adam.yaml
+│   │   └── adamw.yaml
+│   └── small.yaml
 └── trainer
     ├── callbacks
     │   ├── default.yaml

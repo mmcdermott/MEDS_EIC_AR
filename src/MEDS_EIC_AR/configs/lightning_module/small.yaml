@@ -1,0 +1,7 @@
+defaults:
+  - default
+  - model: small
+  - _self_
+
+optimizer:
+  lr: 2e-4
