@@ -1,6 +1,6 @@
 defaults:
   - default
-  - override model: demo
+  - model: demo
   - _self_
 
 metrics:
