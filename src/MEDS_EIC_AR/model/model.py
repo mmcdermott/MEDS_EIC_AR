@@ -139,9 +139,9 @@ class Model(torch.nn.Module):
     PRECISION_TO_MODEL_WEIGHTS_DTYPE: ClassVar[dict[str, torch.dtype]] = {
         "32-true": torch.float32,
         "16-true": torch.float16,
-        "16-mixed": torch.float16,
+        "16-mixed": torch.float32,
         "bf16-true": torch.bfloat16,
-        "bf16-mixed": torch.float16,
+        "bf16-mixed": torch.float32,
         "transformer-engine": torch.bfloat16,
     }
 
@@ -162,6 +162,19 @@ class Model(torch.nn.Module):
         if HAS_FLASH_ATTN:
             logger.info("Using FlashAttention 2 for the model.")
             extra_kwargs["attn_implementation"] = "flash_attention_2"
+
+            if precision in {"16-mixed", "bf16-mixed"}:
+                logger.info(
+                    "Using mixed precision for Flash Attention 2.0. Ignore the warning that may appear "
+                    "below about Flash Attention 2.0 only supporting torch.float16 and torch.bfloat16. "
+                    "Lightning will automatically cast the model to the correct dtype during training in "
+                    "mixed precision mode."
+                )
+            elif precision not in {"16-true", "bf16-true", "transformer-engine"}:
+                logger.warning(
+                    "Flash Attention 2.0 is only supported for precision '16-true', 'bf16-true', "
+                    f"'transformer-engine', '16-mixed' and 'bf16-mixed'. Using {precision} may cause errors."
+                )
 
         self.HF_model = AutoModelForCausalLM.from_config(self.HF_model_config, **extra_kwargs)
 
