@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import NamedTuple
 
 import polars as pl
@@ -281,7 +281,8 @@ def format_trajectory_batch(
     rows = []
     for i in range(batch_size):
         subject_id = schema_chunk.select(DataSchema.subject_id_name)[i].item()
-        time = schema_chunk.select(LabelSchema.prediction_time_name)[i].item()
+        prediction_time = schema_chunk.select(LabelSchema.prediction_time_name)[i].item()
+        time = schema_chunk.select("_last_event_time")[i].item()
         task_sample_id = schema_chunk.select(TASK_SAMPLE_ID_COL)[i].item()
 
         for code_idx in generated_code_indices[i]:
@@ -303,8 +304,10 @@ def format_trajectory_batch(
                     TASK_SAMPLE_ID_COL: task_sample_id,
                     DataSchema.subject_id_name: subject_id,
                     DataSchema.time_name: time,
+                    LabelSchema.prediction_time_name: prediction_time,
                     DataSchema.code_name: code,
                     DataSchema.numeric_value_name: value_mean,
+                    DataSchema.text_value_name: None,
                 }
             )
 
@@ -314,8 +317,10 @@ def format_trajectory_batch(
             TASK_SAMPLE_ID_COL: pl.Int64,
             DataSchema.subject_id_name: pl.Int64,
             DataSchema.time_name: pl.Datetime,
+            LabelSchema.prediction_time_name: pl.Datetime,
             DataSchema.code_name: pl.Utf8,
             DataSchema.numeric_value_name: pl.Float32,
+            DataSchema.text_value_name: pl.LargeUtf8,
         },
     )
 
@@ -404,9 +409,21 @@ def format_trajectories(
                 "which is not 0.0 or 1.0. This is not supported."
             )
 
-    output_schema = (
-        dataset.schema_df.select(DataSchema.subject_id_name, LabelSchema.prediction_time_name).clone()
-    ).with_row_index(TASK_SAMPLE_ID_COL)
+    # Compute the time of the last observed event for each sample in the dataset
+    last_times: list[datetime | None] = []
+    for (subject_id, end_idx) in dataset.index:
+        shard, subj_idx = dataset.subj_locations[subject_id]
+        times_list = dataset.schema_dfs_by_shard[shard][DataSchema.time_name][subj_idx].to_list()
+        last_time = None
+        for t in reversed(times_list[:end_idx]):
+            if t is not None:
+                last_time = t
+                break
+        last_times.append(last_time)
+
+    output_schema = dataset.schema_df.select(
+        DataSchema.subject_id_name, LabelSchema.prediction_time_name
+    ).with_columns(pl.Series("_last_event_time", last_times)).with_row_index(TASK_SAMPLE_ID_COL)
 
     batches_as_df = []
     st_i = 0
