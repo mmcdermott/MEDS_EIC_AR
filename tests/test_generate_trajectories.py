@@ -16,7 +16,9 @@ def test_generate_trajectories_runs(generated_trajectories: Path):
         trajectories_by_split[split] = {}
 
         for fp in split_dir.glob("*.parquet"):
-            trajectories_by_split[split][fp.stem] = pl.read_parquet(fp, use_pyarrow=True)
+            df = pl.read_parquet(fp, use_pyarrow=True)
+            assert len(df) > 0, f"Parquet file {fp} is empty"
+            trajectories_by_split[split][fp.stem] = df
 
     assert len(trajectories_by_split) == 3, "Not all splits have generated trajectories."
 
