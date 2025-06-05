@@ -2,6 +2,7 @@ defaults:
   - model_checkpoint
   - early_stopping
   - learning_rate_monitor
+  - generation_speed_logger
   - _self_
 
 _target_: MEDS_EIC_AR.values_as_list
