@@ -1,6 +1,7 @@
 defaults:
   - datamodule: generate_trajectories
   - trainer: default
+  - override trainer/callbacks: generation
   - inference: default
   - _self_
 
