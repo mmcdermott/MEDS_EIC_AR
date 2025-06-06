@@ -32,6 +32,16 @@ You can exert more fine-grained control on the filtering with the following envi
 1. `MIN_SUBJECTS_PER_CODE`: How many subjects must a given code be observed within to be included in the
     final vocabulary? Note that this excludes some sentinel codes which are always retained.
 2. `MIN_EVENTS_PER_SUBJECT`: How many events must a subject have to be included in the final dataset?
+3. `N_VALUE_QUANTILES`: If set, overrides the default evenly spaced quantile thresholds used when
+    computing numeric value bins. This should be an integer and will result in `n` quantiles evenly spaced
+    between 0 and 1.
+4. `NUMERIC_QUANTILES`: Explicit list of quantiles to compute for numeric values. This should be a valid
+    Python list (e.g. `[0.25, 0.5, 0.75]`). Takes precedence over `N_VALUE_QUANTILES`.
+5. `NUMERIC_QUANTILES_FP`: Path to a YAML/JSON file containing custom bin definitions. When set, the
+    quantile fitting stage is skipped and these bins are applied directly.
+6. `INCLUDE_NUMERIC_VALUES`: If set to `0`, numeric values are removed entirely after preprocessing.
+7. `USE_DATA_DRIVEN_TEMPORAL_BINS`: If set to `1`, the default manual time
+   interval bins are ignored and quantiles are learned from the data instead.
 
 ## Differences from the MEDS-Torch version
 

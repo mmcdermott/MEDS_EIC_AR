@@ -92,6 +92,15 @@ You can exert more fine-grained control on the filtering with the following envi
 1. `MIN_SUBJECTS_PER_CODE`: How many subjects must a given code be observed within to be included in the
     final vocabulary? Note that this excludes some sentinel codes which are always retained.
 2. `MIN_EVENTS_PER_SUBJECT`: How many events must a subject have to be included in the final dataset?
+3. `N_VALUE_QUANTILES`: Integer specifying the number of evenly spaced quantiles to compute for numeric
+   value binning.
+4. `NUMERIC_QUANTILES`: Explicit list of quantiles (e.g. `[0.25, 0.5, 0.75]`). Takes precedence over
+   `N_VALUE_QUANTILES`.
+5. `NUMERIC_QUANTILES_FP`: Path to a YAML or JSON file containing custom bin definitions. When supplied,
+   the quantile fitting stage is skipped and these bins are used directly for numeric value discretization.
+6. `INCLUDE_NUMERIC_VALUES`: Set to `0` to drop numeric values entirely (only time interval bins are kept).
+7. `USE_DATA_DRIVEN_TEMPORAL_BINS`: Set to `1` to learn time interval bins from the data instead of using the
+   manual defaults.
 
 ### 2. Pre-train the model
 

@@ -14,10 +14,10 @@ stages:
     _base_stage: aggregate_code_metadata
   - filter_measurements:
       _match_revise:
-        - _matcher: # No filter for static measurements
+        - _matcher:
             time:
               present: False
-        - _matcher: # No filter for birth, death, admission, discharge, registration, or time intervals.
+        - _matcher:
             code:
               regex: "MEDS_DEATH.*|MEDS_BIRTH.*|.*ADMISSION.*|.*DISCHARGE.*|.*REGISTRATION.*|.*TIME.*"
         - _matcher:
@@ -27,13 +27,6 @@ stages:
   - filter_subjects:
       min_events_per_subject: ${oc.decode:${oc.env:MIN_EVENTS_PER_SUBJECT,10}}
       min_measurements_per_subject: null
-  - fit_quantile_binning:
-      aggregations:
-        - code/n_occurrences
-        - code/n_subjects
-        - name: values/quantiles
-          quantiles: ${oc.decode:${oc.env:NUMERIC_QUANTILES,"[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]"}}
-    _base_stage: aggregate_code_metadata
   - bin_numeric_values:
       do_drop_numeric_value: True
       custom_bins:
