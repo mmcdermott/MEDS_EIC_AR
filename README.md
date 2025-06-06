@@ -132,7 +132,8 @@ more configuration parameters than the pre-training step, so let's go through th
 
 1. You need to specify the task labels directory in the `datamodule.config.task_labels_dir` parameter.
 2. You need to specify the model initialization directory in the `model_initialization_dir` parameter. This
-    is the output directory of the pre-train step.
+    is the output directory of the pre-train step. You can also override `ckpt_path` to load from any
+    particular checkpoint inside this directory if you wish to evaluate intermediate models.
 3. You need to specify how you want to trade-off between allowed input context size and the maximum possible
     generated trajectory length. The former allows you to use more of the patient's record, but the latter
     controls how far into the future you can predict. This can be configured with one of three parameters in
@@ -191,7 +192,7 @@ Not yet implemented.
 This model is configured via Hydra and PyTorch lightning. The configuration structure of this repository is as
 follows:
 
-```python
+````text
 >>> print_directory("./src/MEDS_EIC_AR/configs", config=PrintConfig(file_extension=".yaml"))
 ├── _demo_generate_trajectories.yaml
 ├── _demo_pretrain.yaml
@@ -237,6 +238,14 @@ follows:
         ├── mlflow.yaml
         └── wandb.yaml
 
+Use the existing checkpoint callback with a logarithmic schedule by setting
+`trainer.callbacks.model_checkpoint.enable_logarithmic=True`.  You may
+additionally adjust `base` and `start` to tune how frequently checkpoints are
+saved.  This will save checkpoints more often early in training and less often
+later. For example:
+
+```bash
+MEICAR_pretrain trainer.callbacks.model_checkpoint.enable_logarithmic=True [...other args]
 ```
 
 ### Logging with wandb
@@ -274,7 +283,7 @@ This results in the tags `[model_size, "experiment-1"]` being sent to wandb.
 The output files of the pre-training step are stored in the directory specified by the `output_dir` parameter
 and take the following structure:
 
-```python
+```text
 >>> print_directory(pretrained_model)
 ├── .logs
 │   ├── .hydra
@@ -298,3 +307,4 @@ and take the following structure:
 └── resolved_config.yaml
 
 ```
+````
