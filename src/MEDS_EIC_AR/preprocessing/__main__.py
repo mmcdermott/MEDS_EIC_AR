@@ -30,11 +30,33 @@ def process_data(cfg: DictConfig):
         env["RAW_MEDS_DIR"] = str(input_dir)
         env["MTD_INPUT_DIR"] = str(intermediate_dir)
 
+        # Determine which preprocessing configuration to use
+        include_numeric = env.get("INCLUDE_NUMERIC_VALUES", "1") not in {"0", "false", "False"}
+        custom_bins_fp = env.get("NUMERIC_CUSTOM_BINS_FP") or env.get("NUMERIC_QUANTILES_FP")
+        quantiles_list = env.get("NUMERIC_QUANTILES")
+        n_q = env.get("N_VALUE_QUANTILES")
+
+        if not include_numeric:
+            pipeline_name = "_reshard_no_numeric.yaml" if cfg.do_reshard else "_data_no_numeric.yaml"
+        elif custom_bins_fp:
+            env["NUMERIC_CUSTOM_BINS_FP"] = custom_bins_fp
+            pipeline_name = "_reshard_custom_bins.yaml" if cfg.do_reshard else "_data_custom_bins.yaml"
+        else:
+            if not quantiles_list and n_q:
+                try:
+                    n = int(n_q)
+                    if n <= 0:
+                        raise ValueError
+                    env["NUMERIC_QUANTILES"] = str([(i + 1) / (n + 1) for i in range(n)])
+                except ValueError as e:
+                    raise ValueError(f"Invalid N_VALUE_QUANTILES={n_q}") from e
+            pipeline_name = "_reshard_data.yaml" if cfg.do_reshard else "_data.yaml"
+
         if do_demo:
             env["MIN_SUBJECTS_PER_CODE"] = "2"
             env["MIN_EVENTS_PER_SUBJECT"] = "1"
 
-        pipeline_config_fp = (CONFIGS / "_reshard_data.yaml") if cfg.do_reshard else (CONFIGS / "_data.yaml")
+        pipeline_config_fp = CONFIGS / pipeline_name
         cmd = [
             "MEDS_transform-pipeline",
             f"pipeline_config_fp={pipeline_config_fp!s}",
