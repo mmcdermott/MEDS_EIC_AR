@@ -10,8 +10,6 @@ import hydra
 import yaml
 from omegaconf import DictConfig
 
-from MEDS_EIC_AR import stages as _  # register custom stages
-
 logger = logging.getLogger(__name__)
 
 CONFIGS = files("MEDS_EIC_AR") / "preprocessing" / "configs"
