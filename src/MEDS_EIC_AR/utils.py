@@ -378,10 +378,9 @@ def save_resolved_config(cfg: DictConfig, fp: Path) -> bool:
 def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
     """Populate logger configs with saved experiment IDs if present.
 
-    This helper mutates the provided trainer configuration in-place. It is kept
-    separate from OmegaConf resolvers to keep the configuration loading simple
-    while still allowing logger IDs to be injected automatically when a run is
-    resumed.
+    This helper mutates the provided trainer configuration in-place. It is kept separate from OmegaConf
+    resolvers to keep the configuration loading simple while still allowing logger IDs to be injected
+    automatically when a run is resumed.
     """
 
     if trainer_cfg is None:
