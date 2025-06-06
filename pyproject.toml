@@ -28,7 +28,7 @@ dependencies = [
   "filelock",
   "pytest",
   "meds_testing_helpers~=0.3.0",
-  "MEDS-transforms~=0.5.0",
+  "MEDS-transforms~=0.5.3",
   "meds-torch-data[lightning]~=0.6.2",
   "transformers",
   "torch",

@@ -29,4 +29,4 @@ stages:
       min_measurements_per_subject: null
   - bin_numeric_values:
       do_drop_numeric_value: True
-      custom_bins: ${oc.decode:${oc.env:NUMERIC_CUSTOM_BINS,"{}"}}
+      custom_bins_filepath: ${oc.env:NUMERIC_CUSTOM_BINS_FP,null}

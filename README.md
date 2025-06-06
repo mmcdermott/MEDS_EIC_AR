@@ -93,7 +93,7 @@ You can exert more fine-grained control on the filtering with the following envi
     final vocabulary? Note that this excludes some sentinel codes which are always retained.
 2. `MIN_EVENTS_PER_SUBJECT`: How many events must a subject have to be included in the final dataset?
 3. `N_VALUE_QUANTILES`: Integer specifying the number of evenly spaced quantiles to compute for numeric
-    value binning.
+5. `NUMERIC_CUSTOM_BINS_FP`: Path to a YAML or JSON file containing custom bin definitions. When supplied,
 4. `NUMERIC_QUANTILES`: Explicit list of quantiles (e.g. `[0.25, 0.5, 0.75]`). Takes precedence over
     `N_VALUE_QUANTILES`.
 5. `NUMERIC_QUANTILES_FP`: Path to a YAML or JSON file containing custom bin definitions. When supplied,
