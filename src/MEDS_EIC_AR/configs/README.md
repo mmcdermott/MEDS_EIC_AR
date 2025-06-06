@@ -40,10 +40,13 @@ configuration structure is as follows:
     ├── callbacks
     │   ├── default.yaml
     │   ├── early_stopping.yaml
+    │   ├── generation.yaml
+    │   ├── generation_speed_logger.yaml
     │   ├── learning_rate_monitor.yaml
     │   └── model_checkpoint.yaml
     ├── default.yaml
     ├── demo.yaml
+    ├── generation.yaml
     └── logger
         ├── csv.yaml
         ├── mlflow.yaml

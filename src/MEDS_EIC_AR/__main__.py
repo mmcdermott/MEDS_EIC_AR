@@ -21,6 +21,7 @@ from .training import MEICARModule, find_checkpoint_path, validate_resume_direct
 
 # Import OmegaConf Resolvers
 from .utils import (
+    apply_saved_logger_run_ids,
     gpus_available,
     hash_based_seed,
     int_prod,
@@ -29,6 +30,7 @@ from .utils import (
     num_gpus,
     oc_min,
     resolve_generation_context_size,
+    save_logger_run_ids,
     save_resolved_config,
     sub,
 )
@@ -91,6 +93,7 @@ def pretrain(cfg: DictConfig):
     if M.model.do_demo or cfg.get("seed", None):
         seed_everything(cfg.get("seed", 1), workers=True)
 
+    apply_saved_logger_run_ids(cfg.trainer, output_dir)
     trainer = instantiate(cfg.trainer)
     if any(is_mlflow_logger(logger) for logger in trainer.loggers):
         # We do the import only here to avoid importing mlflow if it isn't installed.
@@ -107,6 +110,7 @@ def pretrain(cfg: DictConfig):
         trainer_kwargs["ckpt_path"] = ckpt_path
 
     trainer.fit(**trainer_kwargs)
+    save_logger_run_ids(trainer.loggers, output_dir)
 
     best_ckpt_path = Path(trainer.checkpoint_callback.best_model_path)
     if not best_ckpt_path.is_file():
@@ -133,6 +137,7 @@ def generate_trajectories(cfg: DictConfig):
     M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path))
     M.eval()
 
+    apply_saved_logger_run_ids(cfg.trainer, Path(cfg.model_initialization_dir))
     trainer = instantiate(cfg.trainer)
 
     inference = cfg.inference
@@ -171,4 +176,5 @@ def generate_trajectories(cfg: DictConfig):
             pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
             pq.write_table(pa_table, out_fp)
 
+    save_logger_run_ids(trainer.loggers, Path(cfg.model_initialization_dir))
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")
