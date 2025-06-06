@@ -6,11 +6,13 @@ from importlib.resources import files
 from pathlib import Path
 
 import hydra
+import pyarrow.parquet as pq
 import torch
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchDataConfig
+from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
 from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
 
@@ -165,6 +167,8 @@ def generate_trajectories(cfg: DictConfig):
             seed_everything(seed, workers=True)
             predictions = trainer.predict(model=M, dataloaders=dataloader)
             predictions_df = format_trajectories(dataloader.dataset, predictions)
-            predictions_df.write_parquet(out_fp, use_pyarrow=True)
+
+            pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
+            pq.write_table(pa_table, out_fp)
 
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")

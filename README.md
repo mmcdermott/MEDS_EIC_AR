@@ -184,6 +184,11 @@ details on the format of the generated trajectories.
 > non-identical across different samples, and containing the right subjects. It has not yet been assessed to
 > ensure full correctness.
 
+> [!NOTE]
+> The generated trajectories from this model are saved in the schema defined in the
+> [`MEDS_trajectory_evaluation.schema.GeneratedTrajectorySchema`](https://github.com/mmcdermott/MEDS_trajectory_evaluation/blob/main/src/MEDS_trajectory_evaluation/schema.py)
+> format, and can be used with that package's evaluation tools.
+
 #### 3.2 Resolve Trajectories into Predictions.
 
 Not yet implemented.
@@ -210,10 +215,7 @@ follows:
 │   └── demo.yaml
 ├── lightning_module
 │   ├── LR_scheduler
-│   │   ├── cosine_annealing_warm_restarts.yaml
-│   │   ├── get_cosine_schedule_with_warmup.yaml
-│   │   ├── one_cycle_LR.yaml
-│   │   └── reduce_LR_on_plateau.yaml
+│   │   └── get_cosine_schedule_with_warmup.yaml
 │   ├── default.yaml
 │   ├── demo.yaml
 │   ├── large.yaml
@@ -229,7 +231,6 @@ follows:
 │   │   ├── micro.yaml
 │   │   └── small.yaml
 │   ├── optimizer
-│   │   ├── adam.yaml
 │   │   └── adamw.yaml
 │   └── small.yaml
 └── trainer
@@ -246,6 +247,36 @@ follows:
         └── wandb.yaml
 
 ```
+
+### Logging with wandb
+
+You can activate the wandb logger by overriding the trainer logger to `wandb`:
+
+```bash
+MEICAR_pretrain trainer.logger=wandb
+```
+
+The configuration file [`configs/trainer/logger/wandb.yaml`](src/MEDS_EIC_AR/configs/trainer/logger/wandb.yaml)
+exposes a `tags` field. Hydra makes the selected configuration groups available
+via `hydra.runtime.choices`. These can be referenced to automatically tag the
+run. For example:
+
+```yaml
+tags:
+  - ${hydra:runtime.choices.lightning_module/model}
+```
+
+This automatically tags each run with the selected model size (e.g. `small`,
+`medium`, `large`). Hydra currently cannot append to a list with a default
+value. To add your own tags you must override the list and include the default
+tag yourself:
+
+```bash
+MEICAR_pretrain trainer.logger=wandb \
+  trainer.logger.tags="[${hydra:runtime.choices.lightning_module/model},experiment-1]"
+```
+
+This results in the tags `[model_size, "experiment-1"]` being sent to wandb.
 
 ## Output Files
 

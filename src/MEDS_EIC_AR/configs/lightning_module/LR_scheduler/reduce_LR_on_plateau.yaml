@@ -1,8 +1,0 @@
-_target_: torch.optim.lr_scheduler.ReduceLROnPlateau
-_partial_: true
-
-mode: min
-factor: 0.1
-patience: 3 # If the LR doesn't improve for this many epochs, reduce it
-threshold: 1e-4
-cooldown: 0

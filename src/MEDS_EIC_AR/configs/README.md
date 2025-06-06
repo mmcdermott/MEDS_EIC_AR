@@ -18,10 +18,7 @@ configuration structure is as follows:
 │   └── demo.yaml
 ├── lightning_module
 │   ├── LR_scheduler
-│   │   ├── cosine_annealing_warm_restarts.yaml
-│   │   ├── get_cosine_schedule_with_warmup.yaml
-│   │   ├── one_cycle_LR.yaml
-│   │   └── reduce_LR_on_plateau.yaml
+│   │   └── get_cosine_schedule_with_warmup.yaml
 │   ├── default.yaml
 │   ├── demo.yaml
 │   ├── large.yaml
@@ -37,7 +34,6 @@ configuration structure is as follows:
 │   │   ├── micro.yaml
 │   │   └── small.yaml
 │   ├── optimizer
-│   │   ├── adam.yaml
 │   │   └── adamw.yaml
 │   └── small.yaml
 └── trainer

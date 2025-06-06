@@ -225,11 +225,22 @@ class MEICARModule(L.LightningModule):
 
         is_train = stage == train_split
 
-        self.log(f"{stage}/loss", loss, on_step=is_train, on_epoch=True, prog_bar=True, batch_size=batch_size)
+        sync_dist = not is_train and torch.distributed.is_available() and torch.distributed.is_initialized()
+
+        self.log(
+            f"{stage}/loss",
+            loss,
+            on_step=is_train,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
         self.log_dict(
             {f"{stage}/{k}": v for k, v in self.metrics(outputs.logits, batch).items()},
             batch_size=batch_size,
             on_step=is_train,
+            sync_dist=sync_dist,
         )
 
     def training_step(self, batch: MEDSTorchBatch):

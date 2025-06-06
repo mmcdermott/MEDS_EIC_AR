@@ -8,7 +8,6 @@ from meds_torchdata import MEDSPytorchDataset
 from MEDS_transforms.stages.add_time_derived_measurements.utils import normalize_time_unit
 
 TIMELINE_DELTA_TOKEN = "TIMELINE//DELTA"
-TASK_SAMPLE_ID_COL = "_task_sample_id"
 
 
 class CodeInformation(NamedTuple):
@@ -102,6 +101,8 @@ def format_trajectory_batch(
               - `"task_sample_id"`: The task sample ID of the patient. This is a unique identifier for the
                 task sample, which is useful as there may be different task samples for the same patient, and
                 we don't wish our generated trajectories to intersect.
+              - `"window_last_observed"`: The last time of an event observed in the input data for this
+                subject sample.
         generated_code_indices: The generated codes for this batch.
         code_information: The code information mapping from code indices to their string representations and
             numeric value means.
@@ -111,7 +112,6 @@ def format_trajectory_batch(
 
     Examples:
         >>> schema_df = pl.DataFrame({
-        ...     "_task_sample_id": [1, 2, 3, 4, 5],
         ...     "subject_id": [1, 2, 3, 1, 4],
         ...     "prediction_time": [
         ...         datetime(1993, 1, 1),
@@ -119,6 +119,13 @@ def format_trajectory_batch(
         ...         datetime(1973, 1, 3),
         ...         datetime(2002, 10, 12),
         ...         datetime(2002, 10, 12),
+        ...     ],
+        ...     "window_last_observed": [
+        ...         datetime(1993, 1, 1),
+        ...         datetime(2000, 1, 1, 22, 13),
+        ...         datetime(1973, 1, 2),
+        ...         datetime(2002, 10, 12),
+        ...         datetime(2002, 10, 11, 23, 59),
         ...     ],
         ... })
         >>> generated_code_indices = torch.LongTensor([
@@ -144,17 +151,17 @@ def format_trajectory_batch(
 
         >>> schema_df
         shape: (5, 3)
-        ┌─────────────────┬────────────┬─────────────────────┐
-        │ _task_sample_id ┆ subject_id ┆ prediction_time     │
-        │ ---             ┆ ---        ┆ ---                 │
-        │ i64             ┆ i64        ┆ datetime[μs]        │
-        ╞═════════════════╪════════════╪═════════════════════╡
-        │ 1               ┆ 1          ┆ 1993-01-01 00:00:00 │
-        │ 2               ┆ 2          ┆ 2000-01-02 00:00:00 │
-        │ 3               ┆ 3          ┆ 1973-01-03 00:00:00 │
-        │ 4               ┆ 1          ┆ 2002-10-12 00:00:00 │
-        │ 5               ┆ 4          ┆ 2002-10-12 00:00:00 │
-        └─────────────────┴────────────┴─────────────────────┘
+        ┌────────────┬─────────────────────┬──────────────────────┐
+        │ subject_id ┆ prediction_time     ┆ window_last_observed │
+        │ ---        ┆ ---                 ┆ ---                  │
+        │ i64        ┆ datetime[μs]        ┆ datetime[μs]         │
+        ╞════════════╪═════════════════════╪══════════════════════╡
+        │ 1          ┆ 1993-01-01 00:00:00 ┆ 1993-01-01 00:00:00  │
+        │ 2          ┆ 2000-01-02 00:00:00 ┆ 2000-01-01 22:13:00  │
+        │ 3          ┆ 1973-01-03 00:00:00 ┆ 1973-01-02 00:00:00  │
+        │ 1          ┆ 2002-10-12 00:00:00 ┆ 2002-10-12 00:00:00  │
+        │ 4          ┆ 2002-10-12 00:00:00 ┆ 2002-10-11 23:59:00  │
+        └────────────┴─────────────────────┴──────────────────────┘
 
     For task sample 1 (starting at 1993-01-01), we generate:
       - (2) A timeline delta of 0.1 years, which is 35.6 days. Event time: ~1993-02-06, 12:30
@@ -167,71 +174,78 @@ def format_trajectory_batch(
       - (5) A TEMP//A event, with a numeric value of 99.0.
       - (1) A timeline delta of 1.0 year. Event time: ~1994-02-06, 21:20
       - (6) A TEMP//B event, with a numeric value of 101.0.
-    For task sample 2 (starting at 2000-01-02), we generate:
-      - (1) A timeline delta of 1.0 year. Event time: ~2001-01-02
+    For task sample 2 (starting at 2000-01-01, 22:13), we generate:
+      - (1) A timeline delta of 1.0 year. Event time: ~2001-01-01
       - (7) A TEMP//C event, with a numeric value of 96.8.
       - (9) A TIMELINE//END event, with no numeric value.
-    For task sample 3 (starting at 1973-01-03), we generate the following:
+    For task sample 3 (starting at 1973-01-02), we generate the following:
       - (4) A HR event, with no numeric value.
       - (7) A TEMP//C event, with a numeric value of 96.8.
-      - (3) A timeline delta of 0.001 years, which is 0.0365 days (8.7 hours). Event time: ~1973-01-03, 08:45
+      - (3) A timeline delta of 0.001 years, which is 0.0365 days (8.7 hours). Event time: ~1973-01-02, 08:45
       - (6) A TEMP//B event, with a numeric value of 101.0.
-      - (1) A timeline delta of 1.0 year. Event time: ~1974-01-03, 08:45
+      - (1) A timeline delta of 1.0 year. Event time: ~1974-01-02, 08:45
       - (9) A TIMELINE//END event, with no numeric value.
     For task sample 4 (starting at 2002-10-12), we generate:
       - (6) A TEMP//B event, with a numeric value of 101.0.
       - (1) A timeline delta of 1.0 year. Event time: ~2003-10-12
       - (8) A DX//1 event, with no numeric value.
       - (9) A TIMELINE//END event, with no numeric value.
-    For task sample 5 (starting at 2002-10-12), we generate:
+    For task sample 5 (starting at 2002-10-11, 23:59), we generate:
       - (9) A TIMELINE//END event, with no numeric value.
 
         >>> _ = pl.Config().set_tbl_rows(-1)
         >>> format_trajectory_batch(schema_df, generated_code_indices, code_information)
         shape: (24, 5)
-        ┌─────────────────┬────────────┬─────────────────────────┬─────────────────────────┬───────────────┐
-        │ _task_sample_id ┆ subject_id ┆ time                    ┆ code                    ┆ numeric_value │
-        │ ---             ┆ ---        ┆ ---                     ┆ ---                     ┆ ---           │
-        │ i64             ┆ i64        ┆ datetime[μs]            ┆ str                     ┆ f32           │
-        ╞═════════════════╪════════════╪═════════════════════════╪═════════════════════════╪═══════════════╡
-        │ 1               ┆ 1          ┆ 1993-02-06 12:34:52.608 ┆ TIMELINE//DELTA//years/ ┆ 0.1           │
-        │                 ┆            ┆                         ┆ /value_…                ┆               │
-        │ 1               ┆ 1          ┆ 1993-02-06 12:34:52.608 ┆ HR                      ┆ null          │
-        │ 1               ┆ 1          ┆ 1993-02-06 12:34:52.608 ┆ TEMP//A                 ┆ 99.0          │
-        │ 1               ┆ 1          ┆ 1993-02-06 12:34:52.608 ┆ HR                      ┆ null          │
-        │ 1               ┆ 1          ┆ 1993-02-06              ┆ TIMELINE//DELTA//years/ ┆ 0.001         │
-        │                 ┆            ┆ 21:20:49.534080         ┆ /value_…                ┆               │
-        │ 1               ┆ 1          ┆ 1993-02-06              ┆ HR                      ┆ null          │
-        │                 ┆            ┆ 21:20:49.534080         ┆                         ┆               │
-        │ 1               ┆ 1          ┆ 1993-02-06              ┆ TEMP//A                 ┆ 99.0          │
-        │                 ┆            ┆ 21:20:49.534080         ┆                         ┆               │
-        │ 1               ┆ 1          ┆ 1993-02-06              ┆ TEMP//A                 ┆ 99.0          │
-        │                 ┆            ┆ 21:20:49.534080         ┆                         ┆               │
-        │ 1               ┆ 1          ┆ 1994-02-07              ┆ TIMELINE//DELTA//years/ ┆ 1.0           │
-        │                 ┆            ┆ 03:09:35.614080         ┆ /value_…                ┆               │
-        │ 1               ┆ 1          ┆ 1994-02-07              ┆ TEMP//B                 ┆ 101.0         │
-        │                 ┆            ┆ 03:09:35.614080         ┆                         ┆               │
-        │ 2               ┆ 2          ┆ 2001-01-01 05:48:46.080 ┆ TIMELINE//DELTA//years/ ┆ 1.0           │
-        │                 ┆            ┆                         ┆ /value_…                ┆               │
-        │ 2               ┆ 2          ┆ 2001-01-01 05:48:46.080 ┆ TEMP//C                 ┆ 96.800003     │
-        │ 2               ┆ 2          ┆ 2001-01-01 05:48:46.080 ┆ TIMELINE//END           ┆ null          │
-        │ 3               ┆ 3          ┆ 1973-01-03 00:00:00     ┆ HR                      ┆ null          │
-        │ 3               ┆ 3          ┆ 1973-01-03 00:00:00     ┆ TEMP//C                 ┆ 96.800003     │
-        │ 3               ┆ 3          ┆ 1973-01-03              ┆ TIMELINE//DELTA//years/ ┆ 0.001         │
-        │                 ┆            ┆ 08:45:56.926080         ┆ /value_…                ┆               │
-        │ 3               ┆ 3          ┆ 1973-01-03              ┆ TEMP//B                 ┆ 101.0         │
-        │                 ┆            ┆ 08:45:56.926080         ┆                         ┆               │
-        │ 3               ┆ 3          ┆ 1974-01-03              ┆ TIMELINE//DELTA//years/ ┆ 1.0           │
-        │                 ┆            ┆ 14:34:43.006080         ┆ /value_…                ┆               │
-        │ 3               ┆ 3          ┆ 1974-01-03              ┆ TIMELINE//END           ┆ null          │
-        │                 ┆            ┆ 14:34:43.006080         ┆                         ┆               │
-        │ 4               ┆ 1          ┆ 2002-10-12 00:00:00     ┆ TEMP//B                 ┆ 101.0         │
-        │ 4               ┆ 1          ┆ 2003-10-12 05:48:46.080 ┆ TIMELINE//DELTA//years/ ┆ 1.0           │
-        │                 ┆            ┆                         ┆ /value_…                ┆               │
-        │ 4               ┆ 1          ┆ 2003-10-12 05:48:46.080 ┆ DX//1                   ┆ null          │
-        │ 4               ┆ 1          ┆ 2003-10-12 05:48:46.080 ┆ TIMELINE//END           ┆ null          │
-        │ 5               ┆ 4          ┆ 2002-10-12 00:00:00     ┆ TIMELINE//END           ┆ null          │
-        └─────────────────┴────────────┴─────────────────────────┴─────────────────────────┴───────────────┘
+        ┌────────────┬───────────────────────┬─────────────────────┬───────────────────────┬───────────────┐
+        │ subject_id ┆ time                  ┆ prediction_time     ┆ code                  ┆ numeric_value │
+        │ ---        ┆ ---                   ┆ ---                 ┆ ---                   ┆ ---           │
+        │ i64        ┆ datetime[μs]          ┆ datetime[μs]        ┆ str                   ┆ f32           │
+        ╞════════════╪═══════════════════════╪═════════════════════╪═══════════════════════╪═══════════════╡
+        │ 1          ┆ 1993-02-06            ┆ 1993-01-01 00:00:00 ┆ TIMELINE//DELTA//year ┆ 0.1           │
+        │            ┆ 12:34:52.608          ┆                     ┆ s//value_…            ┆               │
+        │ 1          ┆ 1993-02-06            ┆ 1993-01-01 00:00:00 ┆ HR                    ┆ null          │
+        │            ┆ 12:34:52.608          ┆                     ┆                       ┆               │
+        │ 1          ┆ 1993-02-06            ┆ 1993-01-01 00:00:00 ┆ TEMP//A               ┆ 99.0          │
+        │            ┆ 12:34:52.608          ┆                     ┆                       ┆               │
+        │ 1          ┆ 1993-02-06            ┆ 1993-01-01 00:00:00 ┆ HR                    ┆ null          │
+        │            ┆ 12:34:52.608          ┆                     ┆                       ┆               │
+        │ 1          ┆ 1993-02-06            ┆ 1993-01-01 00:00:00 ┆ TIMELINE//DELTA//year ┆ 0.001         │
+        │            ┆ 21:20:49.534080       ┆                     ┆ s//value_…            ┆               │
+        │ 1          ┆ 1993-02-06            ┆ 1993-01-01 00:00:00 ┆ HR                    ┆ null          │
+        │            ┆ 21:20:49.534080       ┆                     ┆                       ┆               │
+        │ 1          ┆ 1993-02-06            ┆ 1993-01-01 00:00:00 ┆ TEMP//A               ┆ 99.0          │
+        │            ┆ 21:20:49.534080       ┆                     ┆                       ┆               │
+        │ 1          ┆ 1993-02-06            ┆ 1993-01-01 00:00:00 ┆ TEMP//A               ┆ 99.0          │
+        │            ┆ 21:20:49.534080       ┆                     ┆                       ┆               │
+        │ 1          ┆ 1994-02-07            ┆ 1993-01-01 00:00:00 ┆ TIMELINE//DELTA//year ┆ 1.0           │
+        │            ┆ 03:09:35.614080       ┆                     ┆ s//value_…            ┆               │
+        │ 1          ┆ 1994-02-07            ┆ 1993-01-01 00:00:00 ┆ TEMP//B               ┆ 101.0         │
+        │            ┆ 03:09:35.614080       ┆                     ┆                       ┆               │
+        │ 2          ┆ 2001-01-01            ┆ 2000-01-02 00:00:00 ┆ TIMELINE//DELTA//year ┆ 1.0           │
+        │            ┆ 04:01:46.080          ┆                     ┆ s//value_…            ┆               │
+        │ 2          ┆ 2001-01-01            ┆ 2000-01-02 00:00:00 ┆ TEMP//C               ┆ 96.800003     │
+        │            ┆ 04:01:46.080          ┆                     ┆                       ┆               │
+        │ 2          ┆ 2001-01-01            ┆ 2000-01-02 00:00:00 ┆ TIMELINE//END         ┆ null          │
+        │            ┆ 04:01:46.080          ┆                     ┆                       ┆               │
+        │ 3          ┆ 1973-01-02 00:00:00   ┆ 1973-01-03 00:00:00 ┆ HR                    ┆ null          │
+        │ 3          ┆ 1973-01-02 00:00:00   ┆ 1973-01-03 00:00:00 ┆ TEMP//C               ┆ 96.800003     │
+        │ 3          ┆ 1973-01-02            ┆ 1973-01-03 00:00:00 ┆ TIMELINE//DELTA//year ┆ 0.001         │
+        │            ┆ 08:45:56.926080       ┆                     ┆ s//value_…            ┆               │
+        │ 3          ┆ 1973-01-02            ┆ 1973-01-03 00:00:00 ┆ TEMP//B               ┆ 101.0         │
+        │            ┆ 08:45:56.926080       ┆                     ┆                       ┆               │
+        │ 3          ┆ 1974-01-02            ┆ 1973-01-03 00:00:00 ┆ TIMELINE//DELTA//year ┆ 1.0           │
+        │            ┆ 14:34:43.006080       ┆                     ┆ s//value_…            ┆               │
+        │ 3          ┆ 1974-01-02            ┆ 1973-01-03 00:00:00 ┆ TIMELINE//END         ┆ null          │
+        │            ┆ 14:34:43.006080       ┆                     ┆                       ┆               │
+        │ 1          ┆ 2002-10-12 00:00:00   ┆ 2002-10-12 00:00:00 ┆ TEMP//B               ┆ 101.0         │
+        │ 1          ┆ 2003-10-12            ┆ 2002-10-12 00:00:00 ┆ TIMELINE//DELTA//year ┆ 1.0           │
+        │            ┆ 05:48:46.080          ┆                     ┆ s//value_…            ┆               │
+        │ 1          ┆ 2003-10-12            ┆ 2002-10-12 00:00:00 ┆ DX//1                 ┆ null          │
+        │            ┆ 05:48:46.080          ┆                     ┆                       ┆               │
+        │ 1          ┆ 2003-10-12            ┆ 2002-10-12 00:00:00 ┆ TIMELINE//END         ┆ null          │
+        │            ┆ 05:48:46.080          ┆                     ┆                       ┆               │
+        │ 4          ┆ 2002-10-11 23:59:00   ┆ 2002-10-12 00:00:00 ┆ TIMELINE//END         ┆ null          │
+        └────────────┴───────────────────────┴─────────────────────┴───────────────────────┴───────────────┘
 
     This function is robust to the unit string used for the timeline delta tokens, provided it conforms to the
     set recognized in
@@ -247,23 +261,28 @@ def format_trajectory_batch(
         ...     5: CodeInformation(code='TIMELINE//DELTA//yrs//C', value_prob=1.0, value_mean=1.0),
         ... }
         >>> schema_df = pl.DataFrame({
-        ...     "_task_sample_id": [1], "subject_id": [1], "prediction_time": [datetime(1993, 1, 1)],
+        ...     "subject_id": [1],
+        ...     "prediction_time": [datetime(1993, 1, 1)],
+        ...     "window_last_observed": [datetime(1993, 1, 1)],
         ... })
         >>> generated_code_indices = torch.LongTensor([[1, 2, 3, 4, 5]])
         >>> format_trajectory_batch(schema_df, generated_code_indices, code_information)
         shape: (5, 5)
-        ┌─────────────────┬────────────┬─────────────────────────┬─────────────────────────┬───────────────┐
-        │ _task_sample_id ┆ subject_id ┆ time                    ┆ code                    ┆ numeric_value │
-        │ ---             ┆ ---        ┆ ---                     ┆ ---                     ┆ ---           │
-        │ i64             ┆ i64        ┆ datetime[μs]            ┆ str                     ┆ f32           │
-        ╞═════════════════╪════════════╪═════════════════════════╪═════════════════════════╪═══════════════╡
-        │ 1               ┆ 1          ┆ 1993-01-01 00:00:01     ┆ TIMELINE//DELTA//s//A   ┆ 1.0           │
-        │ 1               ┆ 1          ┆ 1993-01-02 00:00:01     ┆ TIMELINE//DELTA//days// ┆ 1.0           │
-        │                 ┆            ┆                         ┆ A                       ┆               │
-        │ 1               ┆ 1          ┆ 1993-01-09 00:00:01     ┆ TIMELINE//DELTA//wks//B ┆ 1.0           │
-        │ 1               ┆ 1          ┆ 1993-02-08 10:29:07     ┆ TIMELINE//DELTA//mos//C ┆ 1.0           │
-        │ 1               ┆ 1          ┆ 1994-02-08 16:17:53.080 ┆ TIMELINE//DELTA//yrs//C ┆ 1.0           │
-        └─────────────────┴────────────┴─────────────────────────┴─────────────────────────┴───────────────┘
+        ┌────────────┬───────────────────────┬─────────────────────┬───────────────────────┬───────────────┐
+        │ subject_id ┆ time                  ┆ prediction_time     ┆ code                  ┆ numeric_value │
+        │ ---        ┆ ---                   ┆ ---                 ┆ ---                   ┆ ---           │
+        │ i64        ┆ datetime[μs]          ┆ datetime[μs]        ┆ str                   ┆ f32           │
+        ╞════════════╪═══════════════════════╪═════════════════════╪═══════════════════════╪═══════════════╡
+        │ 1          ┆ 1993-01-01 00:00:01   ┆ 1993-01-01 00:00:00 ┆ TIMELINE//DELTA//s//A ┆ 1.0           │
+        │ 1          ┆ 1993-01-02 00:00:01   ┆ 1993-01-01 00:00:00 ┆ TIMELINE//DELTA//days ┆ 1.0           │
+        │            ┆                       ┆                     ┆ //A                   ┆               │
+        │ 1          ┆ 1993-01-09 00:00:01   ┆ 1993-01-01 00:00:00 ┆ TIMELINE//DELTA//wks/ ┆ 1.0           │
+        │            ┆                       ┆                     ┆ /B                    ┆               │
+        │ 1          ┆ 1993-02-08 10:29:07   ┆ 1993-01-01 00:00:00 ┆ TIMELINE//DELTA//mos/ ┆ 1.0           │
+        │            ┆                       ┆                     ┆ /C                    ┆               │
+        │ 1          ┆ 1994-02-08            ┆ 1993-01-01 00:00:00 ┆ TIMELINE//DELTA//yrs/ ┆ 1.0           │
+        │            ┆ 16:17:53.080          ┆                     ┆ /C                    ┆               │
+        └────────────┴───────────────────────┴─────────────────────┴───────────────────────┴───────────────┘
 
     Note than an error is raised if the schema chunk does not have the same batch size as the generated
     tokens:
@@ -281,8 +300,8 @@ def format_trajectory_batch(
     rows = []
     for i in range(batch_size):
         subject_id = schema_chunk.select(DataSchema.subject_id_name)[i].item()
-        time = schema_chunk.select(LabelSchema.prediction_time_name)[i].item()
-        task_sample_id = schema_chunk.select(TASK_SAMPLE_ID_COL)[i].item()
+        prediction_time = schema_chunk.select(LabelSchema.prediction_time_name)[i].item()
+        time = schema_chunk.select(MEDSPytorchDataset.LAST_TIME)[i].item()
 
         for code_idx in generated_code_indices[i]:
             if code_idx == 0:
@@ -300,9 +319,9 @@ def format_trajectory_batch(
 
             rows.append(
                 {
-                    TASK_SAMPLE_ID_COL: task_sample_id,
                     DataSchema.subject_id_name: subject_id,
                     DataSchema.time_name: time,
+                    LabelSchema.prediction_time_name: prediction_time,
                     DataSchema.code_name: code,
                     DataSchema.numeric_value_name: value_mean,
                 }
@@ -311,9 +330,9 @@ def format_trajectory_batch(
     return pl.DataFrame(
         rows,
         schema={
-            TASK_SAMPLE_ID_COL: pl.Int64,
             DataSchema.subject_id_name: pl.Int64,
             DataSchema.time_name: pl.Datetime,
+            LabelSchema.prediction_time_name: pl.Datetime,
             DataSchema.code_name: pl.Utf8,
             DataSchema.numeric_value_name: pl.Float32,
         },
@@ -346,44 +365,47 @@ def format_trajectories(
         >>> _ = pl.Config().set_tbl_rows(-1)
         >>> format_trajectories(pytorch_dataset_with_task, generated_code_indices)
         shape: (20, 5)
-        ┌─────────────────┬────────────┬─────────────────────┬─────────────────────────────┬───────────────┐
-        │ _task_sample_id ┆ subject_id ┆ time                ┆ code                        ┆ numeric_value │
-        │ ---             ┆ ---        ┆ ---                 ┆ ---                         ┆ ---           │
-        │ i64             ┆ i64        ┆ datetime[μs]        ┆ str                         ┆ f32           │
-        ╞═════════════════╪════════════╪═════════════════════╪═════════════════════════════╪═══════════════╡
-        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ TIMELINE//DELTA//years//val ┆ 0.000003      │
-        │                 ┆            ┆                     ┆ ue_…                        ┆               │
-        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ DISCHARGE                   ┆ null          │
-        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
-        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ DISCHARGE                   ┆ null          │
-        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ ADMISSION//PULMONARY        ┆ null          │
-        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ DISCHARGE                   ┆ null          │
-        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
-        │ 0               ┆ 239684     ┆ 2010-05-11 18:01:40 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
-        │ 0               ┆ 239684     ┆ 2010-05-11          ┆ TIMELINE//DELTA//years//val ┆ 0.00004       │
-        │                 ┆            ┆ 18:22:52.400010     ┆ ue_…                        ┆               │
-        │ 0               ┆ 239684     ┆ 2010-05-11          ┆ HR//value_[107.5,107.7)     ┆ 107.5         │
-        │                 ┆            ┆ 18:22:52.400010     ┆                             ┆               │
-        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ TIMELINE//DELTA//years//val ┆ 0.000015      │
-        │                 ┆            ┆ 18:37:43.999983     ┆ ue_…                        ┆               │
-        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ HR//value_[107.7,112.5)     ┆ 108.349998    │
-        │                 ┆            ┆ 18:37:43.999983     ┆                             ┆               │
-        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ TIMELINE//DELTA//years//val ┆ 0.00004       │
-        │                 ┆            ┆ 18:58:56.399993     ┆ ue_…                        ┆               │
-        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ HR//value_[107.5,107.7)     ┆ 107.5         │
-        │                 ┆            ┆ 18:58:56.399993     ┆                             ┆               │
-        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ ADMISSION//CARDIAC          ┆ null          │
-        │                 ┆            ┆ 18:58:56.399993     ┆                             ┆               │
-        │ 1               ┆ 239684     ┆ 2010-05-11          ┆ TIMELINE//END               ┆ null          │
-        │                 ┆            ┆ 18:58:56.399993     ┆                             ┆               │
-        │ 2               ┆ 239684     ┆ 2042-03-22          ┆ TIMELINE//DELTA//years//val ┆ 31.861664     │
-        │                 ┆            ┆ 00:22:49.901777     ┆ ue_…                        ┆               │
-        │ 2               ┆ 239684     ┆ 2042-03-22          ┆ HR//value_[107.7,112.5)     ┆ 108.349998    │
-        │                 ┆            ┆ 00:22:49.901777     ┆                             ┆               │
-        │ 2               ┆ 239684     ┆ 2042-03-22          ┆ TIMELINE//END               ┆ null          │
-        │                 ┆            ┆ 00:22:49.901777     ┆                             ┆               │
-        │ 3               ┆ 1195293    ┆ 2010-06-20 19:30:00 ┆ TIMELINE//END               ┆ null          │
-        └─────────────────┴────────────┴─────────────────────┴─────────────────────────────┴───────────────┘
+        ┌────────────┬───────────────────────┬─────────────────────┬───────────────────────┬───────────────┐
+        │ subject_id ┆ time                  ┆ prediction_time     ┆ code                  ┆ numeric_value │
+        │ ---        ┆ ---                   ┆ ---                 ┆ ---                   ┆ ---           │
+        │ i64        ┆ datetime[μs]          ┆ datetime[μs]        ┆ str                   ┆ f32           │
+        ╞════════════╪═══════════════════════╪═════════════════════╪═══════════════════════╪═══════════════╡
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//year ┆ 0.000003      │
+        │            ┆                       ┆                     ┆ s//value_…            ┆               │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ DISCHARGE             ┆ null          │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107. ┆ 105.099998    │
+        │            ┆                       ┆                     ┆ 5)                    ┆               │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ DISCHARGE             ┆ null          │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ ADMISSION//PULMONARY  ┆ null          │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ DISCHARGE             ┆ null          │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107. ┆ 105.099998    │
+        │            ┆                       ┆                     ┆ 5)                    ┆               │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107. ┆ 105.099998    │
+        │            ┆                       ┆                     ┆ 5)                    ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//year ┆ 0.00004       │
+        │            ┆ 18:11:40.400010       ┆                     ┆ s//value_…            ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:00:00 ┆ HR//value_[107.5,107. ┆ 107.5         │
+        │            ┆ 18:11:40.400010       ┆                     ┆ 7)                    ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//year ┆ 0.000015      │
+        │            ┆ 18:33:18.999983       ┆                     ┆ s//value_…            ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.7,112. ┆ 108.349998    │
+        │            ┆ 18:33:18.999983       ┆                     ┆ 5)                    ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//year ┆ 0.00004       │
+        │            ┆ 18:54:31.399993       ┆                     ┆ s//value_…            ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.5,107. ┆ 107.5         │
+        │            ┆ 18:54:31.399993       ┆                     ┆ 7)                    ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ ADMISSION//CARDIAC    ┆ null          │
+        │            ┆ 18:54:31.399993       ┆                     ┆                       ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//END         ┆ null          │
+        │            ┆ 18:54:31.399993       ┆                     ┆                       ┆               │
+        │ 239684     ┆ 2042-03-22            ┆ 2010-05-11 19:00:00 ┆ TIMELINE//DELTA//year ┆ 31.861664     │
+        │            ┆ 00:20:07.901777       ┆                     ┆ s//value_…            ┆               │
+        │ 239684     ┆ 2042-03-22            ┆ 2010-05-11 19:00:00 ┆ HR//value_[107.7,112. ┆ 108.349998    │
+        │            ┆ 00:20:07.901777       ┆                     ┆ 5)                    ┆               │
+        │ 239684     ┆ 2042-03-22            ┆ 2010-05-11 19:00:00 ┆ TIMELINE//END         ┆ null          │
+        │            ┆ 00:20:07.901777       ┆                     ┆                       ┆               │
+        │ 1195293    ┆ 2010-06-20 19:25:32   ┆ 2010-06-20 19:30:00 ┆ TIMELINE//END         ┆ null          │
+        └────────────┴───────────────────────┴─────────────────────┴───────────────────────┴───────────────┘
 
     If the dataset yields invalid code information, an error will be thrown:
 
@@ -404,9 +426,9 @@ def format_trajectories(
                 "which is not 0.0 or 1.0. This is not supported."
             )
 
-    output_schema = (
-        dataset.schema_df.select(DataSchema.subject_id_name, LabelSchema.prediction_time_name).clone()
-    ).with_row_index(TASK_SAMPLE_ID_COL)
+    output_schema = dataset.schema_df.select(
+        DataSchema.subject_id_name, LabelSchema.prediction_time_name, dataset.LAST_TIME
+    )
 
     batches_as_df = []
     st_i = 0
@@ -414,7 +436,7 @@ def format_trajectories(
         batch_size = generated_codes.shape[0]
 
         # Get the schema chunk for this batch
-        schema_chunk = output_schema.slice(st_i, batch_size)
+        schema_chunk = output_schema.slice(st_i, batch_size).clone()
         st_i += batch_size
 
         # Format the generated codes into a MEDS-like dataframe

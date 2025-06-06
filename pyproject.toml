@@ -20,7 +20,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-  "polars~=1.26.0",
+  "polars~=1.30.0",
   "pyarrow",
   "hydra-core",
   "numpy",
@@ -28,12 +28,13 @@ dependencies = [
   "filelock",
   "pytest",
   "meds_testing_helpers~=0.3.0",
-  "MEDS-transforms~=0.5.0",
-  "meds-torch-data[lightning]~=0.6.2",
+  "MEDS-transforms~=0.5.2",
+  "meds-torch-data[lightning]~=0.6.3",
   "transformers",
   "torch",
   "torchmetrics",
-  "lightning~=2.5.1"
+  "lightning~=2.5.1",
+  "MEDS_trajectory_evaluation~=0.0.3",
 ]
 
 [tool.setuptools_scm]
