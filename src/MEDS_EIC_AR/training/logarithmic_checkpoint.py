@@ -46,8 +46,7 @@ class LogarithmicModelCheckpoint(ModelCheckpoint):
         if train_time_interval:
             prev_time_check = self._last_time_checked
             skip_time = (
-                prev_time_check is None
-                or (now - prev_time_check) < train_time_interval.total_seconds()
+                prev_time_check is None or (now - prev_time_check) < train_time_interval.total_seconds()
             )
             skip_time = trainer.strategy.broadcast(skip_time)
 
