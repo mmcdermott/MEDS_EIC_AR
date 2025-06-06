@@ -233,6 +233,7 @@ follows:
     │   └── model_checkpoint.yaml
     ├── default.yaml
     ├── demo.yaml
+    ├── generation.yaml
     └── logger
         ├── csv.yaml
         ├── mlflow.yaml
