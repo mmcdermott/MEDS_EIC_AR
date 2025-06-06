@@ -175,6 +175,11 @@ details on the format of the generated trajectories.
 > non-identical across different samples, and containing the right subjects. It has not yet been assessed to
 > ensure full correctness.
 
+> [!NOTE]
+> The generated trajectories from this model are saved in the schema defined in the
+> [`MEDS_trajectory_evaluation.schema.GeneratedTrajectorySchema`](https://github.com/mmcdermott/MEDS_trajectory_evaluation/blob/main/src/MEDS_trajectory_evaluation/schema.py)
+> format, and can be used with that package's evaluation tools.
+
 #### 3.2 Resolve Trajectories into Predictions.
 
 Not yet implemented.
