@@ -102,6 +102,8 @@ def format_trajectory_batch(
               - `"task_sample_id"`: The task sample ID of the patient. This is a unique identifier for the
                 task sample, which is useful as there may be different task samples for the same patient, and
                 we don't wish our generated trajectories to intersect.
+              - `"window_last_observed"`: The last time of an event observed in the input data for this
+                subject sample.
         generated_code_indices: The generated codes for this batch.
         code_information: The code information mapping from code indices to their string representations and
             numeric value means.
@@ -114,6 +116,13 @@ def format_trajectory_batch(
         ...     "_task_sample_id": [1, 2, 3, 4, 5],
         ...     "subject_id": [1, 2, 3, 1, 4],
         ...     "prediction_time": [
+        ...         datetime(1993, 1, 1),
+        ...         datetime(2000, 1, 2),
+        ...         datetime(1973, 1, 3),
+        ...         datetime(2002, 10, 12),
+        ...         datetime(2002, 10, 12),
+        ...     ],
+        ...     "window_last_observed": [
         ...         datetime(1993, 1, 1),
         ...         datetime(2000, 1, 2),
         ...         datetime(1973, 1, 3),
@@ -143,18 +152,6 @@ def format_trajectory_batch(
     With this setup, we are generating the following strings of events for these patients:
 
         >>> schema_df
-        shape: (5, 3)
-        ┌─────────────────┬────────────┬─────────────────────┐
-        │ _task_sample_id ┆ subject_id ┆ prediction_time     │
-        │ ---             ┆ ---        ┆ ---                 │
-        │ i64             ┆ i64        ┆ datetime[μs]        │
-        ╞═════════════════╪════════════╪═════════════════════╡
-        │ 1               ┆ 1          ┆ 1993-01-01 00:00:00 │
-        │ 2               ┆ 2          ┆ 2000-01-02 00:00:00 │
-        │ 3               ┆ 3          ┆ 1973-01-03 00:00:00 │
-        │ 4               ┆ 1          ┆ 2002-10-12 00:00:00 │
-        │ 5               ┆ 4          ┆ 2002-10-12 00:00:00 │
-        └─────────────────┴────────────┴─────────────────────┘
 
     For task sample 1 (starting at 1993-01-01), we generate:
       - (2) A timeline delta of 0.1 years, which is 35.6 days. Event time: ~1993-02-06, 12:30
@@ -247,7 +244,10 @@ def format_trajectory_batch(
         ...     5: CodeInformation(code='TIMELINE//DELTA//yrs//C', value_prob=1.0, value_mean=1.0),
         ... }
         >>> schema_df = pl.DataFrame({
-        ...     "_task_sample_id": [1], "subject_id": [1], "prediction_time": [datetime(1993, 1, 1)],
+        ...     "_task_sample_id": [1],
+        ...     "subject_id": [1],
+        ...     "prediction_time": [datetime(1993, 1, 1)],
+        ...     "window_last_observed": [datetime(1993, 1, 1)],
         ... })
         >>> generated_code_indices = torch.LongTensor([[1, 2, 3, 4, 5]])
         >>> format_trajectory_batch(schema_df, generated_code_indices, code_information)
@@ -282,7 +282,7 @@ def format_trajectory_batch(
     for i in range(batch_size):
         subject_id = schema_chunk.select(DataSchema.subject_id_name)[i].item()
         prediction_time = schema_chunk.select(LabelSchema.prediction_time_name)[i].item()
-        time = schema_chunk.select("_last_event_time")[i].item()
+        time = schema_chunk.select(MEDSPytorchDataset.LAST_TIME)[i].item()
         task_sample_id = schema_chunk.select(TASK_SAMPLE_ID_COL)[i].item()
 
         for code_idx in generated_code_indices[i]:
@@ -311,6 +311,7 @@ def format_trajectory_batch(
                 }
             )
 
+
     return pl.DataFrame(
         rows,
         schema={
@@ -320,7 +321,7 @@ def format_trajectory_batch(
             LabelSchema.prediction_time_name: pl.Datetime,
             DataSchema.code_name: pl.Utf8,
             DataSchema.numeric_value_name: pl.Float32,
-            DataSchema.text_value_name: pl.LargeUtf8,
+            DataSchema.text_value_name: pl.String,
         },
     )
 
@@ -409,21 +410,12 @@ def format_trajectories(
                 "which is not 0.0 or 1.0. This is not supported."
             )
 
-    # Compute the time of the last observed event for each sample in the dataset
-    last_times: list[datetime | None] = []
-    for (subject_id, end_idx) in dataset.index:
-        shard, subj_idx = dataset.subj_locations[subject_id]
-        times_list = dataset.schema_dfs_by_shard[shard][DataSchema.time_name][subj_idx].to_list()
-        last_time = None
-        for t in reversed(times_list[:end_idx]):
-            if t is not None:
-                last_time = t
-                break
-        last_times.append(last_time)
-
-    output_schema = dataset.schema_df.select(
-        DataSchema.subject_id_name, LabelSchema.prediction_time_name
-    ).with_columns(pl.Series("_last_event_time", last_times)).with_row_index(TASK_SAMPLE_ID_COL)
+    output_schema = (
+        dataset.schema_df
+        .select(DataSchema.subject_id_name, LabelSchema.prediction_time_name, dataset.LAST_TIME)
+        .clone()
+        .with_row_index(TASK_SAMPLE_ID_COL)
+    )
 
     batches_as_df = []
     st_i = 0

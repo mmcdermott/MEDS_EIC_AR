@@ -33,7 +33,8 @@ dependencies = [
   "transformers",
   "torch",
   "torchmetrics",
-  "lightning~=2.5.1"
+  "lightning~=2.5.1",
+  "MEDS_trajectory_evaluation~=0.0.3",
 ]
 
 [tool.setuptools_scm]

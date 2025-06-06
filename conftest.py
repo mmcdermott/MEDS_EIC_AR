@@ -125,6 +125,7 @@ def dataset_config_with_task(preprocessed_dataset_with_task: tuple[Path, Path, s
         max_seq_len=10,
         task_labels_dir=(tasks_dir / task_name),
         seq_sampling_strategy="to_end",
+        include_window_last_observed_in_schema=True,
     )
 
 
