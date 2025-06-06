@@ -111,3 +111,27 @@ def test_resumes(
 
     last_ckpt = resume_from_dir / "checkpoints" / "last.ckpt"
     assert last_ckpt.is_file(), "No new last checkpoint created after resuming."
+
+
+def test_logarithmic_checkpoint_callback(
+    preprocessed_dataset: Path, tmp_path_factory: pytest.TempPathFactory
+):
+    """Ensure the logarithmic checkpoint callback saves multiple checkpoints."""
+
+    output_dir = tmp_path_factory.mktemp("log_ckpt")
+
+    command = [
+        "MEICAR_pretrain",
+        "--config-name=_demo_pretrain",
+        f"output_dir={output_dir!s}",
+        f"datamodule.config.tensorized_cohort_dir={preprocessed_dataset!s}",
+        "trainer.callbacks.model_checkpoint.enable_logarithmic=True",
+    ]
+
+    run_and_check(command)
+
+    ckpts = sorted(p.name for p in (output_dir / "checkpoints").glob("epoch=*-step=*.ckpt"))
+    assert {
+        "epoch=0-step=2.ckpt",
+        "epoch=1-step=4.ckpt",
+    }.issubset(ckpts), f"Unexpected checkpoints: {ckpts}"

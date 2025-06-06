@@ -1,5 +1,5 @@
 model_checkpoint:
-  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  _target_: MEDS_EIC_AR.training.LogarithmicModelCheckpoint
 
   dirpath: ${trainer.default_root_dir}/checkpoints # directory to save the model file
   monitor: "tuning/loss"
@@ -13,3 +13,6 @@ model_checkpoint:
   train_time_interval: null # checkpoints are monitored at the specified time interval
   every_n_epochs: null # number of epochs between checkpoints
   save_on_train_epoch_end: null # whether to run checkpointing at the end of the training epoch or the end of validation
+  enable_logarithmic: False
+  base: 2.0
+  start: 2

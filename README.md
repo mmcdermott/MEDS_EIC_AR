@@ -132,7 +132,8 @@ more configuration parameters than the pre-training step, so let's go through th
 
 1. You need to specify the task labels directory in the `datamodule.config.task_labels_dir` parameter.
 2. You need to specify the model initialization directory in the `model_initialization_dir` parameter. This
-    is the output directory of the pre-train step.
+    is the output directory of the pre-train step. You can also override `ckpt_path` to load from any
+    particular checkpoint inside this directory if you wish to evaluate intermediate models.
 3. You need to specify how you want to trade-off between allowed input context size and the maximum possible
     generated trajectory length. The former allows you to use more of the patient's record, but the latter
     controls how far into the future you can predict. This can be configured with one of three parameters in
@@ -235,6 +236,16 @@ follows:
         ├── csv.yaml
         ├── mlflow.yaml
         └── wandb.yaml
+
+Use the existing checkpoint callback with a logarithmic schedule by setting
+`trainer.callbacks.model_checkpoint.enable_logarithmic=True`.  You may
+additionally adjust `base` and `start` to tune how frequently checkpoints are
+saved.  This will save checkpoints more often early in training and less often
+later. For example:
+
+```bash
+MEICAR_pretrain trainer.callbacks.model_checkpoint.enable_logarithmic=True [...other args]
+```
 
 ```
 
