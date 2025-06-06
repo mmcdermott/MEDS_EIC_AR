@@ -2,5 +2,3 @@ defaults:
   - default
   - generation_speed_logger
   - _self_
-
-_target_: MEDS_EIC_AR.values_as_list

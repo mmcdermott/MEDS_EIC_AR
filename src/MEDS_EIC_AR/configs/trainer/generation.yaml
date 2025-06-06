@@ -1,0 +1,7 @@
+defaults:
+  - default
+  - override callbacks: generation
+  - _self_
+
+max_epochs: 1
+max_steps: null

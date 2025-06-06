@@ -227,6 +227,8 @@ follows:
     ├── callbacks
     │   ├── default.yaml
     │   ├── early_stopping.yaml
+    │   ├── generation.yaml
+    │   ├── generation_speed_logger.yaml
     │   ├── learning_rate_monitor.yaml
     │   └── model_checkpoint.yaml
     ├── default.yaml
