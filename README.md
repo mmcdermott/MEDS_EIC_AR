@@ -187,7 +187,7 @@ Not yet implemented.
 This model is configured via Hydra and PyTorch lightning. The configuration structure of this repository is as
 follows:
 
-```python
+````python
 >>> print_directory("./src/MEDS_EIC_AR/configs", config=PrintConfig(file_extension=".yaml"))
 ├── _demo_generate_trajectories.yaml
 ├── _demo_pretrain.yaml
@@ -245,7 +245,7 @@ later. For example:
 
 ```bash
 MEICAR_pretrain trainer.callbacks.model_checkpoint.enable_logarithmic=True [...other args]
-```
+````
 
 ## Output Files
 

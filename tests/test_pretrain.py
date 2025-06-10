@@ -111,5 +111,3 @@ def test_resumes(
 
     last_ckpt = resume_from_dir / "checkpoints" / "last.ckpt"
     assert last_ckpt.is_file(), "No new last checkpoint created after resuming."
-
-
