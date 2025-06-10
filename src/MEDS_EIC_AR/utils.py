@@ -1,5 +1,6 @@
 import logging
 import multiprocessing
+from collections.abc import Sequence
 from hashlib import sha256
 from pathlib import Path
 
@@ -21,6 +22,38 @@ def is_mlflow_logger(logger: Logger) -> bool:
         from lightning.pytorch.loggers import MLFlowLogger
 
         return isinstance(logger, MLFlowLogger)
+    except ImportError:
+        return False
+
+
+def is_wandb_logger(logger: Logger) -> bool:
+    """Check whether a Lightning logger is a WandB logger.
+
+    The import of :class:`~lightning.pytorch.loggers.WandbLogger` may fail if
+    the optional ``wandb`` dependency is not installed. This helper safely
+    returns ``False`` in that situation.
+
+    Example:
+        >>> class DummyLogger:
+        ...     ...
+        >>> is_wandb_logger(DummyLogger())
+        False
+        >>> import builtins
+        >>> from unittest.mock import patch
+        >>> original_import = builtins.__import__
+        >>> def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        ...     if name == "lightning.pytorch.loggers" and "WandbLogger" in fromlist:
+        ...         raise ImportError
+        ...     return original_import(name, globals, locals, fromlist, level)
+        >>> with patch.object(builtins, "__import__", fake_import):
+        ...     is_wandb_logger(DummyLogger())
+        False
+    """
+
+    try:
+        from lightning.pytorch.loggers import WandbLogger
+
+        return isinstance(logger, WandbLogger)
     except ImportError:
         return False
 
@@ -356,3 +389,92 @@ def save_resolved_config(cfg: DictConfig, fp: Path) -> bool:
     except Exception as e:
         logger.warning(f"Could not save resolved config: {e}")
         return False
+
+
+def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
+    """Populate logger configs with saved experiment IDs if present.
+
+    This helper mutates the provided trainer configuration in-place and reads
+    any saved run IDs from ``<run_dir>/loggers``. It is kept separate from
+    OmegaConf resolvers so configuration loading remains straightforward.
+
+    Example:
+        >>> from yaml_to_disk import yaml_disk
+        >>> cfg = DictConfig(
+        ...     {"loggers": [{"_target_": "MLFlowLogger"}, {"_target_": "WandbLogger"}]}
+        ... )
+        >>> disk = '''
+        ... loggers:
+        ...   "mlflow_run_id.txt": abc
+        ...   "wandb_run_id.txt": xyz
+        ... '''
+        >>> with yaml_disk(disk) as run_dir:
+        ...     apply_saved_logger_run_ids(cfg, run_dir)
+        ...     print(cfg.loggers[0]["run_id"], cfg.loggers[1]["id"], cfg.loggers[1]["resume"])
+        abc xyz allow
+    """
+
+    if trainer_cfg is None:
+        return
+
+    loggers = []
+    if "logger" in trainer_cfg:
+        loggers.append(trainer_cfg.logger)
+    if "loggers" in trainer_cfg:
+        loggers.extend(trainer_cfg.loggers)
+
+    log_dir = Path(run_dir) / "loggers"
+
+    for logger_cfg in loggers:
+        target = str(logger_cfg.get("_target_", "")).lower()
+        if "wandb" in target:
+            fp = log_dir / "wandb_run_id.txt"
+            if fp.is_file() and not logger_cfg.get("id"):
+                logger_cfg["id"] = fp.read_text().strip()
+                logger_cfg.setdefault("resume", "allow")
+        elif "mlflow" in target:
+            fp = log_dir / "mlflow_run_id.txt"
+            if fp.is_file() and not logger_cfg.get("run_id"):
+                logger_cfg["run_id"] = fp.read_text().strip()
+
+
+def save_logger_run_ids(loggers: Sequence[Logger], run_dir: Path) -> None:
+    """Save experiment IDs for MLFlow and WandB loggers.
+
+    Args:
+        loggers: Collection of :class:`~lightning.pytorch.loggers.Logger` objects
+            used during the run.
+        run_dir: Directory where run IDs should be stored.
+
+    Example:
+        >>> class DummyMLFlowLogger:
+        ...     def __init__(self, run_id="foo"):
+        ...         self.run_id = run_id
+        >>> class DummyWandBExp:
+        ...     def __init__(self, id="bar"):
+        ...         self.id = id
+        >>> class DummyWandbLogger:
+        ...     def __init__(self, exp_id="bar"):
+        ...         self.experiment = DummyWandBExp(exp_id)
+        >>> from unittest.mock import patch
+        >>> from yaml_to_disk import yaml_disk
+        >>> with patch("lightning.pytorch.loggers.MLFlowLogger", DummyMLFlowLogger, create=True), \
+        ...      patch("lightning.pytorch.loggers.WandbLogger", DummyWandbLogger, create=True), \
+        ...      yaml_disk("") as run_dir:
+        ...     save_logger_run_ids([DummyMLFlowLogger("mlflow"), DummyWandbLogger("wandb")], run_dir)
+        ...     print((run_dir / "loggers" / "mlflow_run_id.txt").read_text())
+        ...     print((run_dir / "loggers" / "wandb_run_id.txt").read_text())
+        mlflow
+        wandb
+    """
+
+    log_dir = Path(run_dir) / "loggers"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    for logger in loggers:
+        if is_mlflow_logger(logger):
+            (log_dir / "mlflow_run_id.txt").write_text(str(logger.run_id))
+            continue
+
+        if is_wandb_logger(logger):
+            (log_dir / "wandb_run_id.txt").write_text(str(logger.experiment.id))

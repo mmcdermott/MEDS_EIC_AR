@@ -1,0 +1,4 @@
+defaults:
+  - demo
+  - override callbacks: generation
+  - _self_
