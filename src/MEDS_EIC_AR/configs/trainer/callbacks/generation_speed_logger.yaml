@@ -1,0 +1,2 @@
+generation_speed_logger:
+  _target_: MEDS_EIC_AR.training.callbacks.GenerationSpeedLogger

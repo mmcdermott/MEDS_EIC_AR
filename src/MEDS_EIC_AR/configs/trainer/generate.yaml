@@ -1,0 +1,4 @@
+defaults:
+  - default
+  - override callbacks: generation
+  - _self_
