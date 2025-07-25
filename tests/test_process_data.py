@@ -23,7 +23,7 @@ def test_process_with_reshard_correct(preprocessed_dataset_with_reshard: Path):
 def test_process_with_custom_bins(simple_static_MEDS: Path, tmp_path, monkeypatch):
     bins_fp = tmp_path / "bins.yaml"
     bins_fp.write_text("{HR: {low: 100, high: 110}}")
-    monkeypatch.setenv("NUMERIC_QUANTILES_FP", str(bins_fp))
+    monkeypatch.setenv("NUMERIC_CUSTOM_BINS_FP", str(bins_fp))
     output = run_process_data(simple_static_MEDS, tmp_path)
     codes = pq.read_table(output / "metadata" / "codes.parquet").column("code").to_pylist()
     hr_codes = [c for c in codes if c.startswith("HR")]

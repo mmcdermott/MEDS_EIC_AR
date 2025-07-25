@@ -1,5 +1,4 @@
 import copy
-import json
 import logging
 import os
 import subprocess
@@ -7,7 +6,6 @@ from importlib.resources import files
 from pathlib import Path
 
 import hydra
-import yaml
 from omegaconf import DictConfig
 
 logger = logging.getLogger(__name__)
@@ -34,19 +32,14 @@ def process_data(cfg: DictConfig):
 
         # Determine which preprocessing configuration to use
         include_numeric = env.get("INCLUDE_NUMERIC_VALUES", "1") not in {"0", "false", "False"}
-        quantiles_fp = env.get("NUMERIC_QUANTILES_FP")
+        custom_bins_fp = env.get("NUMERIC_CUSTOM_BINS_FP") or env.get("NUMERIC_QUANTILES_FP")
         quantiles_list = env.get("NUMERIC_QUANTILES")
         n_q = env.get("N_VALUE_QUANTILES")
 
         if not include_numeric:
             pipeline_name = "_reshard_no_numeric.yaml" if cfg.do_reshard else "_data_no_numeric.yaml"
-        elif quantiles_fp:
-            try:
-                with open(quantiles_fp) as f:
-                    custom_bins = yaml.safe_load(f) or {}
-            except Exception as e:
-                raise RuntimeError(f"Failed loading NUMERIC_QUANTILES_FP: {quantiles_fp}") from e
-            env["NUMERIC_CUSTOM_BINS"] = json.dumps(custom_bins)
+        elif custom_bins_fp:
+            env["NUMERIC_CUSTOM_BINS_FP"] = custom_bins_fp
             pipeline_name = "_reshard_custom_bins.yaml" if cfg.do_reshard else "_data_custom_bins.yaml"
         else:
             if not quantiles_list and n_q:
