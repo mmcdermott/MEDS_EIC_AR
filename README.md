@@ -8,6 +8,7 @@
 [![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/mmcdermott/MEDS_EIC_AR#license)
 [![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/pulls)
 [![contributors](https://img.shields.io/github/contributors/mmcdermott/MEDS_EIC_AR.svg)](https://github.com/mmcdermott/MEDS_EIC_AR/graphs/contributors)
+[![DOI](https://zenodo.org/badge/964734885.svg)](https://doi.org/10.5281/zenodo.17535558)
 
 A MEDS, "Everything-is-code" style Autoregressive Generative Model, capable of zero-shot inference.
 
