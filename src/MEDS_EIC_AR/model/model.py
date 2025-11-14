@@ -75,23 +75,23 @@ class Model(torch.nn.Module):
     `code` key.
 
         >>> sample_batch
-        MEDSTorchBatch(code=tensor([[38,  5, 36,  3, 13, 29, 35,  4, 37],
-                                    [38,  5, 36,  2, 22, 25, 35,  4, 37]]),
+        MEDSTorchBatch(code=tensor([[38,  22, 36,  3, 12, 29, 35,  4, 37],
+                                    [38,  22, 36,  2, 21, 25, 35,  4, 37]]),
                        ...)
 
     We run over the batch in the normal way, which internally calls the `forward` method of the model:
 
         >>> loss, outputs = model(sample_batch)
         >>> print(loss)
-        tensor(3.6660, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
+        tensor(3.6602, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
         >>> print(f"Outputs have keys: {', '.join(outputs.keys())}")
         Outputs have keys: logits, past_key_values
         >>> print(f"Logits shape: {outputs.logits.shape}")
         Logits shape: torch.Size([2, 9, 39])
         >>> print(outputs.logits)
-        tensor([[[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.3763e-02, ...,  1.6571e-02]],
+        tensor([[[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.3962e-02, ...,  1.6510e-02]],
         <BLANKLINE>
-                [[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.4458e-02, ...,  1.6281e-02]]],
+                [[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.4549e-02, ...,  1.6312e-02]]],
                dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
 
@@ -111,9 +111,9 @@ class Model(torch.nn.Module):
         >>> loss.backward()
         >>> print(f"Sample parameter grad?: {sample_param.grad}")
         Sample parameter grad?:
-        tensor([[ 0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00],
+        tensor([[ 0.0000,  0.0000,  0.0000,  0.0000],
                 ...,
-                [ 1.5251e-02, -6.2347e-02, -3.1921e-02,  7.9102e-02]],
+                [ 0.0341, -0.0679, -0.0286,  0.0625]],
                dtype=torch.float16)
 
     With a single backward pass, we should not get any infinite gradients:
