@@ -75,8 +75,8 @@ class Model(torch.nn.Module):
     `code` key.
 
         >>> sample_batch
-        MEDSTorchBatch(code=tensor([[38,  5, 36,  3, 13, 29, 35,  4, 37],
-                                    [38,  5, 36,  2, 22, 25, 35,  4, 37]]),
+        MEDSTorchBatch(code=tensor([[38,  22, 36,  3, 13, 29, 35,  4, 37],
+                                    [38,  22, 36,  2, 22, 25, 35,  4, 37]]),
                        ...)
 
     We run over the batch in the normal way, which internally calls the `forward` method of the model:

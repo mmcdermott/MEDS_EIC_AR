@@ -37,16 +37,15 @@ dependencies = [
   "MEDS_trajectory_evaluation~=0.0.3",
 ]
 
+[dependency-groups]
+dev = ["pre-commit<4", "ruff", "pytest-cov", "pretty_print_directory>=0.1.2", "yaml_to_disk"]
+
 [tool.setuptools_scm]
 
 [project.optional-dependencies]
 # Extensions
 wandb = ["wandb"]
 mlflow = ["mlflow", "psutil", "pynvml"]
-
-# Core Development
-dev = ["pre-commit<4", "ruff"]
-tests = ["pytest-cov", "pretty_print_directory>=0.1.2", "yaml_to_disk"]
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_EIC_AR"

@@ -4,46 +4,65 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, "release/*", "dev"]
 
 jobs:
   run_tests_ubuntu:
     runs-on: ubuntu-latest
 
     strategy:
-      matrix:
-        python-version: ["3.12"]
       fail-fast: false
 
     timeout-minutes: 30
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Setup package
+        uses: ./.github/actions/setup
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
 
-      - name: Install packages
-        run: |
-          pip install -e .[tests]
-
-      #----------------------------------------------
-      #              run test suite
-      #----------------------------------------------
       - name: Run tests
-        run: |
-          pytest -v --cov=src
+        run: >
+          uv run pytest -v --cov=src -m "not parallelized and not lightning"
+          --ignore="benchmark" --ignore="src/meds_torchdata/extensions"
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/test-results-action@v1
+      - name: Install lightning
+        run: |
+          uv sync --locked --extra lightning
+
+      - name: Run doctests with lightning
+        run: |
+          uv run pytest -v --cov=src src/meds_torchdata/extensions/lightning_datamodule.py
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4.0.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Run test/* tests with lightning
+        run: |
+          uv run pytest -v --cov=src tests/ -m "lightning and not parallelized"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4.0.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Install joblib
+        run: |
+          uv sync --locked --extra parallelized
+
+      - name: Run tests with joblib
+        run: |
+          uv run pytest -v --cov=src tests/ -m "parallelized and not lightning"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
