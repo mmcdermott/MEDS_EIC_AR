@@ -24,43 +24,7 @@ jobs:
 
       - name: Run tests
         run: >
-          uv run pytest -v --cov=src -m "not parallelized and not lightning"
-          --ignore="benchmark" --ignore="src/meds_torchdata/extensions"
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4.0.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-      - name: Install lightning
-        run: |
-          uv sync --locked --extra lightning
-
-      - name: Run doctests with lightning
-        run: |
-          uv run pytest -v --cov=src src/meds_torchdata/extensions/lightning_datamodule.py
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4.0.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-      - name: Run test/* tests with lightning
-        run: |
-          uv run pytest -v --cov=src tests/ -m "lightning and not parallelized"
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4.0.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-      - name: Install joblib
-        run: |
-          uv sync --locked --extra parallelized
-
-      - name: Run tests with joblib
-        run: |
-          uv run pytest -v --cov=src tests/ -m "parallelized and not lightning"
+          uv run pytest -v --cov=src
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4.0.1
