@@ -457,8 +457,37 @@ class Model(torch.nn.Module):
 
         return loss, outputs
 
-    def generate(self, batch: MEDSTorchBatch, do_sample: bool = True, **kwargs) -> torch.Tensor:
-        """Generates a sequence of tokens from the model using the HF generation mixin.
+    def generate(
+        self,
+        batch: MEDSTorchBatch,
+        do_sample: bool = True,
+        max_new_tokens: int | None = None,
+        rolling_context_size: int | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Generates a sequence of tokens from the model.
+
+        When ``max_new_tokens`` is ``None`` (the default), this performs a single call to the Hugging Face
+        generation mixin, bounded by ``max_seq_len - input_len`` — the model can only emit as many tokens as
+        its remaining context window. This is the legacy, "generate to the end of the input window" path.
+
+        When ``max_new_tokens`` is an integer, this switches to a rolling sliding-window loop that can emit up
+        to ``max_new_tokens`` tokens in total, even if that exceeds the model's positional embedding limit.
+        The loop repeatedly calls the underlying HF generate with the right-aligned tail of
+        ``(original_input ++ previously_generated)`` (truncated to ``rolling_context_size``) until either
+        every sample has emitted the EOS token (``TIMELINE//END``) or ``max_new_tokens`` new tokens have been
+        produced in total. Samples that have already emitted EOS are zeroed into padding on subsequent chunks.
+        See :meth:`_rolling_generate` for details.
+
+        Args:
+            batch: The input batch of data. Only ``batch.code`` and ``batch.PAD_INDEX`` are read.
+            do_sample: Whether HF sampling is enabled (``True``) or greedy (``False``).
+            max_new_tokens: Total new-token budget across all chunks. ``None`` selects the legacy single-call
+                path.
+            rolling_context_size: Size of the sliding context window fed to the model on each chunk. Only used
+                when ``max_new_tokens`` is set. Defaults to ``max_seq_len - 1`` so every chunk always has room
+                for at least one new token.
+            **kwargs: Forwarded to ``HF_model.generate``.
 
         Examples:
             >>> _ = torch.manual_seed(0)
@@ -497,11 +526,36 @@ class Model(torch.nn.Module):
             tensor([[ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
                     [ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]])
 
+        Setting ``max_new_tokens`` explicitly enables the sliding-window path, which can emit more tokens than
+        the model's context window would normally allow. Here the model has ``max_position_embeddings=10`` but
+        we request 15 new tokens:
+
+            >>> _ = torch.manual_seed(0)
+            >>> model = Model({
+            ...     "num_hidden_layers": 2,
+            ...     "num_attention_heads": 2,
+            ...     "hidden_size": 4,
+            ...     "max_position_embeddings": 10,
+            ...     "vocab_size": dataset_config.vocab_size,
+            ... }, precision="32-true")
+            >>> out = model.generate(sample_batch, do_sample=False, max_new_tokens=15)
+            >>> out.shape
+            torch.Size([2, 15])
+
         Note that here, as we've turned sampling off for determinism in these testing algorithms, the
         generated samples are clearly visibly not meaningful. This is completely expected because we are
         working with a model that has just been randomly initialized. What if we try with a model that has
         undergone a (tiny) bit of pre-training? TODO(generation test).
         """
+
+        if max_new_tokens is not None:
+            return self._rolling_generate(
+                batch,
+                max_new_tokens=max_new_tokens,
+                rolling_context_size=rolling_context_size,
+                do_sample=do_sample,
+                **kwargs,
+            )
 
         for_hf = self._hf_inputs(batch)
 
@@ -525,3 +579,178 @@ class Model(torch.nn.Module):
         input_seq_len = batch.code.shape[1]
 
         return output_ids[:, input_seq_len:]
+
+    def _rolling_generate(
+        self,
+        batch: MEDSTorchBatch,
+        max_new_tokens: int,
+        rolling_context_size: int | None,
+        do_sample: bool,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Sliding-window generation loop that can exceed the model's context window.
+
+        The loop maintains a running buffer of generated tokens. On each iteration it feeds the model the
+        right-aligned tail of ``(original_input ++ generated_so_far)`` truncated to
+        ``rolling_context_size`` tokens. HF ``generate`` handles in-chunk EOS (``TIMELINE//END``) naturally —
+        rows that hit EOS are padded with ``PAD_INDEX`` from that point on. Across chunks, we track a
+        ``finished`` mask and overwrite any tokens produced for already-finished rows with pad, so those rows
+        don't "resurrect". The loop terminates as soon as every row is finished or the new-token budget is
+        exhausted. Finally, each row is truncated at its first EOS — everything after is replaced with pad.
+
+        Args:
+            batch: Input batch. Only ``batch.code`` and ``batch.PAD_INDEX`` are read.
+            max_new_tokens: Total new-token budget across all chunks. Must be positive.
+            rolling_context_size: Per-chunk context window. ``None`` defaults to ``max_seq_len - 1``, the
+                largest value that still leaves room for at least one new token per chunk.
+            do_sample: Whether HF sampling is enabled.
+            **kwargs: Forwarded to ``HF_model.generate``.
+
+        Returns:
+            A ``[B, L]`` tensor of newly generated tokens, where ``L <= max_new_tokens``. Each row is
+            truncated at its first EOS, with post-EOS positions replaced with ``PAD_INDEX``.
+
+        Examples:
+            We can build a tiny deterministic model to exercise the loop. With
+            ``max_position_embeddings=5`` and ``max_new_tokens=12``, generation must roll across at least
+            three chunks because each chunk can only produce at most ``5 - 1 = 4`` new tokens given a
+            one-token-minimum prompt:
+
+            >>> _ = torch.manual_seed(0)
+            >>> model = Model({
+            ...     "num_hidden_layers": 2,
+            ...     "num_attention_heads": 2,
+            ...     "hidden_size": 4,
+            ...     "max_position_embeddings": 5,
+            ...     "vocab_size": dataset_config.vocab_size,
+            ... }, precision="32-true")
+            >>> batch = Mock(
+            ...     code=torch.LongTensor([[38, 22, 36], [38, 22, 36]]),
+            ...     PAD_INDEX=0,
+            ...     mode="SM",
+            ... )
+            >>> out = model._rolling_generate(
+            ...     batch, max_new_tokens=12, rolling_context_size=None, do_sample=False
+            ... )
+            >>> out.shape
+            torch.Size([2, 12])
+
+            Every row is either all-padded after its first EOS or has no EOS at all — we never see a token
+            after a ``TIMELINE//END`` in a given row. The ``TIMELINE//END`` index for the test vocab is 37:
+
+            >>> eos_id = 37
+            >>> for row in out:
+            ...     if (row == eos_id).any():
+            ...         first_eos = int((row == eos_id).nonzero(as_tuple=True)[0][0])
+            ...         assert (row[first_eos + 1:] == 0).all(), f"tokens after EOS in {row}"
+
+            If we instead choose a ``max_new_tokens`` that is smaller than the model's one-shot capacity, we
+            still get exactly that many tokens back (at most) — the rolling path just degenerates into a
+            single chunk with a tighter ``max_new_tokens`` cap:
+
+            >>> _ = torch.manual_seed(0)
+            >>> out = model._rolling_generate(
+            ...     batch, max_new_tokens=2, rolling_context_size=None, do_sample=False
+            ... )
+            >>> out.shape
+            torch.Size([2, 2])
+
+        Validation errors:
+
+            >>> model._rolling_generate(
+            ...     batch, max_new_tokens=0, rolling_context_size=None, do_sample=False
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: max_new_tokens must be positive; got 0.
+            >>> model._rolling_generate(
+            ...     batch, max_new_tokens=5, rolling_context_size=0, do_sample=False
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: rolling_context_size must be positive; got 0.
+        """
+
+        if max_new_tokens <= 0:
+            raise ValueError(f"max_new_tokens must be positive; got {max_new_tokens}.")
+
+        if rolling_context_size is None:
+            ctx_size = self.max_seq_len - 1
+        else:
+            if rolling_context_size <= 0:
+                raise ValueError(f"rolling_context_size must be positive; got {rolling_context_size}.")
+            ctx_size = min(rolling_context_size, self.max_seq_len - 1)
+
+        input_ids = batch.code
+        pad_id = batch.PAD_INDEX
+        eos_id = self.HF_model.config.eos_token_id
+        batch_size = input_ids.size(0)
+        device = input_ids.device
+
+        generated = torch.empty((batch_size, 0), dtype=input_ids.dtype, device=device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        while generated.size(1) < max_new_tokens and not bool(finished.all()):
+            full_so_far = torch.cat([input_ids, generated], dim=1)
+            prompt = full_so_far[:, -ctx_size:]
+            prompt_mask = prompt != pad_id
+
+            remaining_budget = max_new_tokens - generated.size(1)
+            chunk_budget = min(remaining_budget, self.max_seq_len - prompt.size(1))
+            if chunk_budget <= 0:
+                # Prompt fills the whole window. Drop the earliest token to free a slot.
+                prompt = prompt[:, 1:]
+                prompt_mask = prompt_mask[:, 1:]
+                chunk_budget = min(remaining_budget, self.max_seq_len - prompt.size(1))
+                if chunk_budget <= 0:  # pragma: no cover — defensive; ctx_size <= max_seq_len - 1
+                    break
+
+            generation_config = GenerationConfig(
+                max_new_tokens=chunk_budget,
+                do_sample=do_sample,
+                num_beams=1,
+                temperature=1.0,
+                pad_token_id=pad_id,
+                bos_token_id=None,
+                eos_token_id=eos_id,
+            )
+
+            out = self.HF_model.generate(
+                prompt,
+                attention_mask=prompt_mask,
+                generation_config=generation_config,
+                **kwargs,
+            )
+            new_tokens = out[:, prompt.size(1) :]
+
+            # Zero-out any tokens for already-finished rows so they can't accidentally contribute.
+            if bool(finished.any()):
+                new_tokens = new_tokens.masked_fill(finished.unsqueeze(1), pad_id)
+
+            generated = torch.cat([generated, new_tokens], dim=1)
+
+            hit_eos = (new_tokens == eos_id).any(dim=1)
+            finished = finished | hit_eos
+
+        return self._truncate_at_first_eos(generated, eos_id, pad_id)
+
+    @staticmethod
+    def _truncate_at_first_eos(x: torch.Tensor, eos_id: int, pad_id: int) -> torch.Tensor:
+        """Replace every token strictly after the first ``eos_id`` in each row with ``pad_id``.
+
+        Examples:
+            >>> x = torch.LongTensor([[1, 2, 9, 3, 9, 4], [1, 2, 3, 4, 5, 6], [9, 1, 2, 3, 4, 5]])
+            >>> Model._truncate_at_first_eos(x, eos_id=9, pad_id=0)
+            tensor([[1, 2, 9, 0, 0, 0],
+                    [1, 2, 3, 4, 5, 6],
+                    [9, 0, 0, 0, 0, 0]])
+        """
+        if x.size(1) == 0:
+            return x
+        is_eos = x == eos_id
+        # cum_prev[i] = number of EOS at positions strictly before i. A position is "after the first EOS"
+        # iff at least one EOS appears strictly before it.
+        cum = is_eos.cumsum(dim=1)
+        cum_prev = torch.cat([torch.zeros_like(cum[:, :1]), cum[:, :-1]], dim=1)
+        after_first_eos = cum_prev >= 1
+        return x.masked_fill(after_first_eos, pad_id)

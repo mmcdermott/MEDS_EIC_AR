@@ -209,6 +209,41 @@ def generated_trajectories(
     return output_dir
 
 
+@pytest.fixture(scope="session")
+def generated_trajectories_rolling(
+    pretrained_model: Path,
+    preprocessed_dataset_with_task: tuple[Path, Path, str],
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Fixture that drives MEICAR_generate_trajectories through the rolling (sliding-window) path.
+
+    Sets ``rolling_generation.max_new_tokens`` to a value larger than the model's per-chunk capacity so the
+    internal loop must cross at least one chunk boundary. This exercises the end-to-end wiring from
+    ``_generate_trajectories.yaml`` → ``M.generation_kwargs`` → ``Model.generate`` → ``_rolling_generate``.
+    """
+
+    tensorized_cohort_dir, task_root_dir, task_name = preprocessed_dataset_with_task
+    model_initialization_dir = pretrained_model
+
+    output_dir = tmp_path_factory.mktemp("generated_trajectories_rolling")
+
+    run_and_check(
+        [
+            "MEICAR_generate_trajectories",
+            "--config-name=_demo_generate_trajectories",
+            f"output_dir={output_dir!s}",
+            f"model_initialization_dir={model_initialization_dir!s}",
+            f"datamodule.config.tensorized_cohort_dir={tensorized_cohort_dir!s}",
+            f"datamodule.config.task_labels_dir={(task_root_dir / task_name)!s}",
+            "datamodule.batch_size=2",
+            "trainer=demo",
+            "rolling_generation.max_new_tokens=15",
+        ]
+    )
+
+    return output_dir
+
+
 @contextmanager
 def print_warnings(caplog: pytest.LogCaptureFixture):
     """Captures all logged warnings within this context block and prints them upon exit.

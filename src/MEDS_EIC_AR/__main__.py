@@ -133,6 +133,13 @@ def generate_trajectories(cfg: DictConfig):
     M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path))
     M.eval()
 
+    rolling_cfg = cfg.get("rolling_generation", None)
+    if rolling_cfg is not None:
+        for k in ("max_new_tokens", "rolling_context_size"):
+            v = rolling_cfg.get(k, None)
+            if v is not None:
+                M.generation_kwargs[k] = v
+
     trainer = instantiate(cfg.trainer)
 
     inference = cfg.inference
