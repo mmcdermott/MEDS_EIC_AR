@@ -456,12 +456,19 @@ def save_logger_run_ids(loggers: Sequence[Logger], run_dir: Path) -> None:
         >>> class DummyWandbLogger:
         ...     def __init__(self, exp_id="bar"):
         ...         self.experiment = DummyWandBExp(exp_id)
+        >>> import tempfile
         >>> from unittest.mock import patch
-        >>> from yaml_to_disk import yaml_disk
-        >>> with patch("lightning.pytorch.loggers.MLFlowLogger", DummyMLFlowLogger, create=True), \
-        ...      patch("lightning.pytorch.loggers.WandbLogger", DummyWandbLogger, create=True), \
-        ...      yaml_disk("") as run_dir:
-        ...     save_logger_run_ids([DummyMLFlowLogger("mlflow"), DummyWandbLogger("wandb")], run_dir)
+        >>> mlflow_patch = patch(
+        ...     "lightning.pytorch.loggers.MLFlowLogger", DummyMLFlowLogger, create=True
+        ... )
+        >>> wandb_patch = patch(
+        ...     "lightning.pytorch.loggers.WandbLogger", DummyWandbLogger, create=True
+        ... )
+        >>> with mlflow_patch, wandb_patch, tempfile.TemporaryDirectory() as tmp:
+        ...     run_dir = Path(tmp)
+        ...     save_logger_run_ids(
+        ...         [DummyMLFlowLogger("mlflow"), DummyWandbLogger("wandb")], run_dir
+        ...     )
         ...     print((run_dir / "loggers" / "mlflow_run_id.txt").read_text())
         ...     print((run_dir / "loggers" / "wandb_run_id.txt").read_text())
         mlflow
