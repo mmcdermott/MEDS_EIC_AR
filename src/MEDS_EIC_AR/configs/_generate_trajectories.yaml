@@ -26,7 +26,9 @@ seq_lens:
 # `max_new_tokens` to an integer switches on the rolling loop, which slides the context window and keeps
 # generating until either every sample has emitted `TIMELINE//END` or the total new-token budget is reached.
 # `rolling_context_size` is the per-chunk prompt size fed to the model; null defaults to
-# `pretrained_max_seq_len - 1` so every chunk always has room for at least one new token.
+# `pretrained_max_seq_len - 1` so that, once the sliding window is full, every chunk emits exactly one
+# new token per call (the minimum guaranteed progress). Earlier chunks — before the window saturates —
+# can emit more than one token per call because the prompt is still shorter than `pretrained_max_seq_len`.
 rolling_generation:
   max_new_tokens: null
   rolling_context_size: null

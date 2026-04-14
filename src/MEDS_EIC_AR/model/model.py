@@ -528,7 +528,10 @@ class Model(torch.nn.Module):
 
         Setting ``max_new_tokens`` explicitly enables the sliding-window path, which can emit more tokens than
         the model's context window would normally allow. Here the model has ``max_position_embeddings=10`` but
-        we request 15 new tokens:
+        we request 15 new tokens. Rolling generation requires a valid ``eos_token_id`` that differs from
+        ``batch.PAD_INDEX``, which in a real run is set by the ``MEICAR_pretrain`` CLI to the index of
+        ``TIMELINE//END``; we set it manually here because the randomly-initialized test model has no
+        pretraining and defaults to ``eos_token_id=0``:
 
             >>> _ = torch.manual_seed(0)
             >>> model = Model({
@@ -538,14 +541,24 @@ class Model(torch.nn.Module):
             ...     "max_position_embeddings": 10,
             ...     "vocab_size": dataset_config.vocab_size,
             ... }, precision="32-true")
-            >>> out = model.generate(sample_batch, do_sample=False, max_new_tokens=15)
-            >>> out.shape
-            torch.Size([2, 15])
+            >>> model.HF_model.config.eos_token_id = 37  # TIMELINE//END for the test vocab
+            >>> model.generate(sample_batch, do_sample=False, max_new_tokens=15)
+            tensor([[ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
+                    [ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]])
 
         Note that here, as we've turned sampling off for determinism in these testing algorithms, the
-        generated samples are clearly visibly not meaningful. This is completely expected because we are
-        working with a model that has just been randomly initialized. What if we try with a model that has
-        undergone a (tiny) bit of pre-training? TODO(generation test).
+        generated samples are clearly visibly not meaningful — a randomly initialized model greedy-decodes
+        to a single high-probability token and then repeats it. This is completely expected. What if we try
+        with a model that has undergone a (tiny) bit of pre-training? TODO(generation test).
+
+        Note on HF library support: HF Transformers does not currently provide a built-in way to generate
+        more tokens than the model's ``max_position_embeddings`` for architectures without native sliding-
+        window attention. GPTNeoX, which this model wraps, is one such architecture. The earlier
+        ``SinkCache`` / StreamingLLM approach was removed from recent releases; its replacement lives
+        inside the model implementations themselves and only applies to architectures that advertise
+        sliding-window attention (Mistral, Gemma2, Llama4). That's why we maintain our own rolling loop
+        here — see :meth:`_rolling_generate` for the trade-offs, including the positional-embedding
+        correctness consideration when the window slides.
         """
 
         if max_new_tokens is not None:
@@ -590,19 +603,45 @@ class Model(torch.nn.Module):
     ) -> torch.Tensor:
         """Sliding-window generation loop that can exceed the model's context window.
 
-        The loop maintains a running buffer of generated tokens. On each iteration it feeds the model the
-        right-aligned tail of ``(original_input ++ generated_so_far)`` truncated to
-        ``rolling_context_size`` tokens. HF ``generate`` handles in-chunk EOS (``TIMELINE//END``) naturally —
-        rows that hit EOS are padded with ``PAD_INDEX`` from that point on. Across chunks, we track a
-        ``finished`` mask and overwrite any tokens produced for already-finished rows with pad, so those rows
-        don't "resurrect". The loop terminates as soon as every row is finished or the new-token budget is
-        exhausted. Finally, each row is truncated at its first EOS — everything after is replaced with pad.
+        The loop preallocates a ``[B, max_new_tokens]`` output buffer and, on each iteration, feeds the model
+        the right-aligned tail of ``(original_input ++ tokens_generated_so_far)`` truncated to
+        ``rolling_context_size`` tokens. New tokens from HF ``generate`` are written into the next free slice
+        of the buffer — there is no per-step ``torch.cat``, so memory/compute is O(T·ctx) rather than O(T²).
+        HF ``generate`` handles in-chunk EOS (``TIMELINE//END``) naturally: rows that hit EOS are padded with
+        ``PAD_INDEX`` from that point on. Across chunks we track a ``finished`` mask and overwrite tokens
+        produced for already-finished rows with pad, so those rows don't "resurrect". The loop terminates as
+        soon as every row is finished or the new-token budget is exhausted. Finally, each row is truncated
+        at its first EOS — everything after is replaced with pad.
+
+        **Why we maintain our own loop.** HF Transformers does not currently expose a built-in primitive
+        for generating past a model's ``max_position_embeddings`` on architectures that lack native sliding-
+        window attention. ``SinkCache`` / StreamingLLM was removed from recent releases; its replacement
+        lives inside specific model implementations (Mistral, Gemma2, Llama4) and doesn't apply to GPTNeoX,
+        which this repo's :class:`Model` wraps. The remaining HF caches (``DynamicCache``, ``StaticCache``,
+        ``QuantizedCache``, offloaded variants) only manage memory — they don't let the model see positions
+        beyond ``max_position_embeddings``. Swapping to a sliding-window-attention architecture upstream
+        would remove the need for this loop; until then this is the pragmatic path.
+
+        **Correctness caveat.** When the window slides and the earliest token is dropped, the new prompt
+        is re-prefilled from position 0, so GPTNeoX's rotary position embeddings see the surviving tokens
+        at different positions than they originally occupied. For a real pretrained model this can degrade
+        generation quality near window boundaries (the StreamingLLM paper addresses this with attention
+        sinks, which we do not yet implement). For the randomly-initialized demo models used in tests and
+        doctests here, this is inconsequential. See #86 / #87 for the follow-ups.
+
+        **Backend evolution.** Under the SGLang backend proposed in #88, only the inner
+        ``self.HF_model.generate(...)`` call site inside this loop is swapped for a backend-level
+        ``generate_chunk(...)`` invocation. The sliding-window bookkeeping — prompt tail construction,
+        ``finished`` mask, preallocated buffer, EOS truncation — stays here because it is the right place
+        to own cross-chunk state (including the time-budget stopping criterion from #82 and the REACH
+        logits-processor state described in the #87 SCOPE/REACH comment thread).
 
         Args:
             batch: Input batch. Only ``batch.code`` and ``batch.PAD_INDEX`` are read.
             max_new_tokens: Total new-token budget across all chunks. Must be positive.
             rolling_context_size: Per-chunk context window. ``None`` defaults to ``max_seq_len - 1``, the
-                largest value that still leaves room for at least one new token per chunk.
+                largest value that still leaves room for at least one new token per chunk once the window
+                saturates.
             do_sample: Whether HF sampling is enabled.
             **kwargs: Forwarded to ``HF_model.generate``.
 
@@ -610,11 +649,15 @@ class Model(torch.nn.Module):
             A ``[B, L]`` tensor of newly generated tokens, where ``L <= max_new_tokens``. Each row is
             truncated at its first EOS, with post-EOS positions replaced with ``PAD_INDEX``.
 
+        Raises:
+            ValueError: If ``max_new_tokens`` or ``rolling_context_size`` are non-positive, or if the
+                model's ``eos_token_id`` is unset or collides with ``batch.PAD_INDEX``.
+
         Examples:
             We can build a tiny deterministic model to exercise the loop. With
             ``max_position_embeddings=5`` and ``max_new_tokens=12``, generation must roll across at least
-            three chunks because each chunk can only produce at most ``5 - 1 = 4`` new tokens given a
-            one-token-minimum prompt:
+            three chunks because each chunk can only produce at most ``5 - 1 = 4`` new tokens once the
+            sliding window is full:
 
             >>> _ = torch.manual_seed(0)
             >>> model = Model({
@@ -624,36 +667,32 @@ class Model(torch.nn.Module):
             ...     "max_position_embeddings": 5,
             ...     "vocab_size": dataset_config.vocab_size,
             ... }, precision="32-true")
+            >>> model.HF_model.config.eos_token_id = 37  # TIMELINE//END for the test vocab
             >>> batch = Mock(
             ...     code=torch.LongTensor([[38, 22, 36], [38, 22, 36]]),
             ...     PAD_INDEX=0,
             ...     mode="SM",
             ... )
-            >>> out = model._rolling_generate(
+            >>> model._rolling_generate(
             ...     batch, max_new_tokens=12, rolling_context_size=None, do_sample=False
             ... )
-            >>> out.shape
-            torch.Size([2, 12])
+            tensor([[17, 19, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
+                    [17, 19, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]])
 
-            Every row is either all-padded after its first EOS or has no EOS at all — we never see a token
-            after a ``TIMELINE//END`` in a given row. The ``TIMELINE//END`` index for the test vocab is 37:
+            The output is a deterministic (seeded, greedy) smoke test: the randomly-initialized model never
+            samples the EOS token (37), so no row is truncated. The truncation path is exercised directly
+            by the :meth:`_truncate_at_first_eos` doctest below.
 
-            >>> eos_id = 37
-            >>> for row in out:
-            ...     if (row == eos_id).any():
-            ...         first_eos = int((row == eos_id).nonzero(as_tuple=True)[0][0])
-            ...         assert (row[first_eos + 1:] == 0).all(), f"tokens after EOS in {row}"
-
-            If we instead choose a ``max_new_tokens`` that is smaller than the model's one-shot capacity, we
-            still get exactly that many tokens back (at most) — the rolling path just degenerates into a
-            single chunk with a tighter ``max_new_tokens`` cap:
+            If we instead choose a ``max_new_tokens`` that is smaller than the model's one-shot capacity,
+            we still get exactly that many tokens back — the rolling path degenerates into a single chunk
+            with a tighter ``max_new_tokens`` cap:
 
             >>> _ = torch.manual_seed(0)
-            >>> out = model._rolling_generate(
+            >>> model._rolling_generate(
             ...     batch, max_new_tokens=2, rolling_context_size=None, do_sample=False
             ... )
-            >>> out.shape
-            torch.Size([2, 2])
+            tensor([[17, 19],
+                    [17, 19]])
 
         Validation errors:
 
@@ -669,6 +708,21 @@ class Model(torch.nn.Module):
             Traceback (most recent call last):
                 ...
             ValueError: rolling_context_size must be positive; got 0.
+
+            >>> model.HF_model.config.eos_token_id = None
+            >>> model._rolling_generate(
+            ...     batch, max_new_tokens=5, rolling_context_size=None, do_sample=False
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: Rolling generation requires the model's eos_token_id to be set (got None). ...
+            >>> model.HF_model.config.eos_token_id = 0  # collides with PAD_INDEX
+            >>> model._rolling_generate(
+            ...     batch, max_new_tokens=5, rolling_context_size=None, do_sample=False
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: Rolling generation requires eos_token_id (0) to differ from batch.PAD_INDEX (0). ...
         """
 
         if max_new_tokens <= 0:
@@ -684,21 +738,44 @@ class Model(torch.nn.Module):
         input_ids = batch.code
         pad_id = batch.PAD_INDEX
         eos_id = self.HF_model.config.eos_token_id
+
+        if eos_id is None:
+            raise ValueError(
+                "Rolling generation requires the model's eos_token_id to be set (got None). "
+                "Instantiate the model with eos_token_id=get_timeline_end_token_idx(dataset_config), "
+                "as is done in the MEICAR_pretrain entry point."
+            )
+        if eos_id == pad_id:
+            raise ValueError(
+                f"Rolling generation requires eos_token_id ({eos_id}) to differ from "
+                f"batch.PAD_INDEX ({pad_id}). The finished-mask and post-EOS truncation would "
+                "otherwise collapse onto padding."
+            )
+
         batch_size = input_ids.size(0)
         device = input_ids.device
 
-        generated = torch.empty((batch_size, 0), dtype=input_ids.dtype, device=device)
+        # Preallocate the full output buffer so we never grow via torch.cat inside the loop.
+        # Total alloc is O(B · max_new_tokens) once, writes are O(new_tokens_per_chunk).
+        generated = torch.full((batch_size, max_new_tokens), pad_id, dtype=input_ids.dtype, device=device)
+        n_generated = 0
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        while generated.size(1) < max_new_tokens and not bool(finished.all()):
-            full_so_far = torch.cat([input_ids, generated], dim=1)
-            prompt = full_so_far[:, -ctx_size:]
+        while n_generated < max_new_tokens and not bool(finished.all()):
+            # Build the chunk prompt as the right-aligned tail of (input_ids ++ generated[:n_generated]).
+            if n_generated == 0:
+                prompt = input_ids[:, -ctx_size:]
+            elif n_generated >= ctx_size:
+                prompt = generated[:, n_generated - ctx_size : n_generated]
+            else:
+                input_tail_len = ctx_size - n_generated
+                prompt = torch.cat([input_ids[:, -input_tail_len:], generated[:, :n_generated]], dim=1)
             prompt_mask = prompt != pad_id
 
-            remaining_budget = max_new_tokens - generated.size(1)
+            remaining_budget = max_new_tokens - n_generated
             chunk_budget = min(remaining_budget, self.max_seq_len - prompt.size(1))
             if chunk_budget <= 0:
-                # Prompt fills the whole window. Drop the earliest token to free a slot.
+                # Prompt saturates the model window. Drop the earliest token to free a slot.
                 prompt = prompt[:, 1:]
                 prompt_mask = prompt_mask[:, 1:]
                 chunk_budget = min(remaining_budget, self.max_seq_len - prompt.size(1))
@@ -722,17 +799,21 @@ class Model(torch.nn.Module):
                 **kwargs,
             )
             new_tokens = out[:, prompt.size(1) :]
+            new_len = new_tokens.size(1)
 
-            # Zero-out any tokens for already-finished rows so they can't accidentally contribute.
+            # Zero-out tokens for already-finished rows so they stay padded in the output buffer.
             if bool(finished.any()):
                 new_tokens = new_tokens.masked_fill(finished.unsqueeze(1), pad_id)
 
-            generated = torch.cat([generated, new_tokens], dim=1)
+            generated[:, n_generated : n_generated + new_len] = new_tokens
+            n_generated += new_len
 
             hit_eos = (new_tokens == eos_id).any(dim=1)
             finished = finished | hit_eos
 
-        return self._truncate_at_first_eos(generated, eos_id, pad_id)
+        # Slice to the portion we actually filled (the final chunk may have been capped by
+        # remaining_budget below its natural chunk size, but n_generated tracks it exactly).
+        return self._truncate_at_first_eos(generated[:, :n_generated], eos_id, pad_id)
 
     @staticmethod
     def _truncate_at_first_eos(x: torch.Tensor, eos_id: int, pad_id: int) -> torch.Tensor:

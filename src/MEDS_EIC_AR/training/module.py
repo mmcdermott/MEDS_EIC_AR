@@ -204,6 +204,13 @@ class MEICARModule(L.LightningModule):
         self.metrics = metrics
         self.optimizer_factory = optimizer
         self.LR_scheduler_factory = LR_scheduler
+
+        # Per-prediction generation kwargs (e.g. rolling_generation.{max_new_tokens, rolling_context_size}).
+        # Intentionally NOT passed to save_hyperparameters: these are set at the start of each
+        # MEICAR_generate_trajectories CLI invocation from that run's Hydra config, not baked into the
+        # training-time checkpoint. A saved checkpoint can be reloaded and then driven with different
+        # generation settings (different rolling budgets, different stopping criteria) without having to
+        # reconcile stale training-era values.
         self.generation_kwargs: dict[str, Any] = {}
 
         self.save_hyperparameters(
