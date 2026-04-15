@@ -7,8 +7,10 @@ dimensions that the CLI test cannot easily parameterize:
 1. **Multi-round iteration** with ``max_new_tokens`` well above ``max_seq_len`` — many sliding
    boundaries, not just one — verified by spying on ``HF_model.generate`` and asserting the call
    count grows with the budget.
-2. **Non-default ``rolling_context_size`` values** — a smaller per-chunk window must yield a
-   strictly larger number of inner ``HF_model.generate`` calls for the same total new-token budget.
+2. **Non-default ``rolling_context_size`` values** — a smaller per-chunk window increases the
+   per-chunk new-token budget (each chunk can emit up to ``max_seq_len - rolling_context_size``
+   tokens), so it yields a strictly **smaller** number of inner ``HF_model.generate`` calls for
+   the same total new-token budget. The test below verifies this monotone relationship.
 
 We use a fresh random-init model per test and pick an ``eos_token_id`` (``37`` = ``TIMELINE//END``
 in the demo vocab) that a randomly-initialized model will essentially never greedily emit, so the
