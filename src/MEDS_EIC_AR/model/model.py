@@ -610,7 +610,11 @@ class Model(torch.nn.Module):
         The loop preallocates a ``[B, max_new_tokens]`` output buffer and, on each iteration, feeds the model
         the right-aligned tail of ``(original_input ++ tokens_generated_so_far)`` truncated to
         ``rolling_context_size`` tokens. New tokens from HF ``generate`` are written into the next free slice
-        of the buffer — there is no per-step ``torch.cat``, so memory/compute is O(T·ctx) rather than O(T²).
+        of the buffer — there is no per-step ``torch.cat``, so output-buffer growth and the memory movement
+        tied to it scale as O(T·ctx) rather than the O(T²) copying that the old concat-based loop incurred.
+        Note that *total* generation compute is still dominated by the repeated ``HF_model.generate`` forward
+        passes (roughly O(#chunks · ctx²) for full attention); the buffer preallocation is a memory-movement
+        fix, not a forward-pass-compute fix.
         HF ``generate`` handles in-chunk EOS (``TIMELINE//END``) naturally: rows that hit EOS are padded with
         ``PAD_INDEX`` from that point on. Across chunks we track a ``finished`` mask and overwrite tokens
         produced for already-finished rows with pad, so those rows don't "resurrect". The loop terminates as
