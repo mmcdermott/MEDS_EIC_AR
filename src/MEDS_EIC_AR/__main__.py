@@ -121,6 +121,45 @@ def pretrain(cfg: DictConfig):
     logger.info(f"Training complete in {datetime.now(tz=UTC) - st}")
 
 
+_ROLLING_ALLOWED_KEYS = {"max_new_tokens", "rolling_context_size"}
+
+
+def _validate_rolling_cfg(rolling_cfg: DictConfig | None) -> dict[str, int]:
+    """Validate the ``rolling_generation`` Hydra config block and return a cleaned kwargs dict.
+
+    Returns an empty dict if ``rolling_cfg`` is absent or contains only ``None`` values. Otherwise
+    returns a dict of positive-int kwargs ready to update ``M.generation_kwargs``. Raises
+    ``ValueError`` on any structural problem so the CLI fails before loading the checkpoint.
+    """
+    if rolling_cfg is None:
+        return {}
+    raw = OmegaConf.to_container(rolling_cfg, resolve=True)
+    extra = set(raw) - _ROLLING_ALLOWED_KEYS
+    if extra:
+        raise ValueError(
+            f"rolling_generation has unexpected key(s) {sorted(extra)}; only "
+            f"{sorted(_ROLLING_ALLOWED_KEYS)} are allowed."
+        )
+    kwargs = {k: v for k, v in raw.items() if v is not None}
+    if not kwargs:
+        return {}
+    for k, v in kwargs.items():
+        if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+            raise ValueError(
+                f"rolling_generation.{k} must be a positive integer when set; got {v!r}. "
+                f"Leave it null to disable rolling generation for {k!r}."
+            )
+    if "max_new_tokens" not in kwargs:
+        raise ValueError(
+            "rolling_generation.rolling_context_size is set but "
+            "rolling_generation.max_new_tokens is null. `rolling_context_size` only takes effect "
+            "on the rolling path, which is enabled by setting `max_new_tokens`. Either set "
+            "`max_new_tokens` to a positive integer to enable rolling generation, or leave "
+            "`rolling_context_size` null."
+        )
+    return kwargs
+
+
 @hydra.main(version_base=None, config_path=str(CONFIGS), config_name="_generate_trajectories")
 def generate_trajectories(cfg: DictConfig):
     st = datetime.now(tz=UTC)
@@ -134,33 +173,8 @@ def generate_trajectories(cfg: DictConfig):
     # batches — so bad values (zero or negative budgets) fail fast with a clear message instead of
     # surfacing deep inside ``Model._rolling_generate`` after minutes of setup. The in-method checks in
     # ``_rolling_generate`` stay as a defensive backstop for direct library callers that bypass this CLI.
-    rolling_cfg = cfg.get("rolling_generation", None)
-    rolling_requested = False
-    rolling_kwargs: dict[str, int] = {}
-    if rolling_cfg is not None:
-        for k in ("max_new_tokens", "rolling_context_size"):
-            v = rolling_cfg.get(k, None)
-            if v is None:
-                continue
-            if not isinstance(v, int) or v <= 0:
-                raise ValueError(
-                    f"rolling_generation.{k} must be a positive integer when set; got {v!r}. "
-                    f"Leave it null to disable rolling generation for {k!r}."
-                )
-            rolling_kwargs[k] = v
-        rolling_requested = "max_new_tokens" in rolling_kwargs
-        # ``rolling_context_size`` only takes effect on the rolling path. ``Model.generate`` dispatches
-        # to the rolling loop iff ``max_new_tokens is not None``; a ``rolling_context_size`` set in
-        # isolation would flow through to the legacy single-chunk path where it is silently dropped.
-        # Fail fast rather than accept a no-op config option.
-        if "rolling_context_size" in rolling_kwargs and not rolling_requested:
-            raise ValueError(
-                "rolling_generation.rolling_context_size is set but "
-                "rolling_generation.max_new_tokens is null. `rolling_context_size` only takes effect "
-                "on the rolling path, which is enabled by setting `max_new_tokens`. Either set "
-                "`max_new_tokens` to a positive integer to enable rolling generation, or leave "
-                "`rolling_context_size` null."
-            )
+    rolling_kwargs = _validate_rolling_cfg(cfg.get("rolling_generation", None))
+    rolling_requested = "max_new_tokens" in rolling_kwargs
 
     M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path))
     M.eval()
