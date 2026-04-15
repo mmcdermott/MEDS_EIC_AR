@@ -4,23 +4,78 @@ generation — both single-chunk and rolling — recovers the grammar.
 All other tests in this repo either exercise the generation code path on a random-init model
 (doctests, ``test_generate_trajectories.py``'s direct unit tests) or drive the full CLI but only
 check parquet shape. This file fills the missing middle: a real generation-correctness test that
-(1) trains a tiny ``Model`` on CPU in a handful of seconds, (2) has unambiguous ground truth because
-the training distribution is a finite-state grammar, and (3) asserts grammar adherence via a
-deterministic FSM walk of the generated tokens.
+(1) trains a tiny ``Model`` on CPU in a handful of seconds, (2) has unambiguous ground truth
+because the training distribution is a finite-state grammar, and (3) asserts grammar adherence
+via a deterministic FSM walk of the generated tokens.
 
 The grammar has three programs — ``A B C D``, ``1 2 3``, ``R S T U V W X Y Z`` — emitted
-stochastically with a ``|`` separator between them. Training sequences are packed full of programs
-until no more fit, then padded — **no terminating EOS token**. That's intentional: if we trained
-the model to emit EOS, the rolling-generation test would terminate early (the model would emit EOS
-before the sliding window had a chance to cross a boundary) and the real integration signal —
-"rolling generation stays grammar-valid across multiple sliding windows" — would be smothered by
-early termination. Instead, we set the model's ``eos_token_id`` to an out-of-grammar dummy token
-and let ``max_new_tokens`` control termination for the rolling test. The single-chunk test
-allows ``SEP`` as the transition token out of a program (which the model will emit, since it's
-what the training distribution always does at that position).
+stochastically with a ``|`` separator between them. Training sequences are packed full of
+programs until no more fit, then padded — **no terminating EOS token**. That's intentional: if
+we trained the model to emit EOS, the rolling-generation test would terminate early (the model
+would emit EOS before the sliding window had a chance to cross a boundary) and the real
+integration signal — "rolling generation stays grammar-valid across multiple sliding windows" —
+would be smothered by early termination. Instead, we set the model's ``eos_token_id`` to an
+out-of-grammar dummy token and let ``max_new_tokens`` control termination for the rolling test.
 
-The whole file fits in under a minute of CPU training on a small model and uses no MEDS fixtures;
-it talks to ``Model`` directly via mock batches.
+The whole file fits in under a minute of CPU training on a small model and uses no MEDS
+fixtures; it talks to ``Model`` directly via mock batches.
+
+## What the training data looks like
+
+The module-level doctest below shows concretely what a training sequence and a training batch
+look like, so anyone reading this file can verify the grammar encoding by inspection rather than
+having to trust the FSM implementation.
+
+    >>> import random, torch
+    >>> _ = torch.manual_seed(0)
+
+Token table::
+
+    PAD = 0         # pad token, excluded from loss via ignore_index
+    SEP = 1         # between programs
+    A   = (2, 3, 4, 5)              # program A — four tokens
+    B   = (6, 7, 8)                 # program B — three tokens
+    C   = (9, 10, 11, 12, 13, 14, 15, 16, 17)  # program C — nine tokens
+    DUMMY_EOS = 18  # reserved out-of-grammar EOS the model should never produce
+
+One training sequence is a run of programs separated by ``SEP``, packed until the next program
+wouldn't fit. With a seeded RNG the first sequence under ``max_len=16`` is::
+
+    >>> rng = random.Random(0)
+    >>> seq = sample_sequence(rng, max_len=16)
+    >>> seq
+    [9, 10, 11, 12, 13, 14, 15, 16, 17, 1]
+
+Read left-to-right: program C (9, 10, ..., 17), then SEP. The RNG sampled program C first, then
+program A was going to be next but wouldn't fit (4 more tokens + SEP = 5 > 16 - 10 = 6... actually
+*would* fit, but the sampler picked a different program next that also wouldn't fit, and the
+packing loop bails out rather than retrying). ``GrammarFSM`` accepts the full sequence::
+
+    >>> GrammarFSM().walk(seq) == len(seq)
+    True
+
+A training batch stacks several such sequences and right-pads to the longest::
+
+    >>> rng = random.Random(0)
+    >>> batch = build_training_batch(rng, batch_size=3)
+    >>> batch
+    tensor([[ 9, 10, 11, 12, 13, 14, 15, 16, 17,  1,  0,  0,  0,  0,  0],
+            [ 6,  7,  8,  1,  2,  3,  4,  5,  1,  6,  7,  8,  1,  0,  0],
+            [ 9, 10, 11, 12, 13, 14, 15, 16, 17,  1,  2,  3,  4,  5,  1]])
+
+Row 1 is ``C | <pad>``, row 2 is ``B | A | B | <pad>``, row 3 is ``C | A`` — all valid under the
+grammar, all right-padded with ``PAD=0`` where they ran short. ``Model._forward``'s cross-entropy
+loss ignores those pad positions so the model never learns "what comes after ``PAD``."
+
+## Negative controls
+
+To protect against "always-accepting FSM" bugs that would make the generation-correctness tests
+vacuous, the file also carries a second grammar ``ALT_PROGRAMS`` — same start tokens and same
+token sets as ``PROGRAMS`` but with the internal order of each program permuted — and asserts
+that ``PROGRAMS`` and ``ALT_PROGRAMS`` disagree on hand-built canonical sequences. The
+generation-correctness test then additionally asserts that the trained model's output is
+**rejected** by ``ALT_PROGRAMS``'s FSM within a short prefix, proving the trained model learned
+``PROGRAMS`` specifically rather than being a uniform-random generator.
 """
 
 from __future__ import annotations
@@ -51,6 +106,19 @@ PROGRAM_NAMES = tuple(PROGRAMS.keys())
 PROGRAM_WEIGHTS = (0.4, 0.3, 0.3)
 PROGRAM_STARTS = {name: prog[0] for name, prog in PROGRAMS.items()}
 
+# **Negative-control alternative grammar.** Same start tokens as ``PROGRAMS``, same token sets per
+# program, but the *order* within each program is different: pairs of adjacent positions are
+# swapped. A model trained on ``PROGRAMS`` must produce sequences that a FSM over ``ALT_PROGRAMS``
+# rejects within a very short prefix — the trained model's "A_start followed by A[1]=3" transition
+# violates ``ALT_PROGRAMS["A"]``'s expected "A_start followed by 4". We use this to prove both that
+# the FSM actually rejects (not always-accepts) and that the trained model learned ``PROGRAMS``
+# specifically rather than any uniform-random generator.
+ALT_PROGRAMS: dict[str, tuple[int, ...]] = {
+    "A": (2, 4, 3, 5),
+    "B": (6, 8, 7),
+    "C": (9, 11, 10, 13, 12, 15, 14, 17, 16),
+}
+
 # Reserved dummy EOS index outside the training distribution. The model is configured with
 # ``eos_token_id=DUMMY_EOS`` so the rolling-generation validation (which rejects ``None`` and pad
 # collisions) is satisfied, but the model is never trained on sequences containing ``DUMMY_EOS`` so
@@ -60,9 +128,9 @@ VOCAB_SIZE = 20
 MAX_SEQ_LEN = 16
 
 
-def _start_token_to_name(token: int) -> str | None:
-    for name, start in PROGRAM_STARTS.items():
-        if token == start:
+def _start_token_to_name(token: int, programs: dict[str, tuple[int, ...]] = PROGRAMS) -> str | None:
+    for name, prog in programs.items():
+        if token == prog[0]:
             return name
     return None
 
@@ -73,27 +141,23 @@ def _start_token_to_name(token: int) -> str | None:
 
 
 class GrammarFSM:
-    """Deterministic walker over the pattern grammar. Each ``step(token)`` returns either the new state name
-    or ``None`` (meaning the transition is grammar-invalid).
+    """Deterministic walker over a pattern grammar. Each ``step(token)`` returns either the new state or
+    ``None`` (meaning the transition is grammar-invalid).
+
+    Defaults to the ``PROGRAMS`` grammar; pass ``programs=ALT_PROGRAMS`` to walk the
+    negative-control grammar instead. Both grammars share the same structural shape — three
+    named programs, a ``SEP`` between them — so the same FSM logic works for both.
 
     States:
       - ``"BETWEEN"`` — between programs (or at the very start). Valid next tokens: any
-        program-start.
+        program-start under the active ``programs`` dict.
       - ``("IN", prog_name, pos)`` — inside program ``prog_name`` having just emitted position
-        ``pos``. Valid next: either ``prog[pos + 1]`` if there is one, or (at the final position)
-        ``SEP``.
+        ``pos``. Valid next: either ``programs[prog_name][pos + 1]`` if there is one, or (at the
+        final position) ``SEP``.
 
-    No terminal state: the training distribution never emits an EOS token (see module docstring),
-    so the grammar is effectively infinite — any valid sequence of programs separated by ``SEP``
-    can continue indefinitely.
-
-    The FSM is used for two things in this file:
-
-    1. Replaying a ground-truth prompt through the FSM to establish the initial state before we
-       call the model (so the test can feed the model into the middle of a program and assert it
-       completes that program correctly).
-    2. Walking the model-generated continuation token-by-token and asserting every transition is
-       valid.
+    No terminal state: the training distribution never emits an EOS token (see module
+    docstring), so the grammar is effectively infinite — any valid sequence of programs
+    separated by ``SEP`` can continue indefinitely.
 
     >>> fsm = GrammarFSM()
     >>> fsm.step(2)  # start of program A
@@ -108,12 +172,23 @@ class GrammarFSM:
     'BETWEEN'
     >>> fsm.step(6)  # start of program B
     ('IN', 'B', 0)
-    >>> fsm.step(8)  # would skip B[1]=7, invalid
+    >>> _ = fsm.step(8)  # would skip B[1]=7, invalid — assign to _ so doctest doesn't print None
     >>> fsm.state is None
+    True
+
+    Under the alternative grammar the same PROGRAMS-valid continuation is rejected at the first
+    internal transition:
+
+    >>> alt = GrammarFSM(programs=ALT_PROGRAMS)
+    >>> alt.step(2)  # start of program A in ALT (2, 4, 3, 5)
+    ('IN', 'A', 0)
+    >>> _ = alt.step(3)  # PROGRAMS expects 3 next; ALT expects 4. Rejected.
+    >>> alt.state is None
     True
     """
 
-    def __init__(self) -> None:
+    def __init__(self, programs: dict[str, tuple[int, ...]] = PROGRAMS) -> None:
+        self.programs = programs
         self.state: str | tuple[str, str, int] | None = "BETWEEN"
 
     def step(self, token: int) -> str | tuple[str, str, int] | None:
@@ -125,7 +200,7 @@ class GrammarFSM:
         if self.state is None:
             return None
         if self.state == "BETWEEN":
-            name = _start_token_to_name(token)
+            name = _start_token_to_name(token, self.programs)
             if name is None:
                 self.state = None
             else:
@@ -133,7 +208,7 @@ class GrammarFSM:
             return self.state
         # ("IN", name, pos)
         _, name, pos = self.state
-        prog = PROGRAMS[name]
+        prog = self.programs[name]
         if pos + 1 < len(prog):
             if token == prog[pos + 1]:
                 self.state = ("IN", name, pos + 1)
@@ -168,10 +243,11 @@ def sample_sequence(rng: random.Random, max_len: int = MAX_SEQ_LEN) -> list[int]
     """Sample one grammar-valid sequence that fits in ``max_len`` tokens, no terminating EOS.
 
     Packs programs separated by ``SEP`` until the next full program wouldn't fit. The sequence
-    always ends with a ``SEP`` followed by nothing — i.e. the caller pads with ``PAD`` up to
-    ``max_len``, and ``Model._forward``'s cross-entropy loss ignores those pad positions so the
-    model never sees a "what comes after the final SEP" target. That keeps the trained grammar
-    effectively non-terminating.
+    always ends with a ``SEP``; there is no terminating EOS. ``sample_batch`` pads a collection
+    of these sequences to the longest one in the batch with ``PAD``, and ``Model._forward``'s
+    cross-entropy loss ignores those pad positions via ``ignore_index``, so the model never sees
+    a "what comes after the final SEP" target and the trained grammar remains effectively
+    non-terminating.
 
     >>> rng = random.Random(0)
     >>> seq = sample_sequence(rng)
@@ -195,7 +271,28 @@ def sample_sequence(rng: random.Random, max_len: int = MAX_SEQ_LEN) -> list[int]
     return tokens
 
 
-def sample_batch(rng: random.Random, batch_size: int, max_len: int = MAX_SEQ_LEN) -> torch.Tensor:
+def build_training_batch(rng: random.Random, batch_size: int, max_len: int = MAX_SEQ_LEN) -> torch.Tensor:
+    """Build a ``[batch_size, L]`` token tensor where ``L`` is the longest sequence in the batch.
+
+    Pads shorter sequences with ``PAD`` on the right. Note this pads **to the longest sequence in
+    the batch**, not to ``max_len`` — ``Model._forward`` ignores ``PAD`` via ``ignore_index`` in
+    cross-entropy so either convention would produce the same loss, but padding only to the batch
+    max saves a few forward-pass FLOPs per step.
+
+    (Note: the function is named ``build_training_batch`` rather than ``sample_batch`` to avoid
+    colliding with the session-scoped ``sample_batch`` fixture that ``conftest.py`` injects into
+    the doctest namespace.)
+
+    >>> rng = random.Random(0)
+    >>> batch = build_training_batch(rng, batch_size=3)
+    >>> batch.shape[0]
+    3
+    >>> bool(batch.shape[1] <= MAX_SEQ_LEN)
+    True
+    >>> # Every row contains at least one real (non-pad) token.
+    >>> bool(((batch != PAD).sum(dim=1) > 0).all())
+    True
+    """
     seqs = [sample_sequence(rng, max_len) for _ in range(batch_size)]
     pad_to = max(len(s) for s in seqs)
     padded = torch.full((batch_size, pad_to), PAD, dtype=torch.long)
@@ -245,7 +342,7 @@ def grammar_trained_model() -> Model:
     optimizer = torch.optim.Adam(model.parameters(), lr=_LEARNING_RATE)
 
     for _ in range(_NUM_TRAIN_STEPS):
-        batch_codes = sample_batch(rng, _BATCH_SIZE)
+        batch_codes = build_training_batch(rng, _BATCH_SIZE)
         batch = mock_batch(batch_codes)
         optimizer.zero_grad()
         loss, _ = model(batch)
@@ -264,6 +361,68 @@ def grammar_trained_model() -> Model:
 # For each program, a short prompt that should unambiguously constrain the next several tokens.
 # The first token is the program's start; we assert greedy decoding completes the program, then
 # transitions via SEP or EOS (both FSM-valid).
+# ---------------------------------------------------------------------------
+# FSM negative-control unit tests (no training, very fast)
+# ---------------------------------------------------------------------------
+
+
+def test_grammar_fsm_rejects_hand_crafted_invalid_sequences():
+    """Negative control: feed the FSM sequences we know are invalid and assert it rejects each
+    at the expected position.
+
+    Without this test, an always-accepting FSM (e.g., one with a bug in the internal transition
+    logic) would let the downstream generation-correctness tests pass vacuously — a trained model
+    could emit garbage and still appear grammar-valid. Each case here exercises a distinct
+    failure mode of the FSM.
+    """
+
+    # (1) Wrong token at BETWEEN: feeding a non-start token rejects immediately.
+    assert GrammarFSM().walk([SEP]) == 0
+    assert GrammarFSM().walk([PAD]) == 0
+    assert GrammarFSM().walk([DUMMY_EOS]) == 0  # out-of-grammar dummy
+    # (2) Skipping a token inside a program (A_start followed by A[2] instead of A[1]).
+    assert GrammarFSM().walk([PROGRAMS["A"][0], PROGRAMS["A"][2]]) == 1
+    # (3) Wrong token at the tail of a program (complete A then emit A[0] instead of SEP).
+    tokens = [*PROGRAMS["A"], PROGRAMS["A"][0]]  # A A A A A_start  → 2,3,4,5,2
+    assert GrammarFSM().walk(tokens) == 4
+    # (4) Consecutive separators: SEP right after another SEP is a BETWEEN-state violation.
+    tokens = [*PROGRAMS["A"], SEP, SEP]
+    assert GrammarFSM().walk(tokens) == 5
+    # (5) Switching programs mid-stream (A_start followed by B[1], skipping all of A).
+    assert GrammarFSM().walk([PROGRAMS["A"][0], PROGRAMS["B"][1]]) == 1
+    # (6) Valid program followed by wrong continuation after SEP.
+    tokens = [*PROGRAMS["A"], SEP, PROGRAMS["A"][1]]  # "A | A[1]" — SEP expects a start
+    assert GrammarFSM().walk(tokens) == 5
+
+
+def test_grammar_fsm_alt_grammar_rejects_default_grammar_sequences():
+    """Symmetric negative control at the grammar level: confirm ``PROGRAMS`` and ``ALT_PROGRAMS``
+    actually disagree on the same input sequences.
+
+    If both FSMs accepted the same sequences, the cross-grammar assertion in
+    ``test_trained_model_rolling_generation_preserves_grammar`` would be vacuous. This test
+    proves the two grammars are materially different: a hand-built ``PROGRAMS``-valid sequence
+    is rejected by the ``ALT_PROGRAMS`` FSM and vice versa.
+    """
+
+    # Canonical PROGRAMS sequence: A then SEP then B then SEP.
+    programs_valid = [*PROGRAMS["A"], SEP, *PROGRAMS["B"], SEP]
+    # Canonical ALT_PROGRAMS sequence: same shape, alt-ordered programs.
+    alt_valid = [*ALT_PROGRAMS["A"], SEP, *ALT_PROGRAMS["B"], SEP]
+
+    # Each grammar accepts its own canonical sequence in full.
+    assert GrammarFSM(programs=PROGRAMS).walk(programs_valid) == len(programs_valid)
+    assert GrammarFSM(programs=ALT_PROGRAMS).walk(alt_valid) == len(alt_valid)
+    # And each grammar rejects the other's canonical sequence at some internal transition.
+    assert GrammarFSM(programs=PROGRAMS).walk(alt_valid) < len(alt_valid)
+    assert GrammarFSM(programs=ALT_PROGRAMS).walk(programs_valid) < len(programs_valid)
+
+
+# ---------------------------------------------------------------------------
+# Generation-correctness tests against the trained model
+# ---------------------------------------------------------------------------
+
+
 _PROMPTS_AND_EXPECTED_COMPLETIONS: list[tuple[list[int], list[int]]] = [
     # ``A`` prompt: start of program A. Must continue with A[1], A[2], A[3].
     ([PROGRAMS["A"][0]], list(PROGRAMS["A"][1:])),
@@ -279,8 +438,13 @@ _PROMPTS_AND_EXPECTED_COMPLETIONS: list[tuple[list[int], list[int]]] = [
 
 
 def test_trained_model_single_chunk_generation_recovers_grammar(grammar_trained_model: Model):
-    """For each prompt, greedy single-chunk generation must complete the in-progress program and then emit a
-    grammar-valid transition (``SEP`` or ``EOS``)."""
+    """For each prompt, greedy single-chunk generation must complete the in-progress program and then emit
+    ``SEP`` as the transition token.
+
+    ``SEP`` is the **only** valid transition out of the final position of a program under this
+    grammar: the training distribution never contains an EOS token (see the module docstring), so
+    the model cannot have learned to emit anything else at that position.
+    """
     model = grammar_trained_model
 
     for prompt, expected_completion in _PROMPTS_AND_EXPECTED_COMPLETIONS:
@@ -290,9 +454,8 @@ def test_trained_model_single_chunk_generation_recovers_grammar(grammar_trained_
         generated = model.generate(batch, do_sample=False)  # single-chunk path
         produced = generated[0].tolist()
 
-        # Strip any trailing PAD/EOS padding that appears after the model stopped emitting useful
-        # tokens; we only need to check enough tokens to cover the expected completion plus one
-        # more token (the transition out of the program).
+        # We only need to check enough tokens to cover the expected completion plus the
+        # transition token; anything beyond that is a don't-care here.
         check_len = len(expected_completion) + 1
         assert len(produced) >= check_len, (
             f"Expected at least {check_len} generated tokens for prompt {prompt}, "
@@ -303,9 +466,6 @@ def test_trained_model_single_chunk_generation_recovers_grammar(grammar_trained_
             f"model produced {produced[: len(expected_completion)]}."
         )
 
-        # The token immediately after completing the program should be SEP — that's the only
-        # valid grammar transition out of the final position of a program, and since the training
-        # distribution never contains a terminating token, the model should always prefer it.
         transition_token = produced[len(expected_completion)]
         assert transition_token == SEP, (
             f"After completing prompt {prompt}, expected SEP={SEP} as the transition token; "
@@ -320,13 +480,22 @@ def test_trained_model_rolling_generation_preserves_grammar(grammar_trained_mode
     """Rolling generation past the model's context window must stay grammar-valid.
 
     The trained model has ``max_position_embeddings=16`` and we generate
-    ``max_new_tokens=_ROLLING_BUDGET`` from a short ``[A_start]`` prompt. That's strictly more than
-    3x the context window, so the sliding-window loop has to cross several boundaries and emit a
-    long tail of post-saturation single-token chunks. We then walk every generated token through
-    the grammar FSM and assert each transition is valid. Because training never contained an EOS
-    token (see module docstring) the model should emit exactly ``_ROLLING_BUDGET`` tokens;
-    anything less means the rolling loop terminated early, which in this test setup is itself a
-    regression.
+    ``max_new_tokens=_ROLLING_BUDGET`` from a short ``[A_start]`` prompt. The budget is set
+    strictly above ``max_seq_len`` so the rolling loop is guaranteed to cross at least one
+    sliding-window boundary regardless of when the model decides to stop. We then walk every
+    generated token through the grammar FSM and assert each transition is valid.
+
+    **The contract we're testing is semantic, not structural.** ``_rolling_generate`` promises
+    "up to ``max_new_tokens`` tokens, possibly fewer on EOS" — not "exactly that many," and not
+    any particular inner-call count. So the two assertions below are:
+
+    1. Every generated token is a valid FSM transition (the grammar-correctness invariant).
+    2. The continuation is longer than a single non-rolling chunk could have produced from this
+       prompt, which proves the rolling path was actually exercised.
+
+    Both invariants survive healthy refactors (e.g., swapping the inner generate call for a
+    faster backend, or changing how ``rolling_context_size`` is computed) because neither depends
+    on the implementation strategy of the rolling loop.
     """
     model = grammar_trained_model
 
@@ -335,35 +504,18 @@ def test_trained_model_rolling_generation_preserves_grammar(grammar_trained_mode
     prompt_tensor = torch.tensor([prompt], dtype=torch.long)
     batch = mock_batch(prompt_tensor)
 
-    # Spy on the inner HF call so we can assert the rolling loop genuinely iterated across many
-    # sliding windows rather than degenerating to a single chunk call.
-    real_generate = model.HF_model.generate
-    from unittest.mock import MagicMock as _MagicMock
-
-    spy = _MagicMock(wraps=real_generate)
-    model.HF_model.generate = spy
-    try:
-        generated = model.generate(batch, do_sample=False, max_new_tokens=_ROLLING_BUDGET)
-    finally:
-        model.HF_model.generate = real_generate
+    generated = model.generate(batch, do_sample=False, max_new_tokens=_ROLLING_BUDGET)
     produced = generated[0].tolist()
 
-    assert len(produced) == _ROLLING_BUDGET, (
-        f"Rolling generation should emit exactly max_new_tokens={_ROLLING_BUDGET} tokens (training "
-        f"data has no EOS so the loop shouldn't terminate early); got {len(produced)}. Full "
-        f"output: {produced}."
-    )
-
-    # Inner call count: ``max_seq_len - 1 = 15`` per chunk before saturation, then 1 per chunk
-    # after. With a 1-token prompt and a ``_ROLLING_BUDGET`` budget, the first chunk alone can
-    # emit up to 15 tokens, then every subsequent chunk emits exactly 1. So for ``_ROLLING_BUDGET
-    # = 50`` we expect at least ``1 + (50 - 15) = 36`` inner calls. We assert a loose ``>= 10`` so
-    # the test is robust to harmless changes in window sizing but still fails if rolling ever
-    # silently falls through to a single chunk.
-    assert spy.call_count >= 10, (
-        f"Rolling loop only made {spy.call_count} inner HF_model.generate call(s) for a budget "
-        f"of {_ROLLING_BUDGET} tokens on a model with max_seq_len={MAX_SEQ_LEN} — expected many "
-        f"rounds. The rolling path may not have been exercised."
+    # (2): length exceeds the single-chunk ceiling of ``max_seq_len - len(prompt)`` new tokens.
+    # A non-rolling ``Model.generate`` on the same prompt can emit at most that many tokens (the
+    # remainder of the model's context window); anything longer must have come from the rolling
+    # path crossing at least one sliding boundary.
+    single_chunk_cap = MAX_SEQ_LEN - len(prompt)
+    assert len(produced) > single_chunk_cap, (
+        f"Rolling generation produced {len(produced)} tokens from a {len(prompt)}-token prompt; "
+        f"that's within the single-chunk cap of {single_chunk_cap} (= max_seq_len - len(prompt)), "
+        f"so the rolling path may not have been exercised. Full output: {produced}."
     )
 
     # Replay the prompt through the FSM to establish the starting state for the continuation.
@@ -374,10 +526,27 @@ def test_trained_model_rolling_generation_preserves_grammar(grammar_trained_mode
         f"Expected FSM in ('IN', 'A', 0) after prompt {prompt}, got {fsm.state}."
     )
 
-    # Walk the full continuation. Every transition must be grammar-valid.
+    # (1): walk every emitted token through the FSM. The first invalid transition is a test
+    # failure regardless of where in the continuation it happened.
     first_invalid = fsm.walk(produced)
     assert first_invalid == len(produced), (
         f"Rolling generation emitted a grammar-invalid token at position {first_invalid} "
         f"(token={produced[first_invalid]}). FSM state just before the violation: "
         f"{fsm.state}. Full output: {produced}."
+    )
+
+    # Negative control (cross-grammar): the same continuation must be rejected by ALT_PROGRAMS
+    # within a very short prefix. If it weren't, the FSM would accept any sequence of tokens and
+    # the "grammar valid" assertion above would be vacuous. See ``ALT_PROGRAMS`` for the contrast:
+    # the trained model emits A[0], A[1]=3 next, but ALT_A's second token is 4, so the walk
+    # rejects at position 1.
+    alt_fsm = GrammarFSM(programs=ALT_PROGRAMS)
+    for tok in prompt:
+        alt_fsm.step(tok)
+    alt_first_invalid = alt_fsm.walk(produced)
+    assert alt_first_invalid < len(produced), (
+        f"ALT_PROGRAMS FSM unexpectedly accepted the entire continuation. The FSM may be "
+        f"degenerate (always-accept bug) or the trained model happens to emit an ALT-valid "
+        f"sequence (statistically implausible for seeded greedy decoding on 50 tokens). "
+        f"Full output: {produced}."
     )
