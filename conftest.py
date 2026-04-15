@@ -237,7 +237,12 @@ def generated_trajectories_rolling(
             f"datamodule.config.task_labels_dir={(task_root_dir / task_name)!s}",
             "datamodule.batch_size=2",
             "trainer=demo",
-            "rolling_generation.max_new_tokens=15",
+            # Set strictly above ``max_seq_len`` (20 in ``_demo_pretrain``) so the rolling loop is
+            # guaranteed to iterate across multiple chunks regardless of per-subject input length —
+            # even a zero-length input couldn't fit 30 new tokens into a 20-slot window. The
+            # end-to-end test downstream uses this gap (vs. the non-rolling fixture) to prove the
+            # rolling path actually produced output the single-chunk path could not.
+            "rolling_generation.max_new_tokens=30",
         ]
     )
 

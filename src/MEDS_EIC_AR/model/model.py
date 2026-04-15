@@ -617,21 +617,36 @@ class Model(torch.nn.Module):
         soon as every row is finished or the new-token budget is exhausted. Finally, each row is truncated
         at its first EOS — everything after is replaced with pad.
 
-        **Why we maintain our own loop.** HF Transformers does not currently expose a built-in primitive
-        for generating past a model's ``max_position_embeddings`` on architectures that lack native sliding-
-        window attention. ``SinkCache`` / StreamingLLM was removed from recent releases; its replacement
-        lives inside specific model implementations (Mistral, Gemma2, Llama4) and doesn't apply to GPTNeoX,
-        which this repo's :class:`Model` wraps. The remaining HF caches (``DynamicCache``, ``StaticCache``,
-        ``QuantizedCache``, offloaded variants) only manage memory — they don't let the model see positions
-        beyond ``max_position_embeddings``. Swapping to a sliding-window-attention architecture upstream
-        would remove the need for this loop; until then this is the pragmatic path.
+        **Why we maintain our own loop.** HF Transformers mainline currently exposes no first-class
+        primitive for generating past a full-attention model's ``max_position_embeddings``. ``SinkCache``
+        was removed in 4.53.0; the sliding-window-attention replacements live inside specific architectures
+        (Mistral, Gemma2, Llama4) that handle the sliding in-kernel, and don't apply to GPTNeoX, which this
+        repo's :class:`Model` wraps. The remaining HF caches (``DynamicCache``, ``StaticCache``,
+        ``QuantizedCache``, offloaded variants) only manage memory — none of them let the model see
+        positions beyond ``max_position_embeddings``. A community port
+        (`transformers-community/sink_cache <https://huggingface.co/transformers-community/sink_cache>`_)
+        preserves the old SinkCache API and is a candidate for a future efficiency pass on this loop; it is
+        not a correctness prerequisite for what we do here (see below).
 
-        **Correctness caveat.** When the window slides and the earliest token is dropped, the new prompt
-        is re-prefilled from position 0, so GPTNeoX's rotary position embeddings see the surviving tokens
-        at different positions than they originally occupied. For a real pretrained model this can degrade
-        generation quality near window boundaries (the StreamingLLM paper addresses this with attention
-        sinks, which we do not yet implement). For the randomly-initialized demo models used in tests and
-        doctests here, this is inconsequential. See #86 / #87 for the follow-ups.
+        **Correctness framing.** This loop is *cache-less* across chunks: every iteration discards the KV
+        cache and re-calls ``HF_model.generate(...)`` on a fresh prompt. HF builds fresh ``position_ids``
+        starting at 0 and applies RoPE rotations at those fresh positions, so every chunk is just "here is
+        a sequence of length ≤ ``max_seq_len``, continue it" — a valid, in-distribution prefix by the model's
+        standards. There is no RoPE violation, no stale cached rotations, no attention geometry outside the
+        trained regime. The loop inherits exactly the error profile of running the model on a short input
+        from scratch, chunk after chunk.
+
+        What the loop cannot avoid is the generic finite-context information-loss problem: once a token
+        scrolls off the left edge, the model can no longer attend to it. This is the same limitation any
+        fixed-window model has when its input exceeds its window; rolling generation makes it visible rather
+        than introducing a new error class. The secondary concern is ordinary compounding-error, which can
+        manifest in loop-specific ways near sliding boundaries because the "start of the visible prefix"
+        changes content each chunk — an empirical/behavioral concern, not a mathematical one. Callers who
+        want to avoid even that tradeoff can leave ``max_new_tokens=None`` and stay on the single-chunk path.
+
+        A cheap future experiment: prepend the first K tokens of the original input to every chunk's prompt
+        to approximate StreamingLLM's attention-sink pinning without any library dependency. Not needed for
+        correctness; potentially useful as a quality knob on real pretrained checkpoints.
 
         **Backend evolution.** Under the SGLang backend proposed in #88, only the inner
         ``self.HF_model.generate(...)`` call site inside this loop is swapped for a backend-level
@@ -683,15 +698,30 @@ class Model(torch.nn.Module):
             ...     PAD_INDEX=0,
             ...     mode="SM",
             ... )
+
+            We wrap ``HF_model.generate`` with a spy so the doctest can also assert that the rolling loop
+            actually iterated across multiple chunks — not just that it produced a plausible-looking output
+            tensor from a single inner call:
+
+            >>> _real_generate = model.HF_model.generate
+            >>> model.HF_model.generate = MagicMock(wraps=_real_generate)
             >>> model._rolling_generate(
             ...     batch, max_new_tokens=12, rolling_context_size=None, do_sample=False
             ... )
             tensor([[17, 19, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
                     [17, 19, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]])
+            >>> model.HF_model.generate.call_count >= 3
+            True
+            >>> model.HF_model.generate = _real_generate
 
             The output is a deterministic (seeded, greedy) smoke test: the randomly-initialized model never
             samples the EOS token (37), so no row is truncated. The truncation path is exercised directly
-            by the :meth:`_truncate_at_first_eos` doctest below.
+            by the :meth:`_truncate_at_first_eos` doctest below. The ``call_count >= 3`` check is the real
+            integration signal: with ``max_position_embeddings=5`` and a 3-token prompt, a single inner
+            ``HF_model.generate`` call can emit at most ``5 - 3 = 2`` new tokens on the first chunk and
+            ``5 - (5 - 1) = 1`` new token on each subsequent chunk once the sliding window saturates, so
+            reaching 12 total new tokens requires at least ``1 + 10 = 11`` chunks — well above the
+            ``>= 3`` floor we assert, and impossible via a single-chunk fall-through.
 
             If we instead choose a ``max_new_tokens`` that is smaller than the model's one-shot capacity,
             we still get exactly that many tokens back — the rolling path degenerates into a single chunk
