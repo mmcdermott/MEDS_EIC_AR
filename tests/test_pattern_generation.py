@@ -57,7 +57,7 @@ packing loop bails out rather than retrying). ``GrammarFSM`` accepts the full se
 A training batch stacks several such sequences and right-pads to the longest::
 
     >>> rng = random.Random(0)
-    >>> batch = build_training_batch(rng, batch_size=3)
+    >>> batch = build_training_batch_codes(rng, batch_size=3)
     >>> batch
     tensor([[ 9, 10, 11, 12, 13, 14, 15, 16, 17,  1,  0,  0,  0,  0,  0],
             [ 6,  7,  8,  1,  2,  3,  4,  5,  1,  6,  7,  8,  1,  0,  0],
@@ -72,10 +72,29 @@ loss ignores those pad positions so the model never learns "what comes after ``P
 To protect against "always-accepting FSM" bugs that would make the generation-correctness tests
 vacuous, the file also carries a second grammar ``ALT_PROGRAMS`` — same start tokens and same
 token sets as ``PROGRAMS`` but with the internal order of each program permuted — and asserts
-that ``PROGRAMS`` and ``ALT_PROGRAMS`` disagree on hand-built canonical sequences. The
-generation-correctness test then additionally asserts that the trained model's output is
-**rejected** by ``ALT_PROGRAMS``'s FSM within a short prefix, proving the trained model learned
-``PROGRAMS`` specifically rather than being a uniform-random generator.
+that ``PROGRAMS`` and ``ALT_PROGRAMS`` disagree on hand-built canonical sequences.
+
+Concretely, program A is ``(2, 3, 4, 5)`` under ``PROGRAMS`` and ``(2, 4, 3, 5)`` under
+``ALT_PROGRAMS``. A canonical "A then SEP" sequence written in the ``PROGRAMS`` ordering is
+accepted by the default FSM and rejected by the ALT FSM, and vice versa::
+
+    >>> programs_A = [2, 3, 4, 5, 1]  # valid under PROGRAMS
+    >>> alt_A      = [2, 4, 3, 5, 1]  # valid under ALT_PROGRAMS
+    >>> GrammarFSM(programs=PROGRAMS).walk(programs_A)
+    5
+    >>> GrammarFSM(programs=ALT_PROGRAMS).walk(programs_A)
+    1
+    >>> GrammarFSM(programs=ALT_PROGRAMS).walk(alt_A)
+    5
+    >>> GrammarFSM(programs=PROGRAMS).walk(alt_A)
+    1
+
+The ``1`` return values in rows 2 and 4 are the crux: each FSM rejects the other's canonical
+sequence at position 1 (the first internal program transition, where the two grammars disagree
+on what should follow A[0]=2). The generation-correctness test then additionally asserts that
+the trained model's output is **rejected** by ``ALT_PROGRAMS``'s FSM within a short prefix,
+proving the trained model learned ``PROGRAMS`` specifically rather than being a uniform-random
+generator.
 """
 
 from __future__ import annotations
@@ -223,10 +242,45 @@ class GrammarFSM:
         return self.state
 
     def walk(self, tokens) -> int:
-        """Walk a token sequence.
+        """Walk a token sequence, returning the index of the first invalid token.
 
-        Returns the index of the first invalid token, or ``len(tokens)``
-        if every transition was valid.
+        Returns ``len(tokens)`` if every transition was valid (i.e. the entire sequence was
+        accepted). This is the primary entry point that the model-generation tests use: after
+        running ``Model.generate(...)``, they walk the resulting token list through a freshly
+        initialized FSM and assert the return value equals ``len(tokens)``.
+
+        Examples:
+            A fully valid PROGRAMS-grammar sequence (program A, then SEP, then program B, then
+            SEP) is accepted all the way through — ``walk`` returns the full length:
+
+            >>> tokens = [2, 3, 4, 5, 1, 6, 7, 8, 1]  # A | B |
+            >>> GrammarFSM().walk(tokens)
+            9
+            >>> GrammarFSM().walk(tokens) == len(tokens)
+            True
+
+            If we poison the middle of program A by swapping A[1] and A[2], ``walk`` rejects at
+            the first offending position (here position 2 — A[0]=2 is fine, expected A[1]=3 but
+            we emit 4 instead):
+
+            >>> GrammarFSM().walk([2, 4, 3, 5, 1])
+            1
+
+            Emitting the wrong start token at ``BETWEEN`` is rejected at position 0:
+
+            >>> GrammarFSM().walk([SEP])
+            0
+            >>> GrammarFSM().walk([99])  # not a program start
+            0
+
+            The same input is accepted by ``ALT_PROGRAMS`` (whose program A is ``(2, 4, 3, 5)``)
+            but rejected by ``PROGRAMS`` (whose program A is ``(2, 3, 4, 5)``):
+
+            >>> seq = [2, 4, 3, 5, 1]  # valid under ALT, invalid under default
+            >>> GrammarFSM(programs=ALT_PROGRAMS).walk(seq)
+            5
+            >>> GrammarFSM(programs=PROGRAMS).walk(seq)
+            1
         """
         for i, tok in enumerate(tokens):
             if self.step(int(tok)) is None:
@@ -243,18 +297,28 @@ def sample_sequence(rng: random.Random, max_len: int = MAX_SEQ_LEN) -> list[int]
     """Sample one grammar-valid sequence that fits in ``max_len`` tokens, no terminating EOS.
 
     Packs programs separated by ``SEP`` until the next full program wouldn't fit. The sequence
-    always ends with a ``SEP``; there is no terminating EOS. ``sample_batch`` pads a collection
-    of these sequences to the longest one in the batch with ``PAD``, and ``Model._forward``'s
-    cross-entropy loss ignores those pad positions via ``ignore_index``, so the model never sees
-    a "what comes after the final SEP" target and the trained grammar remains effectively
-    non-terminating.
+    always ends with a ``SEP``; there is no terminating EOS. ``build_training_batch_codes`` pads
+    a collection of these sequences to the longest one in the batch with ``PAD``, and
+    ``Model._forward``'s cross-entropy loss ignores those pad positions via ``ignore_index``, so
+    the model never sees a "what comes after the final SEP" target and the trained grammar
+    remains effectively non-terminating.
 
     >>> rng = random.Random(0)
     >>> seq = sample_sequence(rng)
+    >>> seq
+    [9, 10, 11, 12, 13, 14, 15, 16, 17, 1]
+    >>> # That's program C (9..17) followed by SEP (1).
     >>> GrammarFSM().walk(seq) == len(seq)
     True
     >>> seq[-1] == SEP
     True
+
+    Sampling a few more seeded sequences shows how the grammar packs programs into ``max_len``:
+
+    >>> [sample_sequence(rng) for _ in range(3)]  # doctest: +NORMALIZE_WHITESPACE
+    [[6, 7, 8, 1, 2, 3, 4, 5, 1, 6, 7, 8, 1],
+     [9, 10, 11, 12, 13, 14, 15, 16, 17, 1, 2, 3, 4, 5, 1],
+     [6, 7, 8, 1, 9, 10, 11, 12, 13, 14, 15, 16, 17, 1]]
     """
     tokens: list[int] = []
     while True:
@@ -271,27 +335,34 @@ def sample_sequence(rng: random.Random, max_len: int = MAX_SEQ_LEN) -> list[int]
     return tokens
 
 
-def build_training_batch(rng: random.Random, batch_size: int, max_len: int = MAX_SEQ_LEN) -> torch.Tensor:
-    """Build a ``[batch_size, L]`` token tensor where ``L`` is the longest sequence in the batch.
+def build_training_batch_codes(
+    rng: random.Random, batch_size: int, max_len: int = MAX_SEQ_LEN
+) -> torch.Tensor:
+    """Build a ``[batch_size, L]`` token-code tensor where ``L`` is the longest sequence in the batch.
 
     Pads shorter sequences with ``PAD`` on the right. Note this pads **to the longest sequence in
     the batch**, not to ``max_len`` — ``Model._forward`` ignores ``PAD`` via ``ignore_index`` in
     cross-entropy so either convention would produce the same loss, but padding only to the batch
     max saves a few forward-pass FLOPs per step.
 
-    (Note: the function is named ``build_training_batch`` rather than ``sample_batch`` to avoid
-    colliding with the session-scoped ``sample_batch`` fixture that ``conftest.py`` injects into
-    the doctest namespace.)
+    Returns the raw token-code tensor. The separate :func:`mock_batch` helper wraps it in a
+    minimal ``MEDSTorchBatch``-shaped mock so ``Model.forward`` / ``Model.generate`` can consume
+    it. We keep the two steps distinct because training only needs the codes tensor and calling
+    ``mock_batch`` inside the training loop would be noise. The ``_codes`` suffix in the name is
+    also how we sidestep a collision with the session-scoped ``sample_batch`` fixture that
+    ``conftest.py`` injects into the doctest namespace.
 
     >>> rng = random.Random(0)
-    >>> batch = build_training_batch(rng, batch_size=3)
-    >>> batch.shape[0]
-    3
-    >>> bool(batch.shape[1] <= MAX_SEQ_LEN)
-    True
-    >>> # Every row contains at least one real (non-pad) token.
-    >>> bool(((batch != PAD).sum(dim=1) > 0).all())
-    True
+    >>> batch_codes = build_training_batch_codes(rng, batch_size=3)
+    >>> batch_codes
+    tensor([[ 9, 10, 11, 12, 13, 14, 15, 16, 17,  1,  0,  0,  0,  0,  0],
+            [ 6,  7,  8,  1,  2,  3,  4,  5,  1,  6,  7,  8,  1,  0,  0],
+            [ 9, 10, 11, 12, 13, 14, 15, 16, 17,  1,  2,  3,  4,  5,  1]])
+
+    Row 0 is program C (9..17) then SEP (1) then PAD. Row 1 is programs B, A, B separated by SEPs
+    then PAD. Row 2 is C then A — it fills ``max_len=16`` exactly, so no PAD positions. Every
+    non-pad row is a valid program-SEP sequence under the grammar, and PAD positions at the right
+    are ignored during training via cross-entropy's ``ignore_index``.
     """
     seqs = [sample_sequence(rng, max_len) for _ in range(batch_size)]
     pad_to = max(len(s) for s in seqs)
@@ -342,7 +413,7 @@ def grammar_trained_model() -> Model:
     optimizer = torch.optim.Adam(model.parameters(), lr=_LEARNING_RATE)
 
     for _ in range(_NUM_TRAIN_STEPS):
-        batch_codes = build_training_batch(rng, _BATCH_SIZE)
+        batch_codes = build_training_batch_codes(rng, _BATCH_SIZE)
         batch = mock_batch(batch_codes)
         optimizer.zero_grad()
         loss, _ = model(batch)
@@ -442,8 +513,14 @@ def test_trained_model_single_chunk_generation_recovers_grammar(grammar_trained_
     ``SEP`` as the transition token.
 
     ``SEP`` is the **only** valid transition out of the final position of a program under this
-    grammar: the training distribution never contains an EOS token (see the module docstring), so
-    the model cannot have learned to emit anything else at that position.
+    grammar: the training distribution never contains an EOS token (see the module docstring),
+    so the model cannot have learned to emit anything else at that position.
+
+    Generation uses ``do_sample=False`` so the model greedy-decodes each next token (argmax over
+    logits, no temperature sampling). That makes the output fully deterministic given the trained
+    weights and the prompt, so a one-shot assertion against the expected program completion is
+    meaningful — we're testing "does the model's argmax follow the grammar?", not "does some
+    stochastic sample happen to do so."
     """
     model = grammar_trained_model
 
@@ -451,6 +528,7 @@ def test_trained_model_single_chunk_generation_recovers_grammar(grammar_trained_
         prompt_tensor = torch.tensor([prompt], dtype=torch.long)
         batch = mock_batch(prompt_tensor)
 
+        # do_sample=False → greedy argmax decoding (see test docstring).
         generated = model.generate(batch, do_sample=False)  # single-chunk path
         produced = generated[0].tolist()
 
@@ -504,6 +582,9 @@ def test_trained_model_rolling_generation_preserves_grammar(grammar_trained_mode
     prompt_tensor = torch.tensor([prompt], dtype=torch.long)
     batch = mock_batch(prompt_tensor)
 
+    # do_sample=False → greedy argmax decoding, same as the single-chunk test: the output is
+    # fully determined by the trained weights and the prompt, so we can assert on specific
+    # grammar-FSM transitions rather than on distributions.
     generated = model.generate(batch, do_sample=False, max_new_tokens=_ROLLING_BUDGET)
     produced = generated[0].tolist()
 
