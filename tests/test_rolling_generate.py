@@ -1,22 +1,58 @@
 """Direct unit tests for ``Model._rolling_generate``.
 
 These tests complement the CLI-driven integration tests in ``test_generate_trajectories.py`` by
-exercising the rolling loop directly on a real pretrained (via the shared ``pretrained_GPT_model``
-fixture) model. They cover two dimensions that the CLI test cannot easily parameterize:
+exercising the rolling loop directly on a randomly-initialized ``Model`` instance. They cover two
+dimensions that the CLI test cannot easily parameterize:
 
 1. **Multi-round iteration** with ``max_new_tokens`` well above ``max_seq_len`` — many sliding
    boundaries, not just one — verified by spying on ``HF_model.generate`` and asserting the call
    count grows with the budget.
 2. **Non-default ``rolling_context_size`` values** — a smaller per-chunk window must yield a
    strictly larger number of inner ``HF_model.generate`` calls for the same total new-token budget.
+
+We use a fresh random-init model per test and pick an ``eos_token_id`` (``37`` = ``TIMELINE//END``
+in the demo vocab) that a randomly-initialized model will essentially never greedily emit, so the
+rolling loop terminates on budget exhaustion rather than on EOS. This makes the call-count math
+deterministic and independent of whatever the session-scoped ``pretrained_GPT_model`` fixture's
+greedy behavior happens to be on any given run — the earlier version of this test was sensitive to
+greedy-decoding EOS drift from the real pretrained model.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
+import pytest
 import torch
-from meds_torchdata import MEDSTorchBatch
+from meds_torchdata import MEDSTorchBatch, MEDSTorchDataConfig
 
 from MEDS_EIC_AR.model.model import Model
+
+
+@pytest.fixture
+def rolling_model(dataset_config: MEDSTorchDataConfig) -> Model:
+    """A small random-init ``Model`` with ``max_seq_len=20`` and a safe ``eos_token_id``."""
+    torch.manual_seed(0)
+    model = Model(
+        {
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "hidden_size": 4,
+            "max_position_embeddings": 20,
+            "vocab_size": dataset_config.vocab_size,
+        },
+        precision="32-true",
+    )
+    model.HF_model.config.eos_token_id = 37  # TIMELINE//END; random-init model ~never greedy-emits 37
+    return model
+
+
+@pytest.fixture
+def rolling_batch() -> MEDSTorchBatch:
+    """A tiny fake batch whose codes avoid the ``eos_token_id=37`` so the rolling loop won't stop."""
+    return Mock(
+        code=torch.LongTensor([[38, 22, 36], [38, 22, 36]]),
+        PAD_INDEX=0,
+        mode="SM",
+    )
 
 
 def _run_rolling(
@@ -42,70 +78,64 @@ def _run_rolling(
     return out, spy.call_count
 
 
-def test_rolling_generate_multi_round(pretrained_GPT_model: Model, sample_batch: MEDSTorchBatch):
+def test_rolling_generate_multi_round(rolling_model: Model, rolling_batch: MEDSTorchBatch):
     """Budget well above ``max_seq_len`` must trigger many sliding-window iterations."""
 
-    torch.manual_seed(0)
-    max_seq_len = pretrained_GPT_model.max_seq_len  # 20 in _demo_pretrain
-    budget = 3 * max_seq_len  # 60 — guarantees many rounds regardless of input length
+    max_seq_len = rolling_model.max_seq_len  # 20
+    budget = 3 * max_seq_len  # 60 — guarantees many rounds
 
     out, call_count = _run_rolling(
-        pretrained_GPT_model,
-        sample_batch,
+        rolling_model,
+        rolling_batch,
         max_new_tokens=budget,
         rolling_context_size=None,
     )
 
-    # Output shape: at most budget tokens per row; less only if every row hit EOS early.
-    assert out.ndim == 2
-    assert out.shape[0] == sample_batch.code.shape[0]
-    assert 0 < out.shape[1] <= budget
+    # Output shape: exactly budget tokens per row, since eos=37 is never emitted by this random-init
+    # model and the full budget is available.
+    assert out.shape == (rolling_batch.code.shape[0], budget), (
+        f"Expected output shape ({rolling_batch.code.shape[0]}, {budget}), got {tuple(out.shape)}."
+    )
 
-    # Lower bound on iteration count: once the sliding window saturates at ctx_size = max_seq_len - 1,
-    # each chunk can emit at most ``max_seq_len - ctx_size = 1`` new token. Earlier (pre-saturation)
-    # chunks can emit more, but the post-saturation floor gives us a principled minimum. For a budget
-    # of ``3 * max_seq_len = 60`` we must have at least ``60 / (max_seq_len - 1) ≈ 4`` inner calls
-    # even under the most favorable pre-saturation fill; in practice we see many more. Asserting
-    # ``>= 4`` is loose enough to be robust across random inputs and tight enough to prove multi-round
-    # iteration happened.
-    assert call_count >= 4, (
+    # With the default ``rolling_context_size = max_seq_len - 1 = 19`` and an input prompt of length
+    # 3, the first chunk emits up to ``max_seq_len - 3 = 17`` tokens (well, this reaches steady state
+    # faster because the window saturates). Once saturated, each subsequent chunk emits exactly
+    # ``max_seq_len - (max_seq_len - 1) = 1`` new token. So a 60-token budget takes at least
+    # ``60 - 17 = 43`` post-saturation chunks, plus some pre-saturation chunks — well over any small
+    # threshold. We use ``>= 30`` as a safe lower bound that proves rolling iterated many times.
+    assert call_count >= 30, (
         f"Rolling loop only made {call_count} inner HF_model.generate call(s) for a budget of "
-        f"{budget} tokens on a model with max_seq_len={max_seq_len}. Expected many rounds."
+        f"{budget} tokens on a model with max_seq_len={max_seq_len} — expected many rounds."
     )
 
 
-def test_rolling_generate_smaller_context_yields_more_chunks(
-    pretrained_GPT_model: Model, sample_batch: MEDSTorchBatch
+def test_rolling_generate_smaller_context_yields_fewer_chunks(
+    rolling_model: Model, rolling_batch: MEDSTorchBatch
 ):
-    """Shrinking ``rolling_context_size`` must strictly increase the inner call count.
+    """Shrinking ``rolling_context_size`` must strictly decrease the inner call count.
 
     Each chunk can emit at most ``max_seq_len - ctx_size`` new tokens once the window saturates.
-    Smaller ``ctx_size`` → larger per-chunk budget → fewer chunks; **larger** ``ctx_size`` →
+    Smaller ``ctx_size`` → larger per-chunk budget → **fewer** chunks. Larger ``ctx_size`` →
     smaller per-chunk budget → **more** chunks. This test verifies the monotone relationship by
-    running the loop twice and comparing call counts. We use a fixed large budget so both runs
-    iterate.
+    running the loop twice on the same model/batch and comparing call counts.
     """
 
-    torch.manual_seed(0)
-    max_seq_len = pretrained_GPT_model.max_seq_len  # 20
-    budget = 40
+    max_seq_len = rolling_model.max_seq_len  # 20
+    budget = 40  # > 2 * max_seq_len, so both settings must iterate several times
 
-    # Large per-chunk window (ctx_size close to max_seq_len) → each chunk emits ~1 token post-
-    # saturation → high call count.
+    # Large per-chunk window → each chunk emits 1 new token post-saturation → many calls.
     _, calls_large_ctx = _run_rolling(
-        pretrained_GPT_model,
-        sample_batch,
+        rolling_model,
+        rolling_batch,
         max_new_tokens=budget,
-        rolling_context_size=max_seq_len - 1,
+        rolling_context_size=max_seq_len - 1,  # 19
     )
 
-    # Small per-chunk window → each chunk can emit up to ``max_seq_len - small_ctx`` tokens →
-    # fewer iterations total for the same budget.
+    # Small per-chunk window → each chunk emits up to ``max_seq_len - 4 = 16`` tokens → few calls.
     small_ctx = 4
-    torch.manual_seed(0)
     _, calls_small_ctx = _run_rolling(
-        pretrained_GPT_model,
-        sample_batch,
+        rolling_model,
+        rolling_batch,
         max_new_tokens=budget,
         rolling_context_size=small_ctx,
     )
@@ -122,15 +152,14 @@ def test_rolling_generate_smaller_context_yields_more_chunks(
     assert calls_large_ctx >= 2
 
 
-def test_rolling_generate_respects_budget(pretrained_GPT_model: Model, sample_batch: MEDSTorchBatch):
+def test_rolling_generate_respects_budget(rolling_model: Model, rolling_batch: MEDSTorchBatch):
     """Output length is bounded above by ``max_new_tokens`` for any ``rolling_context_size``."""
 
-    torch.manual_seed(0)
     budget = 25
-    for ctx in (None, 4, 8, pretrained_GPT_model.max_seq_len - 1):
+    for ctx in (None, 4, 8, rolling_model.max_seq_len - 1):
         out, _ = _run_rolling(
-            pretrained_GPT_model,
-            sample_batch,
+            rolling_model,
+            rolling_batch,
             max_new_tokens=budget,
             rolling_context_size=ctx,
         )

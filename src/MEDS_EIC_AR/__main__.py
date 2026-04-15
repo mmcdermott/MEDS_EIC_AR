@@ -149,6 +149,18 @@ def generate_trajectories(cfg: DictConfig):
                 )
             rolling_kwargs[k] = v
         rolling_requested = "max_new_tokens" in rolling_kwargs
+        # ``rolling_context_size`` only takes effect on the rolling path. ``Model.generate`` dispatches
+        # to the rolling loop iff ``max_new_tokens is not None``; a ``rolling_context_size`` set in
+        # isolation would flow through to the legacy single-chunk path where it is silently dropped.
+        # Fail fast rather than accept a no-op config option.
+        if "rolling_context_size" in rolling_kwargs and not rolling_requested:
+            raise ValueError(
+                "rolling_generation.rolling_context_size is set but "
+                "rolling_generation.max_new_tokens is null. `rolling_context_size` only takes effect "
+                "on the rolling path, which is enabled by setting `max_new_tokens`. Either set "
+                "`max_new_tokens` to a positive integer to enable rolling generation, or leave "
+                "`rolling_context_size` null."
+            )
 
     M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path))
     M.eval()
