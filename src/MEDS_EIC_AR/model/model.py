@@ -828,14 +828,7 @@ class Model(torch.nn.Module):
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         while n_generated < max_new_tokens and not bool(finished.all()):
-            # Build the chunk prompt as the right-aligned tail of (input_ids ++ generated[:n_generated]).
-            if n_generated == 0:
-                prompt = input_ids[:, -ctx_size:]
-            elif n_generated >= ctx_size:
-                prompt = generated[:, n_generated - ctx_size : n_generated]
-            else:
-                input_tail_len = ctx_size - n_generated
-                prompt = torch.cat([input_ids[:, -input_tail_len:], generated[:, :n_generated]], dim=1)
+            prompt = self._build_rolling_prompt(input_ids, generated, n_generated, ctx_size)
             prompt_mask = prompt != pad_id
 
             remaining_budget = max_new_tokens - n_generated
@@ -880,6 +873,106 @@ class Model(torch.nn.Module):
         # Slice to the portion we actually filled (the final chunk may have been capped by
         # remaining_budget below its natural chunk size, but n_generated tracks it exactly).
         return self._truncate_at_first_eos(generated[:, :n_generated], eos_id, pad_id)
+
+    @staticmethod
+    def _build_rolling_prompt(
+        input_ids: torch.Tensor,
+        generated: torch.Tensor,
+        n_generated: int,
+        ctx_size: int,
+    ) -> torch.Tensor:
+        """Right-aligned tail of ``(input_ids ++ generated[:, :n_generated])``, capped at ``ctx_size``.
+
+        This is the stateless core of the sliding-window prompt construction used by
+        :meth:`_rolling_generate`. Given the original input, the buffer of tokens generated so far, and
+        how many positions of that buffer are actually filled (``n_generated``), it returns the tensor
+        that should be fed to the model on the next chunk. Pulling this out as a staticmethod lets us
+        validate the three boundary cases directly with small integer tensors — no ``Model`` instance,
+        no HF forward pass, no fixtures.
+
+        There are three cases, each corresponding to where the sliding frame sits relative to the
+        ``input_ids`` / ``generated`` boundary:
+
+        1. **First chunk** (``n_generated == 0``): the window is entirely inside ``input_ids``; return
+           the right-aligned tail of ``input_ids``.
+        2. **Steady state** (``n_generated >= ctx_size``): the window is entirely inside ``generated``;
+           return a straight slice of ``generated``, no concatenation.
+        3. **Transition** (``0 < n_generated < ctx_size``): the window straddles the boundary; take a
+           tail of ``input_ids`` and the prefix of ``generated[:, :n_generated]`` and concatenate them.
+
+        Args:
+            input_ids: ``[B, L_in]`` — the original input tokens.
+            generated: ``[B, max_new_tokens]`` — preallocated buffer; only the first ``n_generated``
+                columns are meaningful.
+            n_generated: Number of positions currently filled in ``generated``. Must satisfy
+                ``0 <= n_generated <= generated.shape[1]``.
+            ctx_size: Number of tokens to include in the returned prompt. Must be positive. If the
+                combined length of ``input_ids`` and ``generated[:, :n_generated]`` is shorter than
+                ``ctx_size``, the returned prompt will be correspondingly shorter — no padding.
+
+        Returns:
+            A ``[B, min(ctx_size, L_in + n_generated)]`` tensor suitable for feeding directly into
+            ``HF_model.generate``.
+
+        Examples:
+            Set up a fake input and an output buffer with a couple of generated tokens in place
+            (the rest is pad ``= 0``):
+
+            >>> input_ids = torch.LongTensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+            >>> generated = torch.zeros((2, 10), dtype=torch.long)
+            >>> generated[:, 0] = torch.LongTensor([11, 12])
+            >>> generated[:, 1] = torch.LongTensor([13, 14])
+
+            **First chunk** — nothing generated yet, window is entirely inside ``input_ids``. We get
+            the right-aligned tail of ``input_ids``:
+
+            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=0, ctx_size=3)
+            tensor([[ 3,  4,  5],
+                    [ 8,  9, 10]])
+
+            **Transition** — one token generated so far, ``ctx_size=3`` straddles the boundary: we
+            take the last two input tokens plus the one generated token:
+
+            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=1, ctx_size=3)
+            tensor([[ 4,  5, 11],
+                    [ 9, 10, 12]])
+
+            **Transition at the exact boundary** — ``n_generated < ctx_size`` but only by one, so we
+            take one input token and the two generated tokens:
+
+            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=2, ctx_size=3)
+            tensor([[ 5, 11, 13],
+                    [10, 12, 14]])
+
+            **Steady state** — ``n_generated == ctx_size``, window is entirely inside ``generated``,
+            no concatenation. Here we put three more tokens in the buffer and slide the window:
+
+            >>> generated[:, 2] = torch.LongTensor([15, 16])
+            >>> generated[:, 3] = torch.LongTensor([17, 18])
+            >>> generated[:, 4] = torch.LongTensor([19, 20])
+            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=3, ctx_size=3)
+            tensor([[11, 13, 15],
+                    [12, 14, 16]])
+            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=5, ctx_size=3)
+            tensor([[15, 17, 19],
+                    [16, 18, 20]])
+
+            When the total available history is shorter than ``ctx_size``, we simply return the full
+            history with no padding (generation callers are responsible for building an appropriate
+            ``attention_mask``):
+
+            >>> short_input = torch.LongTensor([[1, 2], [3, 4]])
+            >>> short_gen = torch.zeros((2, 10), dtype=torch.long)
+            >>> Model._build_rolling_prompt(short_input, short_gen, n_generated=0, ctx_size=5)
+            tensor([[1, 2],
+                    [3, 4]])
+        """
+        if n_generated == 0:
+            return input_ids[:, -ctx_size:]
+        if n_generated >= ctx_size:
+            return generated[:, n_generated - ctx_size : n_generated]
+        input_tail_len = ctx_size - n_generated
+        return torch.cat([input_ids[:, -input_tail_len:], generated[:, :n_generated]], dim=1)
 
     @staticmethod
     def _truncate_at_first_eos(x: torch.Tensor, eos_id: int, pad_id: int) -> torch.Tensor:
