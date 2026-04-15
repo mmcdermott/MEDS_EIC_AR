@@ -581,7 +581,6 @@ class Model(torch.nn.Module):
             attention_mask=for_hf.get("attention_mask"),
             max_new_tokens=self.max_seq_len - batch.code.shape[1],
             pad_id=batch.PAD_INDEX,
-            eos_id=self.HF_model.config.eos_token_id,
             do_sample=do_sample,
             **kwargs,
         )
@@ -596,19 +595,21 @@ class Model(torch.nn.Module):
     ) -> torch.Tensor:
         """Sliding-window generation loop that can exceed the model's context window.
 
-        The loop preallocates a ``[B, max_new_tokens]`` output buffer and, on each iteration, feeds the model
-        the right-aligned tail of ``(original_input ++ tokens_generated_so_far)`` truncated to
-        ``rolling_context_size`` tokens. New tokens from HF ``generate`` are written into the next free slice
-        of the buffer — there is no per-step ``torch.cat``, so output-buffer growth and the memory movement
-        tied to it scale as O(T·ctx) rather than the O(T²) copying that the old concat-based loop incurred.
-        Note that *total* generation compute is still dominated by the repeated ``HF_model.generate`` forward
-        passes (roughly O(#chunks · ctx²) for full attention); the buffer preallocation is a memory-movement
-        fix, not a forward-pass-compute fix.
-        HF ``generate`` handles in-chunk EOS (``TIMELINE//END``) naturally: rows that hit EOS are padded with
-        ``PAD_INDEX`` from that point on. Across chunks we track a ``finished`` mask and overwrite tokens
-        produced for already-finished rows with pad, so those rows don't "resurrect". The loop terminates as
-        soon as every row is finished or the new-token budget is exhausted. Finally, each row is truncated
-        at its first EOS — everything after is replaced with pad.
+        The loop preallocates a single ``[B, L_in + max_new_tokens]`` buffer ``sequence_so_far`` that
+        starts identical to ``input_ids`` and grows as new tokens are written into its tail. On each
+        iteration the next chunk's prompt is the right-aligned ``ctx_size``-wide slice of
+        ``sequence_so_far[:, :n_total]``, where ``n_total = L_in + n_generated`` — no separate "input"
+        and "generated" tensors, no three-case prompt construction, no per-step ``torch.cat``. At the
+        end we simply slice off the input prefix and return ``sequence_so_far[:, L_in : L_in + n_generated]``.
+        Memory movement for buffer growth is therefore O(T·ctx); total generation compute is still
+        dominated by the repeated ``HF_model.generate`` forward passes (roughly O(#chunks · ctx²) for
+        full attention).
+
+        HF ``generate`` handles in-chunk EOS (``TIMELINE//END``) naturally: rows that hit EOS are
+        padded with ``PAD_INDEX`` from that point on. Across chunks we track a ``finished`` mask and
+        overwrite tokens produced for already-finished rows with pad before writing them, so those
+        rows don't "resurrect" when the next chunk's prompt re-exposes their EOS token. The loop
+        terminates as soon as every row is finished or the new-token budget is exhausted.
 
         **Why we maintain our own loop.** HF Transformers mainline currently exposes no first-class
         primitive for generating past a full-attention model's ``max_position_embeddings``. ``SinkCache``
@@ -642,11 +643,11 @@ class Model(torch.nn.Module):
         correctness; potentially useful as a quality knob on real pretrained checkpoints.
 
         **Backend evolution.** Under the SGLang backend proposed in #88, only the inner
-        ``self.HF_model.generate(...)`` call site inside this loop is swapped for a backend-level
-        ``generate_chunk(...)`` invocation. The sliding-window bookkeeping — prompt tail construction,
-        ``finished`` mask, preallocated buffer, EOS truncation — stays here because it is the right place
-        to own cross-chunk state (including the time-budget stopping criterion from #82 and the REACH
-        logits-processor state described in the #87 SCOPE/REACH comment thread).
+        :meth:`_generate_chunk` call site inside this loop is swapped for a backend-level
+        ``generate_chunk(...)`` invocation. The sliding-window bookkeeping — the ``sequence_so_far``
+        buffer, the slice-based prompt construction, the ``finished`` mask — stays here because it is
+        the right place to own cross-chunk state (including the time-budget stopping criterion from
+        #82 and the REACH logits-processor state described in the #87 SCOPE/REACH comment thread).
 
         Args:
             batch: Input batch. Only ``batch.code`` and ``batch.PAD_INDEX`` are read.
@@ -808,56 +809,62 @@ class Model(torch.nn.Module):
                 "otherwise collapse onto padding."
             )
 
-        batch_size = input_ids.size(0)
+        batch_size, input_len = input_ids.size()
         device = input_ids.device
 
-        # Preallocate the full output buffer so we never grow via torch.cat inside the loop.
-        # Total alloc is O(B · max_new_tokens) once, writes are O(new_tokens_per_chunk).
-        generated = torch.full((batch_size, max_new_tokens), pad_id, dtype=input_ids.dtype, device=device)
+        # Preallocate a single ``sequence_so_far`` buffer that starts identical to ``input_ids`` and
+        # has room for ``max_new_tokens`` more tokens appended at the right. Every iteration reads a
+        # right-aligned ``ctx_size``-wide slice of ``sequence_so_far[:, :n_total]`` as the prompt and
+        # writes its new tokens into ``sequence_so_far[:, n_total : n_total + new_len]``. Pad-init so
+        # any slice is a semantically valid token tensor even before it's written to.
+        sequence_so_far = torch.full(
+            (batch_size, input_len + max_new_tokens), pad_id, dtype=input_ids.dtype, device=device
+        )
+        sequence_so_far[:, :input_len] = input_ids
+        n_total = input_len  # current length of the logical sequence in ``sequence_so_far``
         n_generated = 0
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         while n_generated < max_new_tokens and not bool(finished.all()):
-            prompt = self._build_rolling_prompt(input_ids, generated, n_generated, ctx_size)
+            window_start = max(0, n_total - ctx_size)
+            prompt = sequence_so_far[:, window_start:n_total]
             prompt_len = prompt.size(1)
             prompt_mask = prompt != pad_id
 
-            # ``_build_rolling_prompt`` guarantees ``prompt_len <= ctx_size <= max_seq_len - 1``, so
-            # ``max_seq_len - prompt_len >= 1`` and the per-chunk budget is always positive. The
-            # ``min`` only kicks in on the last iteration when the remaining budget is smaller.
+            # ``prompt_len <= ctx_size <= max_seq_len - 1``, so ``max_seq_len - prompt_len >= 1`` and
+            # the per-chunk budget is always positive. The ``min`` only kicks in on the last iteration
+            # when the remaining budget is smaller than the per-call cap.
             chunk_budget = min(max_new_tokens - n_generated, self.max_seq_len - prompt_len)
             new_tokens = self._generate_chunk(
                 prompt,
                 attention_mask=prompt_mask,
                 max_new_tokens=chunk_budget,
                 pad_id=pad_id,
-                eos_id=eos_id,
                 do_sample=do_sample,
                 **kwargs,
             )
             new_len = new_tokens.size(1)
 
-            # Zero-out tokens for already-finished rows so they stay padded in the output buffer.
-            # HF already pads post-EOS within each chunk via ``pad_token_id`` during generation, so
-            # within-chunk post-EOS positions are already correct; this mask only keeps rows that
-            # finished in *earlier* chunks from resurrecting on the next iteration (because the new
-            # prompt includes the EOS token in its visible tail, and HF would happily keep going).
+            # Mask out tokens for already-finished rows so they stay padded in the buffer. HF already
+            # pads post-EOS within each chunk via ``pad_token_id`` during generation, so within-chunk
+            # post-EOS positions are already correct; this mask only keeps rows that finished in
+            # *earlier* chunks from resurrecting on the next iteration (because the new prompt
+            # includes the EOS token in its visible tail, and HF would happily keep going).
             if bool(finished.any()):
                 new_tokens = new_tokens.masked_fill(finished.unsqueeze(1), pad_id)
 
-            generated[:, n_generated : n_generated + new_len] = new_tokens
+            sequence_so_far[:, n_total : n_total + new_len] = new_tokens
+            n_total += new_len
             n_generated += new_len
 
             hit_eos = (new_tokens == eos_id).any(dim=1)
             finished = finished | hit_eos
 
-        # Slice to the portion we actually filled (the final chunk may have been capped by
-        # remaining_budget below its natural chunk size, but n_generated tracks it exactly). No
-        # explicit post-EOS truncation is needed: HF's ``generate`` pads with ``pad_id`` after EOS
-        # within each chunk, and the ``finished`` mask above keeps already-finished rows padded
-        # across chunks, so every row in ``generated[:, :n_generated]`` already has ``pad_id`` from
-        # its first EOS onwards.
-        return generated[:, :n_generated]
+        # Drop the original input prefix and return only the generated tail. No explicit post-EOS
+        # truncation is needed: HF's ``generate`` pads with ``pad_id`` after EOS within each chunk,
+        # and the ``finished`` mask above keeps already-finished rows padded across chunks, so every
+        # row in the returned slice already has ``pad_id`` from its first EOS onwards.
+        return sequence_so_far[:, input_len : input_len + n_generated]
 
     def _generate_chunk(
         self,
@@ -866,7 +873,6 @@ class Model(torch.nn.Module):
         attention_mask: torch.Tensor | None,
         max_new_tokens: int,
         pad_id: int,
-        eos_id: int | None,
         do_sample: bool,
         **kwargs,
     ) -> torch.Tensor:
@@ -876,15 +882,15 @@ class Model(torch.nn.Module):
         loop so both paths build the ``GenerationConfig`` the same way and apply the same prompt-
         stripping convention. Within a single call HF already fills positions after the first EOS per
         row with ``pad_id`` (verified empirically on ``GPTNeoXForCausalLM``), so neither caller needs
-        to do post-EOS truncation of the per-chunk return value.
+        to do post-EOS truncation of the per-chunk return value. ``eos_token_id`` is read from
+        ``self.HF_model.config.eos_token_id`` rather than passed in, since both callers always want the
+        model's configured EOS.
 
         Args:
             input_ids: ``[B, L_in]`` tensor of prompt tokens.
             attention_mask: Optional ``[B, L_in]`` attention mask (``True`` for real tokens).
             max_new_tokens: Per-call budget passed into ``GenerationConfig``.
-            pad_id: Pad token id.
-            eos_id: EOS token id, or ``None`` for the single-chunk legacy path where the model config
-                already pins it (rolling generation validates this separately).
+            pad_id: Pad token id. Comes from the ``batch`` at call time, not the model config.
             do_sample: Whether to sample (``True``) or greedy-decode (``False``).
             **kwargs: Forwarded to ``HF_model.generate``.
 
@@ -898,7 +904,7 @@ class Model(torch.nn.Module):
             temperature=1.0,
             pad_token_id=pad_id,
             bos_token_id=None,
-            eos_token_id=eos_id,
+            eos_token_id=self.HF_model.config.eos_token_id,
         )
         out = self.HF_model.generate(
             input_ids,
@@ -907,115 +913,3 @@ class Model(torch.nn.Module):
             **kwargs,
         )
         return out[:, input_ids.size(1) :]
-
-    @staticmethod
-    def _build_rolling_prompt(
-        input_ids: torch.Tensor,
-        generated: torch.Tensor,
-        n_generated: int,
-        ctx_size: int,
-    ) -> torch.Tensor:
-        """Right-aligned tail of ``(input_ids ++ generated[:, :n_generated])``, capped at ``ctx_size``.
-
-        This is the stateless core of the sliding-window prompt construction used by
-        :meth:`_rolling_generate`. Given the original input, the buffer of tokens generated so far, and
-        how many positions of that buffer are actually filled (``n_generated``), it returns the tensor
-        that should be fed to the model on the next chunk. Pulling this out as a staticmethod lets us
-        validate the three boundary cases directly with small integer tensors — no ``Model`` instance,
-        no HF forward pass, no fixtures.
-
-        There are three cases, each corresponding to where the sliding frame sits relative to the
-        ``input_ids`` / ``generated`` boundary:
-
-        1. **First chunk** (``n_generated == 0``): the window is entirely inside ``input_ids``; return
-           the right-aligned tail of ``input_ids``.
-        2. **Steady state** (``n_generated >= ctx_size``): the window is entirely inside ``generated``;
-           return a straight slice of ``generated``, no concatenation.
-        3. **Transition** (``0 < n_generated < ctx_size``): the window straddles the boundary; take a
-           tail of ``input_ids`` and the prefix of ``generated[:, :n_generated]`` and concatenate them.
-
-        Args:
-            input_ids: ``[B, L_in]`` — the original input tokens.
-            generated: ``[B, max_new_tokens]`` — preallocated buffer; only the first ``n_generated``
-                columns are meaningful.
-            n_generated: Number of positions currently filled in ``generated``. Must satisfy
-                ``0 <= n_generated <= generated.shape[1]``.
-            ctx_size: Number of tokens to include in the returned prompt. Must be positive. If the
-                combined length of ``input_ids`` and ``generated[:, :n_generated]`` is shorter than
-                ``ctx_size``, the returned prompt will be correspondingly shorter — no padding.
-
-        Returns:
-            A ``[B, min(ctx_size, L_in + n_generated)]`` tensor suitable for feeding directly into
-            ``HF_model.generate``.
-
-        Examples:
-            Use a tiny single-row example so the sliding frame is obvious at a glance. The input
-            is four tokens long and the buffer has room for four more; we'll walk through every
-            state of the sliding window with ``ctx_size=3``.
-
-            >>> input_ids = torch.LongTensor([[1, 2, 3, 4]])
-            >>> generated = torch.zeros((1, 4), dtype=torch.long)  # buffer starts all pad (0)
-            >>> input_ids
-            tensor([[1, 2, 3, 4]])
-            >>> generated
-            tensor([[0, 0, 0, 0]])
-
-            **First chunk** — nothing generated yet, window is entirely inside ``input_ids``. We get
-            the right-aligned tail of ``input_ids`` (last 3 of 4):
-
-            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=0, ctx_size=3)
-            tensor([[2, 3, 4]])
-
-            Suppose that chunk emitted token ``5``, written into ``generated[0, 0]``:
-
-            >>> generated[0, 0] = 5
-            >>> generated
-            tensor([[5, 0, 0, 0]])
-
-            **Transition** — one token generated so far, ``ctx_size=3`` straddles the boundary: we
-            take the last two input tokens plus the one generated token:
-
-            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=1, ctx_size=3)
-            tensor([[3, 4, 5]])
-
-            The next chunk emits ``6``, then ``7``:
-
-            >>> generated[0, 1] = 6
-            >>> generated[0, 2] = 7
-            >>> generated
-            tensor([[5, 6, 7, 0]])
-
-            **Transition at the last straddle step** — ``n_generated=2``, still straddling:
-
-            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=2, ctx_size=3)
-            tensor([[4, 5, 6]])
-
-            **Steady state** — ``n_generated=3 >= ctx_size=3``, window is now entirely inside
-            ``generated``. The ``input_ids`` tensor is no longer read at all:
-
-            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=3, ctx_size=3)
-            tensor([[5, 6, 7]])
-
-            One more step — the window slides forward by one more token:
-
-            >>> generated[0, 3] = 8
-            >>> generated
-            tensor([[5, 6, 7, 8]])
-            >>> Model._build_rolling_prompt(input_ids, generated, n_generated=4, ctx_size=3)
-            tensor([[6, 7, 8]])
-
-            When the total available history is shorter than ``ctx_size``, we simply return the full
-            history with no padding (generation callers are responsible for building an appropriate
-            ``attention_mask``):
-
-            >>> Model._build_rolling_prompt(
-            ...     torch.LongTensor([[1, 2]]), generated, n_generated=0, ctx_size=5
-            ... )
-            tensor([[1, 2]])
-        """
-        if n_generated == 0:
-            return input_ids[:, -ctx_size:]
-        if n_generated >= ctx_size:
-            return generated[:, n_generated - ctx_size : n_generated]
-        input_tail_len = ctx_size - n_generated
-        return torch.cat([input_ids[:, -input_tail_len:], generated[:, :n_generated]], dim=1)
