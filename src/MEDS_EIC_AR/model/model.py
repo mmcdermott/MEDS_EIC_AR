@@ -145,6 +145,10 @@ class Model(torch.nn.Module):
         "transformer-engine": torch.bfloat16,
     }
 
+    _RESERVED_ROLLING_KWARGS: ClassVar[frozenset[str]] = frozenset(
+        {"generation_config", "eos_token_id", "pad_token_id", "bos_token_id", "max_new_tokens"}
+    )
+
     def __init__(self, gpt_kwargs: dict | DictConfig, precision: str = "32-true", do_demo: bool = False):
         super().__init__()
 
@@ -650,8 +654,14 @@ class Model(torch.nn.Module):
             truncated at its first EOS, with post-EOS positions replaced with ``PAD_INDEX``.
 
         Raises:
-            ValueError: If ``max_new_tokens`` or ``rolling_context_size`` are non-positive, or if the
-                model's ``eos_token_id`` is unset or collides with ``batch.PAD_INDEX``.
+            ValueError: If ``max_new_tokens`` or ``rolling_context_size`` are non-positive; if the
+                model's ``eos_token_id`` is unset or collides with ``batch.PAD_INDEX``; or if
+                ``kwargs`` contains any of the HF ``generate`` keys that this loop manages internally
+                (``generation_config``, ``eos_token_id``, ``pad_token_id``, ``bos_token_id``,
+                ``max_new_tokens``). Those would override the values we bake into the per-chunk
+                ``GenerationConfig`` and desynchronize HF's in-chunk stopping from this function's
+                cross-chunk ``finished`` mask and post-loop EOS truncation, silently producing
+                incorrect outputs.
 
         Examples:
             We can build a tiny deterministic model to exercise the loop. With
@@ -723,7 +733,29 @@ class Model(torch.nn.Module):
             Traceback (most recent call last):
                 ...
             ValueError: Rolling generation requires eos_token_id (0) to differ from batch.PAD_INDEX (0). ...
+
+            Passing reserved HF ``generate`` kwargs through ``**kwargs`` is rejected, because they
+            would override the values this loop bakes into each chunk's ``GenerationConfig`` and
+            desynchronize HF's in-chunk stopping from our cross-chunk state:
+
+            >>> model.HF_model.config.eos_token_id = 37
+            >>> model._rolling_generate(
+            ...     batch, max_new_tokens=5, rolling_context_size=None, do_sample=False,
+            ...     eos_token_id=99,
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: Rolling generation manages these HF generate kwargs internally ...
         """
+
+        reserved = Model._RESERVED_ROLLING_KWARGS & kwargs.keys()
+        if reserved:
+            raise ValueError(
+                "Rolling generation manages these HF generate kwargs internally and cannot "
+                f"accept them via **kwargs: {sorted(reserved)}. Control stopping/padding via "
+                "Model.HF_model.config.eos_token_id and batch.PAD_INDEX, and control the "
+                "new-token budget via Model.generate(max_new_tokens=...) / rolling_context_size."
+            )
 
         if max_new_tokens <= 0:
             raise ValueError(f"max_new_tokens must be positive; got {max_new_tokens}.")
