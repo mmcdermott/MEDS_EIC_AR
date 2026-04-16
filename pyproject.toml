@@ -72,6 +72,18 @@ markers = [
   "parallelized: mark test as parallelized, requiring hydra-joblib-launcher",
 ]
 
+[tool.coverage.run]
+# Capture coverage from subprocess-based CLI tests (conftest.py runs
+# MEICAR_pretrain / MEICAR_generate_trajectories / MEICAR_process_data via
+# subprocess.run). coverage.py's built-in "subprocess" patch does the right
+# thing automatically: it monkeypatches subprocess.Popen/spawnv/etc. at
+# coverage-start time so every Python subprocess gets coverage tracking
+# without any .pth file installation or COVERAGE_PROCESS_START env var.
+# Setting `patch = ["subprocess"]` also implies `parallel = true`.
+# See https://pytest-cov.readthedocs.io/en/latest/subprocess-support.html.
+patch = ["subprocess"]
+source = ["src/MEDS_EIC_AR"]
+
 [tool.coverage.report]
 exclude_also = ["logger\\.debug", "except ImportError:", "if TYPE_CHECKING:"]
 
