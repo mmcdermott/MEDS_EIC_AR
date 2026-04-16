@@ -22,20 +22,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Enable subprocess coverage
-        # Without this, the CLI tests (which invoke MEICAR_pretrain /
-        # MEICAR_generate_trajectories via subprocess.run) leave src/MEDS_EIC_AR/__main__.py
-        # and src/MEDS_EIC_AR/preprocessing/__main__.py at 0% coverage even though they're
-        # actually exercised. The .pth file is auto-imported by every Python interpreter,
-        # and coverage.process_startup() reads COVERAGE_PROCESS_START to begin tracking
-        # subprocess coverage. See https://coverage.readthedocs.io/en/latest/subprocess.html
-        run: |
-          SITE_PACKAGES=$(uv run python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
-          echo 'import coverage; coverage.process_startup()' > "$SITE_PACKAGES/cov_subprocess.pth"
-
       - name: Run tests
-        env:
-          COVERAGE_PROCESS_START: ${{ github.workspace }}/pyproject.toml
+        # Subprocess coverage from the CLI integration tests is captured automatically via
+        # `patch = ["subprocess"]` in pyproject.toml's [tool.coverage.run] section — no
+        # .pth file or COVERAGE_PROCESS_START needed.
         run: >
           uv run pytest -v --cov=src --cov-report=xml
 
