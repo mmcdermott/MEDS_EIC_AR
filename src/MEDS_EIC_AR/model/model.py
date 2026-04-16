@@ -282,7 +282,7 @@ class Model(torch.nn.Module):
         if batch.mode != "SM":
             raise ValueError(f"Batch mode {batch.mode} is not supported.")
 
-        batch_size, seq_len = code.shape
+        _batch_size, seq_len = code.shape
 
         if seq_len > self.max_seq_len:
             raise ValueError(
