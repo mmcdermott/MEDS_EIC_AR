@@ -659,8 +659,9 @@ class Model(torch.nn.Module):
             **kwargs: Forwarded to ``HF_model.generate``.
 
         Returns:
-            A ``[B, L]`` tensor of newly generated tokens, where ``L <= max_new_tokens``. Each row is
-            truncated at its first EOS, with post-EOS positions replaced with ``PAD_INDEX``.
+            A ``[B, L]`` tensor of newly generated tokens, where ``L <= max_new_tokens``. Each row
+            has ``PAD_INDEX`` from its first EOS onwards (HF pads within each chunk, and the
+            cross-chunk ``finished`` mask keeps already-finished rows padded in subsequent chunks).
 
         Raises:
             ValueError: If ``max_new_tokens`` or ``rolling_context_size`` are non-positive; if the
@@ -668,9 +669,8 @@ class Model(torch.nn.Module):
                 ``kwargs`` contains any of the HF ``generate`` keys that this loop manages internally
                 (``generation_config``, ``eos_token_id``, ``pad_token_id``, ``bos_token_id``,
                 ``max_new_tokens``). Those would override the values we bake into the per-chunk
-                ``GenerationConfig`` and desynchronize HF's in-chunk stopping from this function's
-                cross-chunk ``finished`` mask and post-loop EOS truncation, silently producing
-                incorrect outputs.
+                ``GenerationConfig`` and desynchronize HF's in-chunk stopping from the cross-chunk
+                ``finished`` mask, silently producing incorrect outputs.
 
         Examples:
             We can build a tiny deterministic model to exercise the loop. With
