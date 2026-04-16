@@ -23,9 +23,6 @@ jobs:
           python-version: "3.12"
 
       - name: Run tests
-        # Subprocess coverage from the CLI integration tests is captured automatically via
-        # `patch = ["subprocess"]` in pyproject.toml's [tool.coverage.run] section — no
-        # .pth file or COVERAGE_PROCESS_START needed.
         run: >
           uv run pytest -v --cov=src --cov-report=xml
 
