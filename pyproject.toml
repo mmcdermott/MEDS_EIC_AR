@@ -72,6 +72,15 @@ markers = [
   "parallelized: mark test as parallelized, requiring hydra-joblib-launcher",
 ]
 
+[tool.coverage.run]
+# Enable parallel mode so that subprocess coverage data (from CLI tests that
+# invoke MEICAR_pretrain / MEICAR_generate_trajectories via subprocess.run) is
+# written to separate .coverage.<host>.<pid> files and merged automatically by
+# pytest-cov at the end of the run. Requires COVERAGE_PROCESS_START to be set
+# and a .pth file in site-packages that calls coverage.process_startup().
+parallel = true
+source = ["src/MEDS_EIC_AR"]
+
 [tool.coverage.report]
 exclude_also = ["logger\\.debug", "except ImportError:", "if TYPE_CHECKING:"]
 
