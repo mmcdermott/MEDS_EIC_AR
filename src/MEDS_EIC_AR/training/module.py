@@ -205,6 +205,14 @@ class MEICARModule(L.LightningModule):
         self.optimizer_factory = optimizer
         self.LR_scheduler_factory = LR_scheduler
 
+        # Per-prediction generation kwargs (e.g. rolling_generation.{max_new_tokens, rolling_context_size}).
+        # Intentionally NOT passed to save_hyperparameters: these are set at the start of each
+        # MEICAR_generate_trajectories CLI invocation from that run's Hydra config, not baked into the
+        # training-time checkpoint. A saved checkpoint can be reloaded and then driven with different
+        # generation settings (different rolling budgets, different stopping criteria) without having to
+        # reconcile stale training-era values.
+        self.generation_kwargs: dict[str, Any] = {}
+
         self.save_hyperparameters(
             {
                 "model": model.hparams,
@@ -440,5 +448,12 @@ class MEICARModule(L.LightningModule):
         return {"optimizer": optimizer, "lr_scheduler": LR_config}
 
     def predict_step(self, batch: MEDSTorchBatch):
-        """Produces generated trajectories for a given batch of data."""
-        return self.model.generate(batch)
+        """Produces generated trajectories for a given batch of data.
+
+        Any keyword arguments stashed on ``self.generation_kwargs`` (typically set from the top-level
+        ``generate_trajectories`` CLI before ``trainer.predict`` is invoked) are forwarded to
+        :meth:`MEDS_EIC_AR.model.model.Model.generate`. This is how rolling-generation settings such as
+        ``max_new_tokens`` and ``rolling_context_size`` reach the model at prediction time without going
+        through the saved Lightning hparams.
+        """
+        return self.model.generate(batch, **self.generation_kwargs)

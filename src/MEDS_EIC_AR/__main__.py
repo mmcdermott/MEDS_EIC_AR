@@ -11,12 +11,12 @@ import torch
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from meds import held_out_split, train_split, tuning_split
-from meds_torchdata import MEDSTorchDataConfig
+from meds_torchdata import MEDSTorchBatch, MEDSTorchDataConfig
 from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
 from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
 
-from .generation import format_trajectories, get_timeline_end_token_idx
+from .generation import format_trajectories, get_timeline_end_token_idx, validate_rolling_cfg
 from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
@@ -130,8 +130,48 @@ def generate_trajectories(cfg: DictConfig):
 
     D = instantiate(cfg.datamodule)
 
+    # Validate rolling-generation config early — before loading the checkpoint and before running any
+    # batches — so bad values (zero or negative budgets) fail fast with a clear message instead of
+    # surfacing deep inside ``Model._rolling_generate`` after minutes of setup. The in-method checks in
+    # ``_rolling_generate`` stay as a defensive backstop for direct library callers that bypass this CLI.
+    rolling_kwargs = validate_rolling_cfg(cfg.get("rolling_generation", None))
+    rolling_requested = "max_new_tokens" in rolling_kwargs
+
     M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path))
     M.eval()
+
+    # Auto-populate ``eos_token_id`` on the loaded checkpoint if it's unset. Models pretrained through
+    # ``MEICAR_pretrain`` already have it populated from ``get_timeline_end_token_idx(D.config)``, but
+    # older checkpoints (or models instantiated directly) may not. Doing this here means every
+    # checkpoint driven through the generation CLI has a usable eos for both single-chunk and rolling
+    # generation without requiring manual config intervention.
+    if M.model.HF_model.config.eos_token_id is None:
+        timeline_end_idx = get_timeline_end_token_idx(D.config)
+        logger.info(
+            f"Checkpoint {cfg.ckpt_path} has no eos_token_id set; defaulting to "
+            f"get_timeline_end_token_idx(dataset_config) = {timeline_end_idx}."
+        )
+        M.model.HF_model.config.eos_token_id = timeline_end_idx
+
+    # Fail fast if rolling was requested but eos is still unset (e.g. dataset config doesn't have a
+    # TIMELINE//END token) or collides with PAD_INDEX. This is the same invariant ``_rolling_generate``
+    # enforces internally, hoisted to config-load time so we don't spend any compute before diagnosing.
+    if rolling_requested:
+        eos_id = M.model.HF_model.config.eos_token_id
+        if eos_id is None:
+            raise ValueError(
+                "rolling_generation.max_new_tokens is set but the model's eos_token_id could not be "
+                "auto-populated from the dataset config. Rolling generation needs a valid eos token "
+                "to handle cross-chunk stopping."
+            )
+        if eos_id == MEDSTorchBatch.PAD_INDEX:
+            raise ValueError(
+                f"Rolling generation requires eos_token_id ({eos_id}) to differ from "
+                f"MEDSTorchBatch.PAD_INDEX ({MEDSTorchBatch.PAD_INDEX}). The finished-mask and "
+                "post-EOS truncation would otherwise collapse onto padding."
+            )
+
+    M.generation_kwargs.update(rolling_kwargs)
 
     trainer = instantiate(cfg.trainer)
 
