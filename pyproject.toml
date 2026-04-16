@@ -29,7 +29,7 @@ dependencies = [
   "pytest",
   "meds_testing_helpers~=0.3.0",
   "MEDS-transforms~=0.5.2",
-  "meds-torch-data[lightning]~=0.6.3",
+  "meds-torch-data[lightning]~=0.7.0",
   "transformers",
   "torch",
   "torchmetrics",
