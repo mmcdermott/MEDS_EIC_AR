@@ -1,2 +1,3 @@
 from .format_trajectories import format_trajectories
+from .repeated_dataset import RepeatedPredictionDataset, collate_with_meta
 from .utils import get_timeline_end_token_idx, validate_rolling_cfg

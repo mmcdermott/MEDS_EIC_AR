@@ -13,6 +13,7 @@ from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from ..generation.repeated_dataset import PredictBatch
 from ..model import Model
 from .metrics import NextCodeMetrics
 
@@ -447,13 +448,29 @@ class MEICARModule(L.LightningModule):
 
         return {"optimizer": optimizer, "lr_scheduler": LR_config}
 
-    def predict_step(self, batch: MEDSTorchBatch):
+    def predict_step(self, batch: PredictBatch) -> dict[str, torch.Tensor]:
         """Produces generated trajectories for a given batch of data.
 
-        Any keyword arguments stashed on ``self.generation_kwargs`` (typically set from the top-level
-        ``generate_trajectories`` CLI before ``trainer.predict`` is invoked) are forwarded to
-        :meth:`MEDS_EIC_AR.model.model.Model.generate`. This is how rolling-generation settings such as
-        ``max_new_tokens`` and ``rolling_context_size`` reach the model at prediction time without going
-        through the saved Lightning hparams.
+        Expects the :data:`PredictBatch` shape yielded by
+        :func:`MEDS_EIC_AR.generation.collate_with_meta` — a three-tuple
+        ``(batch, subject_idxs, trajectory_idxs)`` — as produced by the expanded dataset that
+        ``MEICAR_generate_trajectories`` builds. The bare-``MEDSTorchBatch`` form supported by the
+        prior iteration is no longer accepted; callers wanting a single trajectory per subject
+        should set ``n_trajectories=1`` on :class:`RepeatedPredictionDataset`, which still yields
+        this tuple shape (just with a trivial ``trajectory_idxs`` axis).
+
+        Any keyword arguments stashed on ``self.generation_kwargs`` (typically set from the
+        top-level ``generate_trajectories`` CLI before ``trainer.predict`` is invoked) are
+        forwarded to :meth:`MEDS_EIC_AR.model.model.Model.generate`. This is how
+        rolling-generation settings such as ``max_new_tokens`` and ``rolling_context_size`` reach
+        the model at prediction time without going through the saved Lightning hparams.
+
+        Returns a dict with:
+            - ``tokens``: ``[B, L]`` generated-token tensor from the model.
+            - ``subject_idxs``: ``[B]`` long tensor, which base-dataset subject each row came from.
+            - ``trajectory_idxs``: ``[B]`` long tensor, which of the N trajectories-per-subject
+              each row corresponds to.
         """
-        return self.model.generate(batch, **self.generation_kwargs)
+        mdata_batch, subject_idxs, trajectory_idxs = batch
+        tokens = self.model.generate(mdata_batch, **self.generation_kwargs)
+        return {"tokens": tokens, "subject_idxs": subject_idxs, "trajectory_idxs": trajectory_idxs}
