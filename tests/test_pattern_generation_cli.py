@@ -54,8 +54,10 @@ from tests._grammar_meds import (
 
 # Auxiliary codes that MEICAR_process_data emits for us (timestamps → time-delta tokens; timeline
 # start/end sentinels). These aren't part of the grammar but are expected in the output and must
-# not cause a grammar-check failure.
-_AUX_CODE_PREFIXES = ("TIMELINE//", "GRAMMAR//")
+# not cause a grammar-check failure. ``GRAMMAR//`` is **not** listed here: grammar codes must pass
+# the exact-membership check against ``GRAMMAR_CODES`` so a stray ``GRAMMAR//bogus`` code can't
+# slip through and mask a token→code mapping bug.
+_AUX_CODE_PREFIXES = ("TIMELINE//",)
 
 
 def _load_trajectories_by_split(root: Path) -> dict[str, dict[str, pl.DataFrame]]:
@@ -111,10 +113,20 @@ def test_grammar_cli_trajectories_are_distinct_across_n(grammar_generated_trajec
                 per_subject[subject_id[0]] = tuple(subject_df["code"].to_list())
             per_traj_per_subject[t] = per_subject
 
-        subjects_any = list(per_traj_per_subject["0"].keys())
+        subjects_any = set(per_traj_per_subject["0"].keys())
+        # Must have the same subject set across all trajectories; otherwise ``missing`` would
+        # silently count as ``None`` and make a dropped subject look "distinct". The
+        # structural test above covers this too, but keeping the assertion here makes this
+        # test self-contained.
+        for t, per_subject in per_traj_per_subject.items():
+            assert set(per_subject.keys()) == subjects_any, (
+                f"Split {split} trajectory {t} has subjects {set(per_subject.keys())} but "
+                f"trajectory 0 has {subjects_any} — the demux dropped or added subjects."
+            )
+
         # At least one subject must have at least two distinct trajectories out of N.
         any_subject_is_diverse = any(
-            len({per_traj_per_subject[t].get(s) for t in per_traj_per_subject}) > 1 for s in subjects_any
+            len({per_traj_per_subject[t][s] for t in per_traj_per_subject}) > 1 for s in subjects_any
         )
         assert any_subject_is_diverse, (
             f"Split {split}: every subject produced identical trajectories across all 8 samples. "
@@ -179,22 +191,24 @@ def test_grammar_cli_model_shows_grammar_signal(grammar_generated_trajectories: 
     """
     by_split = _load_trajectories_by_split(grammar_generated_trajectories)
 
+    # Restrict to held-out: train-split trajectories could exhibit apparent grammar signal from
+    # memorization, which wouldn't prove the model generalized. Held-out subjects were never seen
+    # during pretraining, so grammar adherence there is real learned signal.
     best_fraction = 0.0
-    for _split, trajectories in by_split.items():
-        for _t, df in trajectories.items():
-            tokens_by_subject = grammar_tokens_from_output_df(df)
-            for _subject_id, tokens in tokens_by_subject.items():
-                if not tokens:
-                    continue
-                valid, total = _walk_grammar_tokens_ignoring_start(tokens)
-                fraction = valid / total
-                best_fraction = max(best_fraction, fraction)
+    for _t, df in by_split[held_out_split].items():
+        tokens_by_subject = grammar_tokens_from_output_df(df)
+        for _subject_id, tokens in tokens_by_subject.items():
+            if not tokens:
+                continue
+            valid, total = _walk_grammar_tokens_ignoring_start(tokens)
+            fraction = valid / total
+            best_fraction = max(best_fraction, fraction)
 
     assert best_fraction >= 0.3, (
-        f"No generated trajectory in any split had >= 30% valid grammar transitions "
+        f"No generated trajectory in the held-out split had >= 30% valid grammar transitions "
         f"(best seen: {best_fraction:.1%}). The CLI training + generation pipeline is probably "
         f"broken — a correctly wired pipeline with the fixture's training budget should produce "
-        f"at least some coherent grammar output."
+        f"at least some coherent grammar output on unseen subjects."
     )
 
 

@@ -58,16 +58,15 @@ def build_grammar_meds_dataset(
     n_held_out: int = 4,
     seed: int = 0,
     max_len: int = 24,
-    prediction_time_offset_hours: int = 5,
 ) -> None:
     """Write a raw-MEDS directory of grammar-generated subject timelines.
 
     Each subject's timeline is one grammar sequence sampled from
     :func:`tests.test_pattern_generation.sample_sequence`. Tokens become MEDS events with
     timestamps at fixed 1-hour spacing. Codes follow :data:`TOKEN_TO_CODE`. The output layout
-    matches what :class:`meds_testing_helpers.dataset.MEDSDataset` writes (one parquet per
-    split, a ``code_metadata.parquet``, and a ``subject_splits.parquet``), so
-    ``MEICAR_process_data`` can consume it without modification.
+    matches the MEDS spec (``meds.code_metadata_filepath`` is ``metadata/codes.parquet``): one
+    parquet per split, a ``metadata/codes.parquet``, and a ``metadata/subject_splits.parquet``,
+    so ``MEICAR_process_data`` can consume it without modification.
 
     Args:
         data_dir: Directory to write the MEDS files into. Created if it doesn't exist.
@@ -105,14 +104,18 @@ def build_grammar_meds_dataset(
                         "numeric_value": None,
                     }
                 )
-            # One task-labels row per subject — prediction_time sits inside the timeline so the
-            # generator has real history to condition on and real future to generate. The label
-            # value is unused by the generation path (generate_trajectories ignores it) but the
-            # column is required by MEDSTorchDataConfig.
+            # One task-labels row per subject — prediction_time is placed at the midpoint of
+            # the timeline so the generator has at least one real event of history to condition
+            # on and at least one real future event to compare against, regardless of how long
+            # the sampled sequence ended up. With the shortest possible grammar sequence (a
+            # single ``B`` program plus ``SEP`` = 4 tokens, last event at hour 3), a fixed
+            # offset like 5 hours would fall past the last event. The label value is unused by
+            # the generation path but the columns are required by MEDSTorchDataConfig.
+            midpoint_hours = len(tokens) // 2
             split_task_rows.append(
                 {
                     "subject_id": subject_id,
-                    "prediction_time": base_time + timedelta(hours=prediction_time_offset_hours),
+                    "prediction_time": base_time + timedelta(hours=midpoint_hours),
                     "boolean_value": False,
                     "integer_value": None,
                     "float_value": None,
