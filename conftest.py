@@ -249,6 +249,114 @@ def generated_trajectories_rolling(
     return output_dir
 
 
+# ---------------------------------------------------------------------------
+# Grammar-dataset fixtures (issue #105) — pretrain + generate on a synthetic
+# grammar dataset via the full CLI pipeline so we can validate generation
+# correctness end-to-end, not just plumbing.
+# ---------------------------------------------------------------------------
+
+
+# Training-hyperparameter overrides we pass to the grammar pretrain CLI. Centralized here so all
+# grammar fixtures agree on them — the CLI test file inlines references to these for its own
+# assertions (e.g. "generation output should not be wider than this max_seq_len"). See issue #105.
+_GRAMMAR_MAX_SEQ_LEN = 16
+_GRAMMAR_MODEL_HEADS = 2
+_GRAMMAR_MODEL_HEAD_DIM = 16
+_GRAMMAR_PRETRAIN_EPOCHS = 80
+_GRAMMAR_PRETRAIN_BATCH_SIZE = 8
+
+
+@pytest.fixture(scope="session")
+def grammar_raw_meds(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    """Build a raw-MEDS directory from the synthetic grammar + a task-labels directory.
+
+    Returns a tuple ``(meds_root, task_labels_dir)`` that matches the shape of
+    ``preprocessed_dataset_with_task``: the MEDS root has ``data/`` and ``metadata/`` subdirs
+    ready for ``MEICAR_process_data``, and the task-labels dir has per-split parquets keyed by
+    subject with a single prediction time per subject.
+    """
+    from tests._grammar_meds import build_grammar_meds_dataset
+
+    root = tmp_path_factory.mktemp("grammar_raw_meds")
+    meds_dir = root / "meds"
+    task_dir = root / "task_labels"
+    build_grammar_meds_dataset(meds_dir, task_labels_dir=task_dir)
+    return meds_dir, task_dir
+
+
+@pytest.fixture(scope="session")
+def grammar_preprocessed(
+    grammar_raw_meds: tuple[Path, Path], tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """Runs ``MEICAR_process_data`` on the grammar raw MEDS dir and returns the tensorized dir."""
+    meds_dir, _ = grammar_raw_meds
+    return run_process_data(meds_dir, tmp_path_factory.mktemp("grammar_preprocessed"))
+
+
+@pytest.fixture(scope="session")
+def grammar_pretrained(grammar_preprocessed: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Runs ``MEICAR_pretrain`` on the grammar preprocessed dataset.
+
+    Uses a bigger model than the default demo preset (hidden_size=32 via 2 heads x head_dim=16)
+    and a meaningful training budget (80 epochs x a few batches each) so the model actually has
+    a chance to learn the grammar patterns. Disables early-stopping for the same reason — the
+    demo patience=3 kicks in after only a handful of validation checks against a noisy baseline.
+
+    Expected runtime: roughly a minute on a laptop CPU. This is the bulk of the grammar
+    integration test cost; everything downstream is cheap by comparison.
+    """
+    output_dir = tmp_path_factory.mktemp("grammar_pretrained")
+    run_and_check(
+        [
+            "MEICAR_pretrain",
+            "--config-name=_demo_pretrain",
+            f"output_dir={output_dir!s}",
+            f"datamodule.config.tensorized_cohort_dir={grammar_preprocessed!s}",
+            f"datamodule.batch_size={_GRAMMAR_PRETRAIN_BATCH_SIZE}",
+            f"trainer.max_epochs={_GRAMMAR_PRETRAIN_EPOCHS}",
+            "trainer.overfit_batches=0",
+            "trainer.callbacks.early_stopping.patience=100000",
+            f"max_seq_len={_GRAMMAR_MAX_SEQ_LEN}",
+            f"lightning_module.model.gpt_kwargs.num_attention_heads={_GRAMMAR_MODEL_HEADS}",
+            f"lightning_module.model.gpt_kwargs.attention_head_dim={_GRAMMAR_MODEL_HEAD_DIM}",
+        ]
+    )
+    return output_dir
+
+
+@pytest.fixture(scope="session")
+def grammar_generated_trajectories(
+    grammar_pretrained: Path,
+    grammar_preprocessed: Path,
+    grammar_raw_meds: tuple[Path, Path],
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Runs ``MEICAR_generate_trajectories`` on the grammar-pretrained model.
+
+    Uses a larger ``N_trajectories_per_task_sample=8`` (vs. the demo default of 2) and a
+    ``batch_size=3`` that is deliberately *not* a multiple of N, so the interleaving /demux code
+    path from #89 is stressed in its cross-sample-group configuration. Rolling generation is
+    enabled with a modest budget so we also exercise the sliding-window path end-to-end.
+    """
+    _, task_dir = grammar_raw_meds
+    output_dir = tmp_path_factory.mktemp("grammar_generated_trajectories")
+    run_and_check(
+        [
+            "MEICAR_generate_trajectories",
+            "--config-name=_demo_generate_trajectories",
+            f"output_dir={output_dir!s}",
+            f"model_initialization_dir={grammar_pretrained!s}",
+            f"datamodule.config.tensorized_cohort_dir={grammar_preprocessed!s}",
+            f"datamodule.config.task_labels_dir={task_dir!s}",
+            "datamodule.batch_size=3",
+            "trainer=demo",
+            "inference.N_trajectories_per_task_sample=8",
+            "rolling_generation.max_new_tokens=30",
+        ]
+    )
+    return output_dir
+
+
 @contextmanager
 def print_warnings(caplog: pytest.LogCaptureFixture):
     """Captures all logged warnings within this context block and prints them upon exit.
