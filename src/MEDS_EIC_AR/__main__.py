@@ -250,10 +250,13 @@ def generate_trajectories(cfg: DictConfig):
         for pred in predictions:
             tokens = pred["tokens"]
             sample_idxs = pred["sample_idxs"]
-            for s in range(n_samples):
+            # Iterate over the samples actually present in this batch rather than always doing N
+            # boolean compares. For batches that cover every sample (the common case when
+            # batch_size >= N), this is the same work; for tail batches or small batch sizes, it
+            # scales with the number of distinct sample_idxs in the batch instead.
+            for s in sample_idxs.unique().tolist():
                 mask = sample_idxs == s
-                if bool(mask.any()):
-                    per_sample_batches[s].append(tokens[mask])
+                per_sample_batches[s].append(tokens[mask])
 
         for sample, out_fp in sample_paths.items():
             if out_fp.is_file() and not cfg.do_overwrite:

@@ -9,9 +9,11 @@ rows then end up in adjacent batch positions, which gives us:
 2. Prefix-cache reuse on backends that have one (vLLM/SGLang, see #88 / #97).
 3. One ``trainer.predict`` pass instead of ``N`` (saves dataloader/worker spawn + Lightning init).
 
-The wrapper is a thin ``Dataset`` that just multiplies the index space and attaches per-row
-metadata (the ``(subject_idx, sample_idx)`` pair) so the downstream regrouping code can unscramble
-the flat predictions back into per-sample parquet files.
+The wrapper is a thin ``Dataset`` that multiplies the index space and carries per-row metadata
+(the ``(subject_idx, sample_idx)`` pair). The collate helper returns a **three-tuple**
+``(batch, subject_idxs, sample_idxs)`` rather than attaching metadata as a sidecar attribute on
+the batch itself — this keeps the base ``MEDSTorchBatch`` untouched and avoids any coupling to
+``meds_torchdata``'s dataclass-mutation behavior.
 """
 
 from __future__ import annotations
@@ -25,11 +27,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from meds_torchdata import MEDSTorchBatch
-
-# Sentinel attribute name we attach the metadata under on the returned ``MEDSTorchBatch``. Keeping
-# this as a module-level constant means the predict_step and reshaping code can refer to a single
-# source of truth rather than repeating the string.
-META_ATTR = "_repeated_meta"
 
 
 class RepeatedPredictionDataset(Dataset):
@@ -45,7 +42,7 @@ class RepeatedPredictionDataset(Dataset):
 
     with each ``A#k`` carrying metadata ``(subject_idx=0, sample_idx=k)``. Each call to
     ``__getitem__`` returns a tuple ``(item, subject_idx, sample_idx)`` so the collate function
-    downstream can repack the metadata onto the batch.
+    downstream can repack the metadata alongside the base batch.
 
     Examples:
         >>> class FakeDataset:
@@ -94,17 +91,20 @@ class RepeatedPredictionDataset(Dataset):
 def collate_with_meta(
     raw_items: Sequence[tuple[object, int, int]],
     base_collate: Callable[[Sequence[object]], MEDSTorchBatch],
-) -> MEDSTorchBatch:
-    """Wrap a base ``MEDSTorchBatch`` collate to also attach per-row metadata.
+) -> tuple[MEDSTorchBatch, torch.Tensor, torch.Tensor]:
+    """Wrap a base ``MEDSTorchBatch`` collate to also return per-row metadata.
 
     ``RepeatedPredictionDataset.__getitem__`` returns ``(item, subject_idx, sample_idx)`` tuples,
     so the dataloader hands ``raw_items`` to this collate as a list of those tuples. We unzip the
-    metadata, run the base collate over the items, and stash a ``(subject_idxs, sample_idxs)`` pair
-    on the resulting batch under ``META_ATTR`` for the predict step to read.
+    metadata, run the base collate over the items, and return a **three-tuple**
+    ``(batch, subject_idxs, sample_idxs)``.
 
-    ``MEDSTorchBatch`` is a frozen dataclass, so we use ``dataclasses.replace`` to attach the
-    metadata via a sidecar dict on a fresh instance — no in-place mutation, no patching of the
-    original class.
+    The three-tuple return (rather than attaching a sidecar attribute to ``batch``) keeps the base
+    ``MEDSTorchBatch`` untouched: no ``object.__setattr__`` workaround, no reliance on whether
+    ``MEDSTorchBatch`` is a frozen dataclass or accepts extra attributes, and no brittleness if
+    ``meds_torchdata`` changes the batch type upstream. The downstream
+    :meth:`MEICARModule.predict_step` and the regrouping loop in ``MEICAR_generate_trajectories``
+    simply destructure the tuple.
 
     Args:
         raw_items: Sequence of ``(item, subject_idx, sample_idx)`` tuples from
@@ -113,34 +113,17 @@ def collate_with_meta(
             ``MEDSPytorchDataset.collate``). Receives just the items, not the metadata.
 
     Returns:
-        The ``MEDSTorchBatch`` from ``base_collate`` with a sidecar metadata pair stashed under
-        ``META_ATTR``. Use :func:`extract_meta` to read it back.
+        A three-tuple ``(batch, subject_idxs, sample_idxs)`` where ``batch`` is whatever the base
+        collate produced, ``subject_idxs`` is a ``[B]`` long tensor of the subject indices backing
+        each row, and ``sample_idxs`` is a ``[B]`` long tensor of the sample indices.
     """
     items, subject_idxs, sample_idxs = zip(*raw_items, strict=True)
     batch = base_collate(list(items))
-    meta = (
+    return (
+        batch,
         torch.as_tensor(subject_idxs, dtype=torch.long),
         torch.as_tensor(sample_idxs, dtype=torch.long),
     )
-    # ``MEDSTorchBatch`` is a dataclass without a __dict__ in older versions; use replace + a sidecar
-    # set on the returned instance. ``object.__setattr__`` works around frozen=True if applicable.
-    object.__setattr__(batch, META_ATTR, meta)
-    return batch
 
 
-def extract_meta(batch: MEDSTorchBatch) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read back the ``(subject_idxs, sample_idxs)`` metadata that :func:`collate_with_meta` stashed.
-
-    Raises ``AttributeError`` with an actionable message if the metadata is missing — that means
-    the batch came through some other collate path and the caller probably has a wiring bug.
-    """
-    if not hasattr(batch, META_ATTR):
-        raise AttributeError(
-            f"Batch is missing per-row metadata under {META_ATTR!r}. "
-            f"This batch did not come through ``collate_with_meta`` — check the dataloader "
-            f"configuration in MEICAR_generate_trajectories."
-        )
-    return getattr(batch, META_ATTR)
-
-
-__all__ = ["META_ATTR", "RepeatedPredictionDataset", "collate_with_meta", "extract_meta"]
+__all__ = ["RepeatedPredictionDataset", "collate_with_meta"]

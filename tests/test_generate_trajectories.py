@@ -264,11 +264,11 @@ def test_rolling_generate_respects_budget(rolling_model: Model, rolling_batch: M
 
 
 def test_collate_with_meta_round_trip_through_dataloader():
-    """Run the expanded dataset through a real DataLoader and confirm the per-row metadata makes it onto the
-    batched ``MEDSTorchBatch`` and unscrambles back to the right (subject, sample) indices.
+    """Run the expanded dataset through a real DataLoader and confirm the per-row metadata is yielded
+    alongside the base batch and unscrambles back to the right ``(subject, sample)`` indices.
 
     This is the wire-up test for the issue #89 path: ``RepeatedPredictionDataset`` →
-    ``collate_with_meta`` → ``extract_meta`` is the chain ``predict_step`` and the regrouping
+    ``collate_with_meta`` → destructure-tuple is the chain ``predict_step`` and the regrouping
     code in ``MEICAR_generate_trajectories`` rely on, so it's worth testing end-to-end with a
     real dataloader rather than just calling the helpers in isolation.
     """
@@ -279,7 +279,6 @@ def test_collate_with_meta_round_trip_through_dataloader():
     from MEDS_EIC_AR.generation.repeated_dataset import (
         RepeatedPredictionDataset,
         collate_with_meta,
-        extract_meta,
     )
 
     # Build a fake dataset whose items are MEDSTorchBatch-shaped (single-row) and whose ``code``
@@ -295,11 +294,8 @@ def test_collate_with_meta_round_trip_through_dataloader():
             return torch.tensor([i, 100 + i, 200 + i], dtype=torch.long)
 
         def collate(self, items):
-            # Return a Mock that quacks like MEDSTorchBatch enough for the metadata sidecar to
-            # attach via object.__setattr__.
             codes = torch.stack(items, dim=0)
-            batch = Mock(code=codes, PAD_INDEX=0, mode="SM")
-            return batch
+            return Mock(code=codes, PAD_INDEX=0, mode="SM")
 
     base = FakeBaseDataset(n=3)
     n_samples = 4
@@ -314,9 +310,10 @@ def test_collate_with_meta_round_trip_through_dataloader():
     all_subject_idxs: list[int] = []
     all_sample_idxs: list[int] = []
     all_first_codes: list[int] = []
-    for batch in loader:
-        subject_idxs, sample_idxs = extract_meta(batch)
-        # Every row in the batch should have a metadata entry of the right shape.
+    for yielded in loader:
+        # ``collate_with_meta`` returns a three-tuple; Lightning passes whatever the dataloader
+        # yields straight through to ``predict_step``, which destructures it the same way.
+        batch, subject_idxs, sample_idxs = yielded
         assert subject_idxs.shape == (batch.code.shape[0],)
         assert sample_idxs.shape == (batch.code.shape[0],)
         all_subject_idxs.extend(subject_idxs.tolist())
@@ -331,20 +328,3 @@ def test_collate_with_meta_round_trip_through_dataloader():
     assert all_subject_idxs == expected_subject_idxs
     assert all_sample_idxs == expected_sample_idxs
     assert all_first_codes == expected_subject_idxs
-
-
-def test_extract_meta_raises_on_unwrapped_batch():
-    """``extract_meta`` should fail loudly when handed a batch that didn't come through the
-    ``collate_with_meta`` path.
-
-    This catches CLI wiring bugs where someone forgets to swap the collate function on the dataloader.
-    """
-    from types import SimpleNamespace
-
-    from MEDS_EIC_AR.generation.repeated_dataset import extract_meta
-
-    # SimpleNamespace, not Mock — Mock auto-creates attributes on access, which would falsely
-    # pass the ``hasattr(batch, META_ATTR)`` check inside ``extract_meta``.
-    bare_batch = SimpleNamespace(code=torch.zeros((2, 3), dtype=torch.long), PAD_INDEX=0, mode="SM")
-    with pytest.raises(AttributeError, match="missing per-row metadata"):
-        extract_meta(bare_batch)

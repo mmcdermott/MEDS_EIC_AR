@@ -447,7 +447,7 @@ class MEICARModule(L.LightningModule):
 
         return {"optimizer": optimizer, "lr_scheduler": LR_config}
 
-    def predict_step(self, batch: MEDSTorchBatch):
+    def predict_step(self, batch):
         """Produces generated trajectories for a given batch of data.
 
         Any keyword arguments stashed on ``self.generation_kwargs`` (typically set from the top-level
@@ -456,17 +456,16 @@ class MEICARModule(L.LightningModule):
         ``max_new_tokens`` and ``rolling_context_size`` reach the model at prediction time without going
         through the saved Lightning hparams.
 
-        If the batch was produced by :func:`MEDS_EIC_AR.generation.collate_with_meta` (the path used
-        by ``MEICAR_generate_trajectories`` to interleave ``N`` samples per subject into a single
-        predict pass — see issue #89), the per-row ``(subject_idxs, sample_idxs)`` metadata is
-        forwarded along with the generated tokens so downstream code can demux the flat batch into
-        per-sample parquet files. Plain MEDSTorchBatches without metadata return just the tokens,
-        preserving the legacy contract.
+        If the dataloader was built with :func:`MEDS_EIC_AR.generation.collate_with_meta` (the path
+        used by ``MEICAR_generate_trajectories`` to interleave ``N`` samples per subject into a
+        single predict pass — see issue #89), it yields a three-tuple
+        ``(batch, subject_idxs, sample_idxs)`` instead of a bare ``MEDSTorchBatch``. We detect that
+        shape and forward the metadata alongside the generated tokens so downstream code can demux
+        the flat batch into per-sample parquet files. Plain MEDSTorchBatches without metadata return
+        just the tokens, preserving the legacy contract.
         """
-        from MEDS_EIC_AR.generation.repeated_dataset import META_ATTR
-
-        tokens = self.model.generate(batch, **self.generation_kwargs)
-        if hasattr(batch, META_ATTR):
-            subject_idxs, sample_idxs = getattr(batch, META_ATTR)
+        if isinstance(batch, tuple) and len(batch) == 3:
+            batch, subject_idxs, sample_idxs = batch
+            tokens = self.model.generate(batch, **self.generation_kwargs)
             return {"tokens": tokens, "subject_idxs": subject_idxs, "sample_idxs": sample_idxs}
-        return tokens
+        return self.model.generate(batch, **self.generation_kwargs)
