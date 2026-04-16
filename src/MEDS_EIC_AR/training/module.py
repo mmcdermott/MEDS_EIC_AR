@@ -455,5 +455,18 @@ class MEICARModule(L.LightningModule):
         :meth:`MEDS_EIC_AR.model.model.Model.generate`. This is how rolling-generation settings such as
         ``max_new_tokens`` and ``rolling_context_size`` reach the model at prediction time without going
         through the saved Lightning hparams.
+
+        If the batch was produced by :func:`MEDS_EIC_AR.generation.collate_with_meta` (the path used
+        by ``MEICAR_generate_trajectories`` to interleave ``N`` samples per subject into a single
+        predict pass — see issue #89), the per-row ``(subject_idxs, sample_idxs)`` metadata is
+        forwarded along with the generated tokens so downstream code can demux the flat batch into
+        per-sample parquet files. Plain MEDSTorchBatches without metadata return just the tokens,
+        preserving the legacy contract.
         """
-        return self.model.generate(batch, **self.generation_kwargs)
+        from MEDS_EIC_AR.generation.repeated_dataset import META_ATTR
+
+        tokens = self.model.generate(batch, **self.generation_kwargs)
+        if hasattr(batch, META_ATTR):
+            subject_idxs, sample_idxs = getattr(batch, META_ATTR)
+            return {"tokens": tokens, "subject_idxs": subject_idxs, "sample_idxs": sample_idxs}
+        return tokens

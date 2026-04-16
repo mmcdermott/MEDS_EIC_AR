@@ -25,7 +25,7 @@ def is_mlflow_logger(logger: Logger) -> bool:
         return False
 
 
-def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
+def hash_based_seed(seed: int | None, split: str, sample: int = 0) -> int:
     """Generates a hash-based seed for reproducibility.
 
     This function generates a hash-based seed using the provided seed, split, and sample values. It is
@@ -35,7 +35,9 @@ def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
         seed: The original seed value. THIS WILL NOT OVERWRITE THE OUTPUT. Rather, this just ensures the
             sequence of seeds chosen can be deterministically updated by changing a base parameter.
         split: The split identifier.
-        sample: The sample index.
+        sample: The sample index. Defaults to ``0`` for single-pass-per-split callers
+            (``MEICAR_generate_trajectories`` since #89's interleaving rewrite); explicit values
+            preserve the per-sample seeding contract for any other caller.
 
     Returns:
         A hash-based seed value.
@@ -45,6 +47,8 @@ def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
         1508872876
         >>> hash_based_seed(None, "held_out", 1)
         3132876237
+        >>> hash_based_seed(42, "train")  # default sample=0
+        1508872876
     """
 
     hash_str = f"{seed}_{split}_{sample}"
