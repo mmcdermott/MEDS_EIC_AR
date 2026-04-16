@@ -2,6 +2,18 @@ defaults:
   - default
   - _self_
 
+# seq_sampling_strategy controls how subsequences are sampled from each subject's full timeline
+# during training. Options (from meds-torch-data >=0.7.0):
+#   - RANDOM: uniform random start offset. Events near the middle of long sequences appear in
+#     more windows than events at the boundaries (trapezoidal inclusion distribution).
+#   - BALANCED_RANDOM: every event has equal inclusion probability regardless of position.
+#     Draws a (possibly negative) start offset and clips to the sequence, producing shorter
+#     windows near the boundaries. Removes the structural boundary bias of RANDOM.
+#   - FROM_START / TO_END: deterministic, take the first / last max_seq_len elements.
+#   - STEP_THROUGH: deterministic sliding window that expands one subject into multiple
+#     dataset elements. Requires step_through_stride or step_through_overlap to be set.
+# BALANCED_RANDOM is the default for pretraining because it gives uniform per-event coverage
+# without the boundary bias of RANDOM. Override via CLI: datamodule.config.seq_sampling_strategy=RANDOM
 config:
   max_seq_len: ${max_seq_len}
-  seq_sampling_strategy: RANDOM
+  seq_sampling_strategy: BALANCED_RANDOM
