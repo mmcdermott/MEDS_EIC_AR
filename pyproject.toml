@@ -73,12 +73,15 @@ markers = [
 ]
 
 [tool.coverage.run]
-# Enable parallel mode so that subprocess coverage data (from CLI tests that
-# invoke MEICAR_pretrain / MEICAR_generate_trajectories via subprocess.run) is
-# written to separate .coverage.<host>.<pid> files and merged automatically by
-# pytest-cov at the end of the run. Requires COVERAGE_PROCESS_START to be set
-# and a .pth file in site-packages that calls coverage.process_startup().
-parallel = true
+# Capture coverage from subprocess-based CLI tests (conftest.py runs
+# MEICAR_pretrain / MEICAR_generate_trajectories / MEICAR_process_data via
+# subprocess.run). coverage.py's built-in "subprocess" patch does the right
+# thing automatically: it monkeypatches subprocess.Popen/spawnv/etc. at
+# coverage-start time so every Python subprocess gets coverage tracking
+# without any .pth file installation or COVERAGE_PROCESS_START env var.
+# Setting `patch = ["subprocess"]` also implies `parallel = true`.
+# See https://pytest-cov.readthedocs.io/en/latest/subprocess-support.html.
+patch = ["subprocess"]
 source = ["src/MEDS_EIC_AR"]
 
 [tool.coverage.report]
