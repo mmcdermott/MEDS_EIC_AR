@@ -188,7 +188,7 @@ def generate_trajectories(cfg: DictConfig):
     if cfg.get("seed", None):
         seed_everything(cfg.get("seed", 1), workers=True)
 
-    n_samples = inference.N_trajectories_per_task_sample
+    n_trajectories = inference.N_trajectories_per_task_sample
 
     for split in inference.generate_for_splits:
         if split == train_split:
@@ -200,28 +200,33 @@ def generate_trajectories(cfg: DictConfig):
         else:
             raise ValueError(f"Unknown split {split}.")
 
-        # Skip work for samples whose output parquet already exists. If every requested sample is
-        # already on disk and ``do_overwrite`` is false, skip the predict pass entirely; otherwise
-        # we still run a single pass over the full ``N``-expanded dataset and just don't write the
-        # parquets that already exist. (Partial-skip support is a minor wrinkle — it keeps existing
-        # checkpointed runs idempotent without making us special-case mid-run resumption.)
-        sample_paths = {
-            sample: Path(cfg.output_dir) / split / f"{sample}.parquet" for sample in range(n_samples)
+        # Skip work for trajectories whose output parquet already exists. If every requested
+        # trajectory is already on disk and ``do_overwrite`` is false, skip the predict pass
+        # entirely; otherwise we still run a single pass over the full ``N``-expanded dataset and
+        # just don't write the parquets that already exist. (Partial-skip support is a minor
+        # wrinkle — it keeps existing checkpointed runs idempotent without making us special-case
+        # mid-run resumption.)
+        trajectory_paths = {
+            trajectory_idx: Path(cfg.output_dir) / split / f"{trajectory_idx}.parquet"
+            for trajectory_idx in range(n_trajectories)
         }
-        for sample_fp in sample_paths.values():
-            sample_fp.parent.mkdir(parents=True, exist_ok=True)
-        if not cfg.do_overwrite and all(p.is_file() for p in sample_paths.values()):
-            logger.info(f"Skipping all {n_samples} samples for split {split}: every parquet exists.")
+        for trajectory_fp in trajectory_paths.values():
+            trajectory_fp.parent.mkdir(parents=True, exist_ok=True)
+        if not cfg.do_overwrite and all(p.is_file() for p in trajectory_paths.values()):
+            logger.info(
+                f"Skipping all {n_trajectories} trajectories for split {split}: every parquet exists."
+            )
             continue
 
-        # Expand the base dataset so each subject contributes ``n_samples`` consecutive rows. See
-        # issue #89 for the motivation: one predict pass instead of ``N``, tighter padding, and
-        # prefix-cache reuse on backends that have one (#88, #97). The ordering invariant — subject
-        # changes slow, sample changes fast — means rows for sample ``s`` extracted from each batch
-        # in order land in subject-index order overall, which is what ``format_trajectories`` needs
-        # so its sequential ``schema_df.slice(...)`` lines up with the right subject metadata.
+        # Expand the base dataset so each subject contributes ``n_trajectories`` consecutive rows.
+        # See issue #89 for the motivation: one predict pass instead of ``N``, tighter padding,
+        # and prefix-cache reuse on backends that have one (#88, #97). The ordering invariant —
+        # subject changes slow, trajectory_idx changes fast — means rows for trajectory ``t``
+        # extracted from each batch in order land in subject-index order overall, which is what
+        # ``format_trajectories`` needs so its sequential ``schema_df.slice(...)`` lines up with
+        # the right subject metadata.
         base_dataset = base_loader.dataset
-        expanded_dataset = RepeatedPredictionDataset(base_dataset, n_samples=n_samples)
+        expanded_dataset = RepeatedPredictionDataset(base_dataset, n_trajectories=n_trajectories)
         expanded_loader = DataLoader(
             expanded_dataset,
             batch_size=base_loader.batch_size,
@@ -233,37 +238,41 @@ def generate_trajectories(cfg: DictConfig):
 
         seed = hash_based_seed(cfg.get("seed", None), split)
         logger.info(
-            f"Generating {n_samples} trajectories for each of {len(base_dataset)} subjects in split "
-            f"{split} (one interleaved predict pass over {len(expanded_dataset)} expanded rows, "
-            f"seed={seed})."
+            f"Generating {n_trajectories} trajectories for each of {len(base_dataset)} subjects "
+            f"in split {split} (one interleaved predict pass over {len(expanded_dataset)} "
+            f"expanded rows, seed={seed})."
         )
         seed_everything(seed, workers=True)
         predictions = trainer.predict(model=M, dataloaders=expanded_loader)
 
-        # Demux the flat predictions into per-sample, per-batch token lists. Within each batch the
-        # rows for sample ``s`` are in subject-index order (because the expanded dataset was built
-        # with subject-changes-slow ordering and ``shuffle=False``), and across batches the
-        # subject-index ranges are non-overlapping and increasing — so the concatenation per sample
-        # ``s`` is exactly the order that ``format_trajectories`` consumes from
+        # Demux the flat predictions into per-trajectory, per-batch token lists. Within each batch
+        # the rows for trajectory ``t`` are in subject-index order (because the expanded dataset
+        # was built with subject-changes-slow ordering and ``shuffle=False``), and across batches
+        # the subject-index ranges are non-overlapping and increasing — so the concatenation per
+        # trajectory ``t`` is exactly the order that ``format_trajectories`` consumes from
         # ``base_dataset.schema_df``.
-        per_sample_batches: dict[int, list[torch.Tensor]] = {s: [] for s in range(n_samples)}
+        #
+        # ``trajectory_idxs`` is a [B] long tensor recording, for each batch row, which of the N
+        # trajectories-per-subject that row corresponds to (0..N-1). It's distinct from
+        # ``subject_idxs`` which records the base-dataset index the row came from.
+        per_trajectory_batches: dict[int, list[torch.Tensor]] = {t: [] for t in range(n_trajectories)}
         for pred in predictions:
             tokens = pred["tokens"]
-            sample_idxs = pred["sample_idxs"]
-            # Iterate over the samples actually present in this batch rather than always doing N
-            # boolean compares. For batches that cover every sample (the common case when
-            # batch_size >= N), this is the same work; for tail batches or small batch sizes, it
-            # scales with the number of distinct sample_idxs in the batch instead.
-            for s in sample_idxs.unique().tolist():
-                mask = sample_idxs == s
-                per_sample_batches[s].append(tokens[mask])
+            trajectory_idxs = pred["trajectory_idxs"]
+            # Iterate over the trajectories actually present in this batch rather than always
+            # doing N boolean compares. For batches that cover every trajectory (the common case
+            # when batch_size >= N), this is the same work; for tail batches or small batch sizes,
+            # it scales with the number of distinct trajectory_idxs in the batch instead.
+            for t in trajectory_idxs.unique().tolist():
+                mask = trajectory_idxs == t
+                per_trajectory_batches[t].append(tokens[mask])
 
-        for sample, out_fp in sample_paths.items():
+        for trajectory_idx, out_fp in trajectory_paths.items():
             if out_fp.is_file() and not cfg.do_overwrite:
                 logger.info(f"Skipping {out_fp} as it already exists.")
                 continue
-            logger.info(f"Writing {sample} sample for split {split} to {out_fp}.")
-            predictions_df = format_trajectories(base_dataset, per_sample_batches[sample])
+            logger.info(f"Writing trajectory {trajectory_idx} for split {split} to {out_fp}.")
+            predictions_df = format_trajectories(base_dataset, per_trajectory_batches[trajectory_idx])
             pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
             pq.write_table(pa_table, out_fp)
 

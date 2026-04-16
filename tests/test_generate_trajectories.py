@@ -265,7 +265,7 @@ def test_rolling_generate_respects_budget(rolling_model: Model, rolling_batch: M
 
 def test_collate_with_meta_round_trip_through_dataloader():
     """Run the expanded dataset through a real DataLoader and confirm the per-row metadata is yielded
-    alongside the base batch and unscrambles back to the right ``(subject, sample)`` indices.
+    alongside the base batch and unscrambles back to the right ``(subject_idx, trajectory_idx)`` indices.
 
     This is the wire-up test for the issue #89 path: ``RepeatedPredictionDataset`` →
     ``collate_with_meta`` → destructure-tuple is the chain ``predict_step`` and the regrouping
@@ -298,33 +298,34 @@ def test_collate_with_meta_round_trip_through_dataloader():
             return Mock(code=codes, PAD_INDEX=0, mode="SM")
 
     base = FakeBaseDataset(n=3)
-    n_samples = 4
-    expanded = RepeatedPredictionDataset(base, n_samples=n_samples)
+    n_trajectories = 4
+    expanded = RepeatedPredictionDataset(base, n_trajectories=n_trajectories)
     loader = DataLoader(
         expanded,
-        batch_size=5,  # deliberately not a multiple of n_samples so we hit a cross-subject batch
+        # batch_size deliberately not a multiple of n_trajectories so we hit a cross-subject batch
+        batch_size=5,
         shuffle=False,
         collate_fn=partial(collate_with_meta, base_collate=base.collate),
     )
 
     all_subject_idxs: list[int] = []
-    all_sample_idxs: list[int] = []
+    all_trajectory_idxs: list[int] = []
     all_first_codes: list[int] = []
     for yielded in loader:
         # ``collate_with_meta`` returns a three-tuple; Lightning passes whatever the dataloader
         # yields straight through to ``predict_step``, which destructures it the same way.
-        batch, subject_idxs, sample_idxs = yielded
+        batch, subject_idxs, trajectory_idxs = yielded
         assert subject_idxs.shape == (batch.code.shape[0],)
-        assert sample_idxs.shape == (batch.code.shape[0],)
+        assert trajectory_idxs.shape == (batch.code.shape[0],)
         all_subject_idxs.extend(subject_idxs.tolist())
-        all_sample_idxs.extend(sample_idxs.tolist())
+        all_trajectory_idxs.extend(trajectory_idxs.tolist())
         all_first_codes.extend(batch.code[:, 0].tolist())
 
-    # 3 subjects * 4 samples = 12 rows total, in subject-changes-slow order.
-    expected_subject_idxs = [s for s in range(3) for _ in range(n_samples)]
-    expected_sample_idxs = [k for _ in range(3) for k in range(n_samples)]
+    # 3 subjects * 4 trajectories = 12 rows total, in subject-changes-slow order.
+    expected_subject_idxs = [s for s in range(3) for _ in range(n_trajectories)]
+    expected_trajectory_idxs = [k for _ in range(3) for k in range(n_trajectories)]
     # The fake dataset returns code[0] = subject_idx for whichever base item is being rendered,
     # so the per-row first code should equal the subject_idx that row carries.
     assert all_subject_idxs == expected_subject_idxs
-    assert all_sample_idxs == expected_sample_idxs
+    assert all_trajectory_idxs == expected_trajectory_idxs
     assert all_first_codes == expected_subject_idxs
