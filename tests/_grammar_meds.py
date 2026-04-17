@@ -67,13 +67,17 @@ GRAMMAR_MODEL_HEADS: int = 4
 #: hidden_size=128 (plus more training data and more epochs, below) reliably produces an
 #: unambiguous distributional held-out grammar signal that survives sampling variance.
 GRAMMAR_MODEL_HEAD_DIM: int = 32
-#: Pretrain epoch budget. Sized to produce clear, reproducible signal on held-out — this test
-#: is intentionally the expensive end-to-end content regression test for the CLI pipeline; it
-#: can be skipped locally in favor of doctests during iteration and run in CI or pre-commit
-#: sweeps when content correctness is the question.
+#: Pretrain epoch budget. Sized to dominate the overall fixture cost so the test's strict
+#: assertions (greedy == 100% valid on held-out, sampling >= 50% passing rate at 50% validity)
+#: have the training depth they need. In-process ``test_pattern_generation.py`` uses 400 steps
+#: of batch=32 = 12,800 forward passes to get 100% greedy validity; we pay a similar budget here
+#: (``n_train=256`` subjects x 400 epochs / batch=32 = 3200 steps x 32 = 102,400 forward passes)
+#: through the Lightning + MEDS + Hydra stack. This test is intentionally the expensive
+#: content-correctness regression test for the CLI pipeline; iterate locally via doctests and
+#: let this run in pre-commit sweeps or CI.
 GRAMMAR_PRETRAIN_EPOCHS: int = 400
-#: Batch size for pretrain.
-GRAMMAR_PRETRAIN_BATCH_SIZE: int = 16
+#: Batch size for pretrain. Matches the in-process test's batch size.
+GRAMMAR_PRETRAIN_BATCH_SIZE: int = 32
 #: N trajectories generated per task-sample in the generate CLI call.
 GRAMMAR_N_TRAJECTORIES: int = 8
 #: Batch size for the generate CLI — deliberately not a multiple of ``GRAMMAR_N_TRAJECTORIES`` so
@@ -81,7 +85,7 @@ GRAMMAR_N_TRAJECTORIES: int = 8
 GRAMMAR_GENERATE_BATCH_SIZE: int = 3
 #: Rolling-generation budget for the generate CLI. Chosen strictly above the single-chunk cap
 #: ``GRAMMAR_MAX_SEQ_LEN`` so at least one sample must cross a chunk boundary; see the rolling
-#: content assertion in ``test_grammar_cli_rolling_produces_sequences_beyond_single_chunk``.
+#: content assertion in ``test_grammar_cli_rolling_actually_rolls_and_preserves_signal``.
 GRAMMAR_ROLLING_MAX_NEW_TOKENS: int = 30
 
 
@@ -89,9 +93,9 @@ def build_grammar_meds_dataset(
     data_dir: Path,
     task_labels_dir: Path | None = None,
     *,
-    n_train: int = 64,
-    n_tuning: int = 8,
-    n_held_out: int = 8,
+    n_train: int = 256,
+    n_tuning: int = 16,
+    n_held_out: int = 16,
     seed: int = 0,
     max_len: int = 24,
 ) -> None:
@@ -163,7 +167,11 @@ def build_grammar_meds_dataset(
             rows,
             schema={
                 "subject_id": pl.Int64,
-                "time": pl.Datetime("us"),
+                # tz-aware to match the Python ``datetime(..., tzinfo=UTC)`` used when building
+                # ``rows``. A naive ``pl.Datetime("us")`` schema silently strips the timezone at
+                # construction time, which "works" today but can flip to an error on polars
+                # upgrades and produces parquet timestamps without the expected ``UTC`` metadata.
+                "time": pl.Datetime("us", time_zone="UTC"),
                 "code": pl.Utf8,
                 "numeric_value": pl.Float32,
             },
@@ -210,7 +218,9 @@ def build_grammar_meds_dataset(
                 rows,
                 schema={
                     "subject_id": pl.Int64,
-                    "prediction_time": pl.Datetime("us"),
+                    # Match the tz-aware convention used for the events ``time`` column above so
+                    # downstream MEDS tooling sees consistent timestamp metadata on both files.
+                    "prediction_time": pl.Datetime("us", time_zone="UTC"),
                     "boolean_value": pl.Boolean,
                     "integer_value": pl.Int64,
                     "float_value": pl.Float32,

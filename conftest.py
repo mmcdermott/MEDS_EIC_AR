@@ -301,13 +301,20 @@ def grammar_preprocessed(
 def grammar_pretrained(grammar_preprocessed: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Runs ``MEICAR_pretrain`` on the grammar preprocessed dataset.
 
-    Uses a bigger model than the default demo preset (hidden_size=32 via 2 heads x head_dim=16)
-    and a meaningful training budget (80 epochs x a few batches each) so the model actually has
-    a chance to learn the grammar patterns. Disables early-stopping for the same reason — the
-    demo patience=3 kicks in after only a handful of validation checks against a noisy baseline.
+    Uses a substantially bigger model than the default demo preset — see the ``GRAMMAR_*``
+    constants in ``tests/_grammar_meds``: hidden_size is ``GRAMMAR_MODEL_HEADS x
+    GRAMMAR_MODEL_HEAD_DIM``, training runs for ``GRAMMAR_PRETRAIN_EPOCHS`` with
+    ``GRAMMAR_PRETRAIN_BATCH_SIZE``, and early stopping is effectively disabled
+    (``patience=100000``). The budget is sized to dominate test cost on purpose: this fixture
+    underpins the strict greedy-correctness assertion in
+    ``test_grammar_cli_greedy_output_is_fully_grammar_valid``, which requires enough training
+    depth to reach 100% held-out grammar validity under greedy decoding — see the rationale on
+    ``GRAMMAR_PRETRAIN_EPOCHS`` for the forward-pass-count comparison with
+    ``test_pattern_generation.py``'s in-process budget.
 
-    Expected runtime: roughly a minute on a laptop CPU. This is the bulk of the grammar
-    integration test cost; everything downstream is cheap by comparison.
+    Expected runtime: several minutes on a laptop CPU. This is the bulk of the grammar
+    integration test cost; everything downstream is cheap by comparison. Skip locally in favor
+    of doctests during iteration.
     """
     output_dir = tmp_path_factory.mktemp("grammar_pretrained")
     run_and_check(
@@ -328,22 +335,20 @@ def grammar_pretrained(grammar_preprocessed: Path, tmp_path_factory: pytest.Temp
     return output_dir
 
 
-@pytest.fixture(scope="session")
-def grammar_generated_trajectories(
+def _run_grammar_generate(
+    output_dir: Path,
     grammar_pretrained: Path,
     grammar_preprocessed: Path,
-    grammar_raw_meds: tuple[Path, Path],
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Path:
-    """Runs ``MEICAR_generate_trajectories`` on the grammar-pretrained model.
+    task_dir: Path,
+    *,
+    do_sample: bool,
+) -> None:
+    """Invoke ``MEICAR_generate_trajectories`` with the shared grammar fixture config.
 
-    Uses a larger ``N_trajectories_per_task_sample=8`` (vs. the demo default of 2) and a
-    ``batch_size=3`` that is deliberately *not* a multiple of N, so the interleaving /demux code
-    path from #89 is stressed in its cross-sample-group configuration. Rolling generation is
-    enabled with a modest budget so we also exercise the sliding-window path end-to-end.
+    Centralized here so the sampling and greedy fixtures only differ by the ``do_sample`` flag
+    and can't drift apart on other knobs (batch size, rolling budget, N trajectories). All other
+    parameters come from the shared constants in :mod:`tests._grammar_meds`.
     """
-    _, task_dir = grammar_raw_meds
-    output_dir = tmp_path_factory.mktemp("grammar_generated_trajectories")
     run_and_check(
         [
             "MEICAR_generate_trajectories",
@@ -355,9 +360,51 @@ def grammar_generated_trajectories(
             f"datamodule.batch_size={GRAMMAR_GENERATE_BATCH_SIZE}",
             "trainer=demo",
             f"inference.N_trajectories_per_task_sample={GRAMMAR_N_TRAJECTORIES}",
+            f"inference.do_sample={str(do_sample).lower()}",
             f"rolling_generation.max_new_tokens={GRAMMAR_ROLLING_MAX_NEW_TOKENS}",
         ]
     )
+
+
+@pytest.fixture(scope="session")
+def grammar_generated_trajectories(
+    grammar_pretrained: Path,
+    grammar_preprocessed: Path,
+    grammar_raw_meds: tuple[Path, Path],
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Runs ``MEICAR_generate_trajectories`` on the grammar-pretrained model with sampling.
+
+    Uses a larger ``N_trajectories_per_task_sample`` (vs. the demo default of 2) and a
+    ``batch_size`` that is deliberately *not* a multiple of N, so the interleaving / demux
+    code path from #89 is stressed in its cross-sample-group configuration. Rolling generation
+    is enabled with a budget above ``max_seq_len`` so we also exercise the sliding-window path
+    end-to-end.
+    """
+    _, task_dir = grammar_raw_meds
+    output_dir = tmp_path_factory.mktemp("grammar_generated_trajectories")
+    _run_grammar_generate(output_dir, grammar_pretrained, grammar_preprocessed, task_dir, do_sample=True)
+    return output_dir
+
+
+@pytest.fixture(scope="session")
+def grammar_generated_trajectories_greedy(
+    grammar_pretrained: Path,
+    grammar_preprocessed: Path,
+    grammar_raw_meds: tuple[Path, Path],
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Same as :func:`grammar_generated_trajectories` but with ``do_sample=False`` (greedy argmax).
+
+    Greedy decoding gives fully deterministic outputs given the trained weights and prompt, so
+    this fixture underpins the strict grammar-correctness assertion in
+    ``test_grammar_cli_greedy_output_is_fully_grammar_valid``: if the model has learned the
+    grammar, its argmax continuation should be 100% grammar-valid, matching the in-process
+    :mod:`tests.test_pattern_generation` tests' strictness but through the full CLI pipeline.
+    """
+    _, task_dir = grammar_raw_meds
+    output_dir = tmp_path_factory.mktemp("grammar_generated_trajectories_greedy")
+    _run_grammar_generate(output_dir, grammar_pretrained, grammar_preprocessed, task_dir, do_sample=False)
     return output_dir
 
 

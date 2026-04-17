@@ -12,13 +12,13 @@ Closes issue #105. The existing tests split the work:
 
 This file fills the gap between them: train a model **through the full CLI pipeline**
 (``MEICAR_process_data`` → ``MEICAR_pretrain``) on a grammar-formatted MEDS dataset, generate
-trajectories **through the full CLI** with ``N_trajectories_per_task_sample=8`` (larger than the
-demo default) and a ``batch_size=3`` (deliberately not a multiple of N, to stress the
-cross-sample-group demux from PR #103), then inspect the output parquets.
+trajectories **through the full CLI** with ``N_trajectories_per_task_sample=GRAMMAR_N_TRAJECTORIES``
+(larger than the demo default) and a ``batch_size=GRAMMAR_GENERATE_BATCH_SIZE`` (deliberately not
+a multiple of N, to stress the cross-sample-group demux from PR #103), then inspect the output
+parquets. Training budget is sized to dominate fixture cost — see the ``GRAMMAR_*`` constants in
+``tests/_grammar_meds``.
 
-**Assertions are deliberately weaker than the in-process test.** CLI training runs on a small
-budget for test runtime, and the model won't converge to perfect grammar adherence. What we can
-assert reliably at this budget:
+Assertions span plumbing and content:
 
 1. File-layout correctness: ``N`` parquet files per split, every subject appears in every
    trajectory, no duplicates.
@@ -27,9 +27,15 @@ assert reliably at this budget:
 3. Demux correctness: different ``trajectory_idx`` parquets contain distinct content for the
    same subject (not identical rows — that would mean the interleaved predict pass collapsed N
    trajectories into 1).
-4. Grammar **signal** (not strict validity): a meaningful fraction of the in-program transitions
-   the model emits should be grammar-valid, which proves the model learned *something* about the
-   data. Strict 100%-valid is covered by ``test_pattern_generation.py``.
+4. **Sampling grammar signal**: a distributional passing-rate check — at least half of held-out
+   (subject, trajectory) samples clear a per-sample 50% grammar-validity threshold on the
+   ``do_sample=True`` fixture. This is the "does sampling produce mostly-grammar output"
+   assertion.
+5. **Greedy strict validity**: every held-out sample's SEP-anchored suffix must be 100%
+   grammar-valid under ``do_sample=False``. This is the CLI analogue of the in-process test's
+   strict correctness bar.
+6. **Rolling content**: at least one sample exceeded the single-chunk cap (proving rolling was
+   exercised) and signal survives rolling at the same threshold as (4).
 
 Also adds a few small tests for the CLI config-validation error paths that aren't exercised by
 the happy-path fixtures.
@@ -276,6 +282,63 @@ def test_grammar_cli_model_shows_grammar_signal(grammar_generated_trajectories: 
         f"per-sample {_PER_SAMPLE_VALIDITY_THRESHOLD:.0%} grammar-validity threshold (required: "
         f"{_MIN_FRACTION_SAMPLES_PASSING:.0%}). Either the CLI pipeline is broken, the training "
         f"budget is too small, or a recent change regressed generalization."
+    )
+
+
+def test_grammar_cli_greedy_output_is_fully_grammar_valid(
+    grammar_generated_trajectories_greedy: Path,
+):
+    """Strict correctness: greedy (``do_sample=False``) CLI output must be 100% grammar-valid.
+
+    This is the CLI-pipeline analogue of the in-process ``test_pattern_generation.py``'s
+    ``test_trained_model_single_chunk_generation_recovers_grammar`` /
+    ``test_trained_model_rolling_generation_preserves_grammar`` tests, which assert exact
+    argmax correctness under greedy decoding. The in-process tests can make that claim because
+    greedy removes sampling noise; the same should hold through the full CLI path if the model
+    actually learned the grammar.
+
+    We assert: **every** held-out (subject, trajectory) pair with at least one scorable grammar
+    token (a SEP present + non-empty suffix) has ``valid == total`` — every FSM transition in
+    the suffix after the first generated SEP is valid. No passing-rate threshold, no averaging;
+    if even one sample has an invalid transition, the test fails with the offending sample's
+    index and tokens.
+
+    Samples with no generated SEP are excluded from scoring (the walker has nothing to ground
+    the FSM on for them), but we require at least half of held-out samples to be scorable — a
+    model that never emits SEP is itself a regression worth catching.
+    """
+    by_split = _load_trajectories_by_split(grammar_generated_trajectories_greedy)
+
+    scored = 0
+    total_samples = 0
+    failures: list[str] = []
+    for t, df in by_split[held_out_split].items():
+        tokens_by_subject = grammar_tokens_from_output_df(df)
+        for subject_id, tokens in tokens_by_subject.items():
+            total_samples += 1
+            if SEP not in tokens:
+                continue
+            valid, total = _walk_grammar_tokens_ignoring_start(tokens)
+            if total == 0:
+                continue
+            scored += 1
+            if valid != total:
+                # Reconstruct suffix for debugging so a failure message points at the exact
+                # offending tokens rather than just counts.
+                suffix = tokens[tokens.index(SEP) + 1 :]
+                failures.append(
+                    f"traj={t} subject={subject_id}: {valid}/{total} valid "
+                    f"(first invalid at suffix position {valid}): suffix={suffix}"
+                )
+
+    assert scored >= total_samples // 2, (
+        f"Only {scored}/{total_samples} held-out greedy samples had a scorable SEP-anchored "
+        f"suffix. A model that rarely emits SEP is itself a regression — strict validity can't "
+        f"be meaningfully asserted without grounding in a known FSM state."
+    )
+    assert not failures, (
+        f"Greedy CLI output was not 100% grammar-valid on {len(failures)} / {scored} held-out "
+        f"samples:\n" + "\n".join(failures)
     )
 
 
