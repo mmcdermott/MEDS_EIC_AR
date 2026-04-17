@@ -21,6 +21,19 @@ class HFBackend:
     parameter sharing with Lightning / checkpointing is unaffected. Every call slices off the
     prompt tokens before returning, matching the contract documented on
     :class:`GenerationBackend`.
+
+    **On the ``**kwargs`` forwarding policy.** The :class:`GenerationBackend` protocol says
+    implementations must "only forward options supported by the active engine and silently
+    ignore or strip the rest." Here the "active engine" is HF ``generate``, whose
+    :class:`~transformers.GenerationMixin` accepts a broad ``**kwargs`` set — anything the
+    underlying model's ``forward`` accepts, plus all generation-control kwargs like
+    ``logits_processor`` / ``stopping_criteria``. We therefore forward ``**kwargs`` unchanged
+    rather than maintaining a brittle whitelist that would drift across transformers releases.
+    This satisfies the protocol because HF's supported-kwarg set is a superset of what callers
+    realistically pass through ``Model.generate``. The obligation to *strip* applies
+    asymmetrically to backends whose engine accepts a narrower set than HF — an SGLang adapter
+    (PR 2, issue #88) will need to drop HF-specific keys like ``logits_processor`` before
+    invoking ``sgl.Engine.generate``.
     """
 
     def __init__(self, hf_model: PreTrainedModel):
