@@ -29,11 +29,13 @@ Assertions span plumbing and content:
    trajectories into 1).
 4. **Sampling grammar signal**: a distributional passing-rate check — at least half of held-out
    (subject, trajectory) samples clear a per-sample 50% grammar-validity threshold on the
-   ``do_sample=True`` fixture. This is the "does sampling produce mostly-grammar output"
-   assertion.
-5. **Greedy strict validity**: every held-out sample's SEP-anchored suffix must be 100%
-   grammar-valid under ``do_sample=False``. This is the CLI analogue of the in-process test's
-   strict correctness bar.
+   ``do_sample=True`` fixture. The FSM is pre-advanced through the subject's prompt tokens so
+   mid-program continuations are scored correctly, not rejected as "not a program-start".
+5. **Greedy strict validity**: every generated grammar token in every held-out sample under
+   ``do_sample=False`` must be a valid FSM continuation from the prompt's end-state. Strict
+   100% validity, no averaging, no tolerance. The FSM is pre-advanced through the subject's
+   prompt tokens so this test is byte-for-byte equivalent in strictness to the in-process
+   ``test_pattern_generation.py`` tests' ``GrammarFSM().walk(seq) == len(seq)`` bar.
 6. **Rolling content**: at least one sample exceeded the single-chunk cap (proving rolling was
    exercised) and signal survives rolling at the same threshold as (4).
 
@@ -60,8 +62,8 @@ from tests._grammar_meds import (
     GRAMMAR_ROLLING_MAX_NEW_TOKENS,
     GrammarFSM,
     grammar_tokens_from_output_df,
+    prompt_grammar_tokens_by_subject,
 )
-from tests.test_pattern_generation import SEP
 
 # Auxiliary codes that MEICAR_process_data emits for us (timestamps → time-delta tokens; timeline
 # start/end sentinels). These aren't part of the grammar but are expected in the output and must
@@ -173,88 +175,79 @@ def test_grammar_cli_output_codes_are_in_expected_vocab(grammar_generated_trajec
                 )
 
 
-def _walk_grammar_tokens_ignoring_start(tokens: list[int]) -> tuple[int, int]:
-    """Return (n_valid_transitions, n_total_transitions) over the suffix starting at the first SEP.
+def _fsm_advanced_through_prompt(prompt_tokens: list[int]) -> GrammarFSM:
+    """Build a :class:`GrammarFSM` and walk it through the subject's prompt tokens.
 
-    Generated trajectories start partway through some program — whatever state the prompt's
-    timeline left the model in. A fresh :class:`GrammarFSM` (initial state = BETWEEN) can't judge
-    those initial in-program tokens because it would expect a program-start token there. Instead,
-    we find the first ``SEP`` token in the generated sequence (which unambiguously returns the
-    FSM to BETWEEN state) and score the suffix starting right after it. If no ``SEP`` appears,
-    we walk from BETWEEN over the whole sequence — the worst-case interpretation, but the model
-    failing to emit *any* SEP in N generated tokens is itself a legitimate negative signal.
+    The returned FSM's state is the state the model was conditioning on when it began
+    generating. Scoring the generated continuation from this state lets us judge strict validity
+    of every single generated token — no prefix-trimming, no "benefit of the doubt" heuristics.
 
-    A transition is "valid" if it doesn't send the FSM to the invalid sink; we stop counting at
-    the first invalid step, so the return is the valid-prefix length of the scored suffix.
+    If the prompt itself walks invalid, something is wrong with the data-setup — we constructed
+    the raw MEDS timelines to be grammar-valid by construction — so raise instead of silently
+    masking. In practice this can't happen for subjects produced by
+    :func:`build_grammar_meds_dataset`, but it's cheap insurance against a future refactor that
+    accidentally corrupts the raw-MEDS layer.
     """
-    if SEP in tokens:
-        suffix_start = tokens.index(SEP) + 1
-        scored = tokens[suffix_start:]
-    else:
-        scored = tokens
-
-    if not scored:
-        return 0, 0
-
     fsm = GrammarFSM()
+    for i, tok in enumerate(prompt_tokens):
+        if fsm.step(tok) is None:
+            raise AssertionError(
+                f"Prompt tokens are not grammar-valid — data setup bug. First invalid at "
+                f"position {i}; prompt={prompt_tokens}"
+            )
+    return fsm
+
+
+def _walk_generated_strictly(prompt_tokens: list[int], generated_tokens: list[int]) -> tuple[int, int]:
+    """Walk ``generated_tokens`` through a :class:`GrammarFSM` pre-advanced by ``prompt_tokens``.
+
+    Returns ``(n_valid_transitions, n_total_transitions)``. ``n_valid_transitions == len(
+    generated_tokens)`` iff every generated grammar token is a valid FSM continuation from the
+    prompt's end-state — byte-for-byte equivalent in strictness to ``GrammarFSM().walk(seq) ==
+    len(seq)`` in the in-process ``test_pattern_generation.py`` tests, just with the FSM
+    correctly advanced through the prompt rather than starting fresh at ``BETWEEN``.
+    """
+    fsm = _fsm_advanced_through_prompt(prompt_tokens)
     valid = 0
-    for tok in scored:
+    for tok in generated_tokens:
         if fsm.step(tok) is None:
             break
         valid += 1
-    return valid, len(scored)
+    return valid, len(generated_tokens)
 
-
-#: A sample must have at least this many grammar tokens before it's scored at all. Must be >= 1
-#: (0-length samples have no transitions to validate) but deliberately not higher: the CLI
-#: training budget often produces short outputs, and a higher floor would filter out the bulk
-#: of the data. The passing-rate metric below is robust to short samples (they either pass or
-#: fail the per-sample threshold on their own); a mean-based metric would require a higher
-#: floor to avoid being dominated by short-sample outliers.
-_MIN_GRAMMAR_TOKENS_FOR_SCORING: int = 1
 
 #: Per-sample threshold: a sample is "passing" if this fraction of its grammar-token transitions
-#: are FSM-valid (after stripping the pre-first-SEP prefix; see the walker's docstring). 0.50 is
-#: chosen so "passing" means the majority of a sample's emitted grammar tokens continue the
-#: grammar — well above anything explainable by chance (a random vocab pick gives ~6% per-step
-#: valid rate; the expected prefix-length fraction on long sequences is far below 0.10). The
-#: in-process test reaches ~0.9 routinely, so the CLI budget calibrated in the fixture should
-#: reach this threshold comfortably.
+#: are FSM-valid, with the FSM pre-advanced by the subject's prompt tokens so mid-program
+#: continuations (e.g. emitting ``A[2]`` after a prompt that ended at ``A[1]``) are scored
+#: correctly rather than rejected as "not a program start". 0.50 is comfortably above chance
+#: (random picks from a ~50-entry vocab give ~6% per-step valid rate) and inside what the CLI
+#: budget hits routinely; the in-process test reaches ~0.9 greedy with more training.
 _PER_SAMPLE_VALIDITY_THRESHOLD: float = 0.50
 
 #: Minimum fraction of held-out (subject, trajectory) samples that must clear the per-sample
 #: threshold. Using a passing-rate distributional metric (instead of "best seen") rules out the
-#: "one lucky sample masks universal garbage" failure mode a prior reviewer flagged. Short-sample
-#: outliers don't drag a passing rate around the way they drag a mean. Tuned empirically on the
-#: fixture: the current budget produces ~80% passing rate on held-out at 0.50 per-sample
-#: validity, so 0.50 leaves ample sampling-variance headroom while still being a majority
-#: requirement.
+#: "one lucky sample masks universal garbage" failure mode a prior reviewer flagged.
 _MIN_FRACTION_SAMPLES_PASSING: float = 0.50
 
 
-def test_grammar_cli_model_shows_grammar_signal(grammar_generated_trajectories: Path):
-    """Distributional grammar-adherence check on the held-out split.
+def test_grammar_cli_model_shows_grammar_signal(
+    grammar_generated_trajectories: Path, grammar_raw_meds: tuple[Path, Path]
+):
+    """Distributional grammar-adherence check on the held-out split (sampling fixture).
 
-    This is a **signal** test, not a correctness test. Strict per-token grammar validity is
-    covered by ``test_pattern_generation.py``'s in-process tests, which have more training
-    budget. Here the CLI budget is fixed, so we verify the model learned something grammatical
-    on unseen subjects — which rules out entire classes of CLI bugs (wrong vocab indexing,
-    off-by-one in token → code mapping, etc.) that would leave the model emitting
-    structurally-random output — while keeping the test robust across minor CLI changes.
+    Per-sample metric: (# of valid FSM transitions) / (# of generated grammar tokens), with the
+    FSM pre-advanced through the subject's prompt tokens so the starting state is exactly what
+    the model conditioned on at generation time. No prefix trimming, no SEP anchor — every
+    generated grammar token counts.
 
-    Per-sample metric: (# of valid FSM transitions) / (# of grammar tokens). Walks the sequence
-    through :class:`GrammarFSM`; stops at the first invalid step and records how far it got.
-
-    Distributional assertion (not just "best seen"): at least
-    ``_MIN_FRACTION_SAMPLES_PASSING`` of held-out (subject, trajectory) pairs clear
-    ``_PER_SAMPLE_VALIDITY_THRESHOLD``. This rules out the "one lucky sample masks universal
-    garbage" failure mode of a naive "best seen" test while being robust to the
-    short-sample outliers that would destabilize a mean-based metric.
-
-    Samples with fewer than ``_MIN_GRAMMAR_TOKENS_FOR_SCORING`` tokens are excluded — they're too
-    short for the fraction to be a meaningful distributional signal.
+    Assertion: at least ``_MIN_FRACTION_SAMPLES_PASSING`` of held-out (subject, trajectory)
+    pairs clear ``_PER_SAMPLE_VALIDITY_THRESHOLD``. Rules out the "one lucky sample masks
+    universal garbage" failure mode without overreacting to sampling noise on individual rows.
     """
+    raw_meds_dir, task_labels_dir = grammar_raw_meds
     by_split = _load_trajectories_by_split(grammar_generated_trajectories)
+
+    prompts_by_subject = prompt_grammar_tokens_by_subject(raw_meds_dir, task_labels_dir, held_out_split)
 
     # Restrict to held-out: train-split trajectories could exhibit apparent grammar signal from
     # memorization, which wouldn't prove the model generalized. Held-out subjects were never seen
@@ -262,18 +255,17 @@ def test_grammar_cli_model_shows_grammar_signal(grammar_generated_trajectories: 
     fractions: list[float] = []
     for _t, df in by_split[held_out_split].items():
         tokens_by_subject = grammar_tokens_from_output_df(df)
-        for _subject_id, tokens in tokens_by_subject.items():
-            if len(tokens) < _MIN_GRAMMAR_TOKENS_FOR_SCORING:
+        for subject_id, tokens in tokens_by_subject.items():
+            if not tokens:
                 continue
-            valid, total = _walk_grammar_tokens_ignoring_start(tokens)
+            valid, total = _walk_generated_strictly(prompts_by_subject[subject_id], tokens)
             if total == 0:
-                continue  # all-SEP edge case — nothing to score after the split
+                continue
             fractions.append(valid / total)
 
     assert fractions, (
-        f"No held-out samples had >= {_MIN_GRAMMAR_TOKENS_FOR_SCORING} grammar tokens. The "
-        f"fixture either generates nothing or generates only non-grammar codes — both indicate "
-        f"a broken pipeline."
+        "No held-out samples produced any grammar tokens. The fixture generates nothing or "
+        "generates only non-grammar codes — both indicate a broken pipeline."
     )
     passing_fraction = sum(f >= _PER_SAMPLE_VALIDITY_THRESHOLD for f in fractions) / len(fractions)
 
@@ -286,64 +278,60 @@ def test_grammar_cli_model_shows_grammar_signal(grammar_generated_trajectories: 
 
 
 def test_grammar_cli_greedy_output_is_fully_grammar_valid(
-    grammar_generated_trajectories_greedy: Path,
+    grammar_generated_trajectories_greedy: Path, grammar_raw_meds: tuple[Path, Path]
 ):
     """Strict correctness: greedy (``do_sample=False``) CLI output must be 100% grammar-valid.
 
-    This is the CLI-pipeline analogue of the in-process ``test_pattern_generation.py``'s
+    This is the CLI-pipeline analogue of ``test_pattern_generation.py``'s
     ``test_trained_model_single_chunk_generation_recovers_grammar`` /
-    ``test_trained_model_rolling_generation_preserves_grammar`` tests, which assert exact
-    argmax correctness under greedy decoding. The in-process tests can make that claim because
-    greedy removes sampling noise; the same should hold through the full CLI path if the model
-    actually learned the grammar.
+    ``test_trained_model_rolling_generation_preserves_grammar`` tests, which assert exact argmax
+    correctness under greedy decoding. The in-process tests can make that claim because greedy
+    removes sampling noise; the same should hold through the full CLI path if the model actually
+    learned the grammar.
 
-    We assert: **every** held-out (subject, trajectory) pair with at least one scorable grammar
-    token (a SEP present + non-empty suffix) has ``valid == total`` — every FSM transition in
-    the suffix after the first generated SEP is valid. No passing-rate threshold, no averaging;
-    if even one sample has an invalid transition, the test fails with the offending sample's
-    index and tokens.
-
-    Samples with no generated SEP are excluded from scoring (the walker has nothing to ground
-    the FSM on for them), but we require at least half of held-out samples to be scorable — a
-    model that never emits SEP is itself a regression worth catching.
+    Methodology matches the in-process strictness: for each held-out (subject, trajectory) pair,
+    pre-advance a :class:`GrammarFSM` through the subject's prompt tokens (so the starting state
+    reflects wherever the prompt left off in some program), then walk every generated grammar
+    token through it. ``valid == total`` on every single sample — no passing-rate averaging, no
+    SEP prefix-trim, no ">= 50% scorable" guard. If any generated token is an invalid
+    continuation from the known prompt state, the test fails with the offending subject, the
+    prompt tokens that establish the starting state, and the generated tokens up to and
+    including the first invalid one.
     """
+    raw_meds_dir, task_labels_dir = grammar_raw_meds
     by_split = _load_trajectories_by_split(grammar_generated_trajectories_greedy)
 
-    scored = 0
+    prompts_by_subject = prompt_grammar_tokens_by_subject(raw_meds_dir, task_labels_dir, held_out_split)
+
     total_samples = 0
     failures: list[str] = []
     for t, df in by_split[held_out_split].items():
         tokens_by_subject = grammar_tokens_from_output_df(df)
         for subject_id, tokens in tokens_by_subject.items():
+            if not tokens:
+                continue
             total_samples += 1
-            if SEP not in tokens:
-                continue
-            valid, total = _walk_grammar_tokens_ignoring_start(tokens)
-            if total == 0:
-                continue
-            scored += 1
+            prompt_tokens = prompts_by_subject[subject_id]
+            valid, total = _walk_generated_strictly(prompt_tokens, tokens)
             if valid != total:
-                # Reconstruct suffix for debugging so a failure message points at the exact
-                # offending tokens rather than just counts.
-                suffix = tokens[tokens.index(SEP) + 1 :]
                 failures.append(
                     f"traj={t} subject={subject_id}: {valid}/{total} valid "
-                    f"(first invalid at suffix position {valid}): suffix={suffix}"
+                    f"(first invalid at generated position {valid}): "
+                    f"prompt_tokens={prompt_tokens}, generated={tokens}"
                 )
 
-    assert scored >= total_samples // 2, (
-        f"Only {scored}/{total_samples} held-out greedy samples had a scorable SEP-anchored "
-        f"suffix. A model that rarely emits SEP is itself a regression — strict validity can't "
-        f"be meaningfully asserted without grounding in a known FSM state."
+    assert total_samples > 0, (
+        "No held-out greedy samples had any generated grammar tokens — the model either "
+        "produced no output or produced only non-grammar codes."
     )
     assert not failures, (
-        f"Greedy CLI output was not 100% grammar-valid on {len(failures)} / {scored} held-out "
-        f"samples:\n" + "\n".join(failures)
+        f"Greedy CLI output was not 100% grammar-valid on {len(failures)} / {total_samples} "
+        f"held-out samples:\n" + "\n".join(failures)
     )
 
 
 def test_grammar_cli_rolling_actually_rolls_and_preserves_signal(
-    grammar_generated_trajectories: Path,
+    grammar_generated_trajectories: Path, grammar_raw_meds: tuple[Path, Path]
 ):
     """Rolling-path specific content check.
 
@@ -366,7 +354,10 @@ def test_grammar_cli_rolling_actually_rolls_and_preserves_signal(
        signal check on just those samples catches regressions that the aggregate signal test
        above would miss if non-rolling samples dominated the mean.
     """
+    raw_meds_dir, task_labels_dir = grammar_raw_meds
     by_split = _load_trajectories_by_split(grammar_generated_trajectories)
+
+    prompts_by_subject = prompt_grammar_tokens_by_subject(raw_meds_dir, task_labels_dir, held_out_split)
 
     rolling_sample_lengths: list[int] = []
     rolling_validity_fractions: list[float] = []
@@ -375,16 +366,17 @@ def test_grammar_cli_rolling_actually_rolls_and_preserves_signal(
         sorted_df = df.sort(["subject_id", "time"])
         # Per-subject total length (prompt + new). A MEDS event row has a subject_id, so
         # ``len(subject_df)`` directly equals the number of tokens emitted for that subject.
-        for _subject_id, subject_df in sorted_df.group_by("subject_id", maintain_order=True):
+        for subject_id_tup, subject_df in sorted_df.group_by("subject_id", maintain_order=True):
+            subject_id = subject_id_tup[0]
             total_len = len(subject_df)
             if total_len <= GRAMMAR_MAX_SEQ_LEN:
                 continue
             rolling_sample_lengths.append(total_len)
             codes = subject_df["code"].to_list()
             tokens = [CODE_TO_TOKEN[c] for c in codes if c in CODE_TO_TOKEN]
-            if len(tokens) < _MIN_GRAMMAR_TOKENS_FOR_SCORING:
+            if not tokens:
                 continue
-            valid, total = _walk_grammar_tokens_ignoring_start(tokens)
+            valid, total = _walk_generated_strictly(prompts_by_subject[subject_id], tokens)
             if total == 0:
                 continue
             rolling_validity_fractions.append(valid / total)

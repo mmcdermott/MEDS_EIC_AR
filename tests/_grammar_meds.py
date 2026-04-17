@@ -135,7 +135,14 @@ def build_grammar_meds_dataset(
         for _ in range(n_subjects):
             subject_id = next(subject_counter)
             subject_splits_rows.append({"subject_id": subject_id, "split": split})
+            # Resample until the sequence contains at least one SEP that is *not* the final
+            # token — i.e. the subject's timeline spans more than one grammar program. This
+            # gives us a usable "program boundary" at which to place ``prediction_time`` (see
+            # next comment). Single-program sequences (e.g. ``[B[0], B[1], B[2], SEP]``) are
+            # the degenerate case where no such boundary exists.
             tokens = sample_sequence(rng, max_len=max_len)
+            while tokens.count(SEP) < 2:
+                tokens = sample_sequence(rng, max_len=max_len)
             for i, tok in enumerate(tokens):
                 rows.append(
                     {
@@ -145,18 +152,32 @@ def build_grammar_meds_dataset(
                         "numeric_value": None,
                     }
                 )
-            # One task-labels row per subject — prediction_time is placed at the midpoint of
-            # the timeline so the generator has at least one real event of history to condition
-            # on and at least one real future event to compare against, regardless of how long
-            # the sampled sequence ended up. With the shortest possible grammar sequence (a
-            # single ``B`` program plus ``SEP`` = 4 tokens, last event at hour 3), a fixed
-            # offset like 5 hours would fall past the last event. The label value is unused by
-            # the generation path but the columns are required by MEDSTorchDataConfig.
-            midpoint_hours = len(tokens) // 2
+            # Place ``prediction_time`` strictly **between** the SEP event and the next
+            # grammar event, so the prompt ends on a program boundary (FSM state = BETWEEN)
+            # unambiguously.
+            #
+            # Why not ``first_sep_idx + 1`` hours (i.e. exactly on the next event)?
+            # meds-torchdata's task-label handling uses
+            # ``pl.col("time").search_sorted(prediction_time, side="right")`` to compute the
+            # end-of-prompt index (see ``MEDSPytorchDataset._prepare_task_label_schema``),
+            # which **includes** events at ``time == prediction_time`` in the prompt. With
+            # integer-hour events at hours 0, 1, 2, ..., a ``prediction_time`` sitting exactly
+            # on an event time therefore pulls that event into the prompt, silently shifting
+            # the "first generated token" forward by one event (two tokens after preprocessing
+            # because each event is preceded by a ``TIMELINE//DELTA``). Placing
+            # ``prediction_time`` at ``sep_hour + 30min`` avoids the ambiguity entirely: no
+            # event sits at that time, so the ``side`` argument of ``search_sorted`` doesn't
+            # change the result. This is issue #111's root cause — see that issue for the
+            # investigation.
+            #
+            # Semantic: prompt = events at hours 0..first_sep_idx inclusive (first program +
+            # SEP); next event at hour first_sep_idx+1 (B[0] or similar) is the model's first
+            # generated target.
+            first_sep_idx = tokens.index(SEP)
             split_task_rows.append(
                 {
                     "subject_id": subject_id,
-                    "prediction_time": base_time + timedelta(hours=midpoint_hours),
+                    "prediction_time": base_time + timedelta(hours=first_sep_idx, minutes=30),
                     "boolean_value": False,
                     "integer_value": None,
                     "float_value": None,
@@ -256,6 +277,45 @@ def grammar_tokens_from_output_df(df: pl.DataFrame) -> dict[int, list[int]]:
         if code in CODE_TO_TOKEN:
             codes_by_subject.setdefault(row["subject_id"], []).append(CODE_TO_TOKEN[code])
     return codes_by_subject
+
+
+def prompt_grammar_tokens_by_subject(
+    raw_meds_dir: Path, task_labels_dir: Path, split: str
+) -> dict[int, list[int]]:
+    """Return the grammar tokens of each subject's prompt in ``split``.
+
+    "Prompt" here = the events strictly before ``prediction_time``. These are the tokens the
+    model conditions on before emitting anything. Walking them through :class:`GrammarFSM` gives
+    the FSM state at generation time, which is the starting state to evaluate the generated
+    continuation against — otherwise a fresh FSM at ``BETWEEN`` would reject any in-program
+    continuation (e.g. ``A[2]``) as invalid even though it's the grammar-correct continuation
+    from wherever the prompt left off.
+
+    Args:
+        raw_meds_dir: The MEDS root that ``build_grammar_meds_dataset`` wrote (has
+            ``data/{split}/0.parquet`` and ``metadata/``).
+        task_labels_dir: The task-labels directory it wrote alongside (has ``{split}.parquet``).
+        split: One of ``meds.train_split``, ``meds.tuning_split``, ``meds.held_out_split``.
+
+    Returns:
+        ``{subject_id: [grammar_token_int, ...]}`` for every subject in the split, in
+        chronological (event-time) order. Aux codes aren't in the raw data we wrote, so the
+        filter-by-``CODE_TO_TOKEN`` is defensive, not load-bearing.
+    """
+    events_df = pl.read_parquet(raw_meds_dir / "data" / split / "0.parquet")
+    task_df = pl.read_parquet(task_labels_dir / f"{split}.parquet")
+
+    prompt_by_subject: dict[int, list[int]] = {}
+    for row in task_df.iter_rows(named=True):
+        subject_id = row["subject_id"]
+        prediction_time = row["prediction_time"]
+        prompt_df = events_df.filter(
+            (pl.col("subject_id") == subject_id) & (pl.col("time") < prediction_time)
+        ).sort("time")
+        prompt_by_subject[subject_id] = [
+            CODE_TO_TOKEN[code] for code in prompt_df["code"].to_list() if code in CODE_TO_TOKEN
+        ]
+    return prompt_by_subject
 
 
 def grammar_fsm_walk_is_valid(tokens: list[int]) -> tuple[bool, int]:

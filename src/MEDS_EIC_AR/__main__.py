@@ -181,6 +181,11 @@ def generate_trajectories(cfg: DictConfig):
 
     M.generation_kwargs.update(rolling_kwargs)
 
+    # Wire ``inference.do_sample`` through to ``Model.generate``. Kept on the inference section
+    # rather than ``rolling_generation`` because ``do_sample`` is not rolling-specific — it
+    # applies to both single-chunk and rolling paths.
+    M.generation_kwargs["do_sample"] = cfg.inference.do_sample
+
     trainer = instantiate(cfg.trainer)
 
     inference = cfg.inference
