@@ -26,6 +26,7 @@ class HFBackend:
 
     def __init__(self, hf_model: PreTrainedModel):
         self.hf_model = hf_model
+        self._supported_generate_params = frozenset(inspect.signature(hf_model.generate).parameters)
 
     def generate_chunk(
         self,
@@ -36,8 +37,7 @@ class HFBackend:
         **kwargs,
     ) -> torch.Tensor:
         if kwargs:
-            supported = inspect.signature(self.hf_model.generate).parameters
-            kwargs = {k: v for k, v in kwargs.items() if k in supported}
+            kwargs = {k: v for k, v in kwargs.items() if k in self._supported_generate_params}
         out = self.hf_model.generate(
             input_ids,
             attention_mask=attention_mask,
