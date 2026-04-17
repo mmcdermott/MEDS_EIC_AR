@@ -238,6 +238,22 @@ def grammar_pretrained(
             f"trainer.max_epochs={grammar_pretrain_epochs}",
             "trainer.overfit_batches=0",
             "trainer.callbacks.early_stopping.patience=100000",
+            # Undo three demo-mode pessimizations that the ``trainer: demo`` / ``model: demo``
+            # defaults apply. They exist to help humans eyeball a single-epoch demo run, but
+            # they dominate wall-clock on this fixture's 100k-forward-pass training budget:
+            #   - ``val_check_interval: 1`` + ``check_val_every_n_epoch: null`` = validate
+            #     after every training batch (thousands of val passes over the run). We need
+            #     *some* validation because ``ModelCheckpoint`` monitors ``val_loss`` to
+            #     select ``best_model.ckpt``, but don't need it every batch. Switch to
+            #     once-per-epoch + once-per-N-epochs (50) so the full training budget sees
+            #     only ~8 val passes.
+            #   - ``detect_anomaly: True`` wraps every forward pass in nan/inf detection.
+            #   - ``do_demo: True`` on the Model runs ``_check_parameters`` every forward
+            #     pass — a full parameter scan for nan/inf.
+            "trainer.val_check_interval=1.0",
+            "trainer.check_val_every_n_epoch=50",
+            "trainer.detect_anomaly=False",
+            "lightning_module.model.do_demo=false",
             f"max_seq_len={grammar_max_seq_len}",
             f"lightning_module.model.gpt_kwargs.num_attention_heads={grammar_model_heads}",
             f"lightning_module.model.gpt_kwargs.attention_head_dim={grammar_model_head_dim}",
