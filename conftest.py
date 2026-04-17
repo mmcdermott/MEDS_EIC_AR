@@ -249,9 +249,6 @@ def generated_trajectories_rolling(
     return output_dir
 
 
-# Grammar-dataset fixtures (issue #105) live in ``tests/grammar/conftest.py``.
-
-
 @contextmanager
 def print_warnings(caplog: pytest.LogCaptureFixture):
     """Captures all logged warnings within this context block and prints them upon exit.
