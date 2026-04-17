@@ -47,10 +47,15 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from tests._grammar_meds import (
+    CODE_TO_TOKEN,
     GRAMMAR_CODES,
+    GRAMMAR_MAX_SEQ_LEN,
+    GRAMMAR_N_TRAJECTORIES,
+    GRAMMAR_ROLLING_MAX_NEW_TOKENS,
     GrammarFSM,
     grammar_tokens_from_output_df,
 )
+from tests.test_pattern_generation import SEP
 
 # Auxiliary codes that MEICAR_process_data emits for us (timestamps → time-delta tokens; timeline
 # start/end sentinels). These aren't part of the grammar but are expected in the output and must
@@ -77,11 +82,9 @@ def test_grammar_cli_produces_n_parquets_per_split(grammar_generated_trajectorie
     """N trajectories x 3 splits x correct shape — the bedrock structural signal."""
     by_split = _load_trajectories_by_split(grammar_generated_trajectories)
 
-    n_trajectories = 8  # matches grammar_generated_trajectories fixture override
-
     for split, trajectories in by_split.items():
-        assert set(trajectories.keys()) == {str(i) for i in range(n_trajectories)}, (
-            f"Split {split}: expected parquets 0..{n_trajectories - 1}, got {sorted(trajectories)}"
+        assert set(trajectories.keys()) == {str(i) for i in range(GRAMMAR_N_TRAJECTORIES)}, (
+            f"Split {split}: expected parquets 0..{GRAMMAR_N_TRAJECTORIES - 1}, got {sorted(trajectories)}"
         )
         # Every trajectory parquet for a split must cover the same subject set. If the
         # interleaving path corrupted the demux, we'd see subjects dropped or duplicated across
@@ -106,10 +109,15 @@ def test_grammar_cli_trajectories_are_distinct_across_n(grammar_generated_trajec
 
     for split, trajectories in by_split.items():
         # Build per-(trajectory_idx, subject_id) code tuple and compare across trajectories.
+        # Sort by ``time`` within each subject so the extracted sequence is a stable function of
+        # generation order — polars' ``group_by`` doesn't guarantee intra-group row order without
+        # ``maintain_order=True``, and if a reorder swapped two codes we'd spuriously detect
+        # "diversity" even for identical runs.
         per_traj_per_subject: dict[str, dict[int, tuple[str, ...]]] = {}
         for t, df in trajectories.items():
             per_subject: dict[int, tuple[str, ...]] = {}
-            for subject_id, subject_df in df.group_by("subject_id"):
+            sorted_df = df.sort(["subject_id", "time"])
+            for subject_id, subject_df in sorted_df.group_by("subject_id", maintain_order=True):
                 per_subject[subject_id[0]] = tuple(subject_df["code"].to_list())
             per_traj_per_subject[t] = per_subject
 
@@ -129,9 +137,10 @@ def test_grammar_cli_trajectories_are_distinct_across_n(grammar_generated_trajec
             len({per_traj_per_subject[t][s] for t in per_traj_per_subject}) > 1 for s in subjects_any
         )
         assert any_subject_is_diverse, (
-            f"Split {split}: every subject produced identical trajectories across all 8 samples. "
-            f"Either sampling is degenerate (model always picks the same token) or the "
-            f"interleaved-predict path collapsed the N trajectories into 1."
+            f"Split {split}: every subject produced identical trajectories across all "
+            f"{GRAMMAR_N_TRAJECTORIES} samples. Either sampling is degenerate (model always "
+            f"picks the same token) or the interleaved-predict path collapsed the N "
+            f"trajectories into 1."
         )
 
 
@@ -159,56 +168,185 @@ def test_grammar_cli_output_codes_are_in_expected_vocab(grammar_generated_trajec
 
 
 def _walk_grammar_tokens_ignoring_start(tokens: list[int]) -> tuple[int, int]:
-    """Return (n_valid_transitions, n_total_transitions).
+    """Return (n_valid_transitions, n_total_transitions) over the suffix starting at the first SEP.
 
-    The FSM's initial state is BETWEEN; feeding the tokens in order counts each transition. We consider a
-    transition "valid" if it doesn't send the FSM to the invalid sink. Since we stop walking on the first
-    invalid step, the return is the count before failure.
+    Generated trajectories start partway through some program — whatever state the prompt's
+    timeline left the model in. A fresh :class:`GrammarFSM` (initial state = BETWEEN) can't judge
+    those initial in-program tokens because it would expect a program-start token there. Instead,
+    we find the first ``SEP`` token in the generated sequence (which unambiguously returns the
+    FSM to BETWEEN state) and score the suffix starting right after it. If no ``SEP`` appears,
+    we walk from BETWEEN over the whole sequence — the worst-case interpretation, but the model
+    failing to emit *any* SEP in N generated tokens is itself a legitimate negative signal.
+
+    A transition is "valid" if it doesn't send the FSM to the invalid sink; we stop counting at
+    the first invalid step, so the return is the valid-prefix length of the scored suffix.
     """
+    if SEP in tokens:
+        suffix_start = tokens.index(SEP) + 1
+        scored = tokens[suffix_start:]
+    else:
+        scored = tokens
+
+    if not scored:
+        return 0, 0
+
     fsm = GrammarFSM()
     valid = 0
-    for tok in tokens:
+    for tok in scored:
         if fsm.step(tok) is None:
             break
         valid += 1
-    return valid, len(tokens)
+    return valid, len(scored)
+
+
+#: A sample must have at least this many grammar tokens before it's scored at all. Must be >= 1
+#: (0-length samples have no transitions to validate) but deliberately not higher: the CLI
+#: training budget often produces short outputs, and a higher floor would filter out the bulk
+#: of the data. The passing-rate metric below is robust to short samples (they either pass or
+#: fail the per-sample threshold on their own); a mean-based metric would require a higher
+#: floor to avoid being dominated by short-sample outliers.
+_MIN_GRAMMAR_TOKENS_FOR_SCORING: int = 1
+
+#: Per-sample threshold: a sample is "passing" if this fraction of its grammar-token transitions
+#: are FSM-valid (after stripping the pre-first-SEP prefix; see the walker's docstring). 0.50 is
+#: chosen so "passing" means the majority of a sample's emitted grammar tokens continue the
+#: grammar — well above anything explainable by chance (a random vocab pick gives ~6% per-step
+#: valid rate; the expected prefix-length fraction on long sequences is far below 0.10). The
+#: in-process test reaches ~0.9 routinely, so the CLI budget calibrated in the fixture should
+#: reach this threshold comfortably.
+_PER_SAMPLE_VALIDITY_THRESHOLD: float = 0.50
+
+#: Minimum fraction of held-out (subject, trajectory) samples that must clear the per-sample
+#: threshold. Using a passing-rate distributional metric (instead of "best seen") rules out the
+#: "one lucky sample masks universal garbage" failure mode a prior reviewer flagged. Short-sample
+#: outliers don't drag a passing rate around the way they drag a mean. Tuned empirically on the
+#: fixture: the current budget produces ~80% passing rate on held-out at 0.50 per-sample
+#: validity, so 0.50 leaves ample sampling-variance headroom while still being a majority
+#: requirement.
+_MIN_FRACTION_SAMPLES_PASSING: float = 0.50
 
 
 def test_grammar_cli_model_shows_grammar_signal(grammar_generated_trajectories: Path):
-    """Soft grammar-adherence check: the model's output must contain a meaningful fraction of
-    valid grammar transitions.
+    """Distributional grammar-adherence check on the held-out split.
 
-    This is a **signal** test, not a correctness test. Strict grammar validity for every emitted
-    token is covered by ``test_pattern_generation.py``'s in-process tests, which have more
-    training budget. Here we just want to confirm the CLI pipeline produced a model that learned
-    at least *something* grammatical, which rules out entire classes of CLI bugs (wrong vocab
-    indexing, off-by-one in token → code mapping, etc.) that would leave the model emitting
-    structurally-random output.
+    This is a **signal** test, not a correctness test. Strict per-token grammar validity is
+    covered by ``test_pattern_generation.py``'s in-process tests, which have more training
+    budget. Here the CLI budget is fixed, so we verify the model learned something grammatical
+    on unseen subjects — which rules out entire classes of CLI bugs (wrong vocab indexing,
+    off-by-one in token → code mapping, etc.) that would leave the model emitting
+    structurally-random output — while keeping the test robust across minor CLI changes.
 
-    Threshold: at least one trajectory across the held-out split should have >= 30% of its
-    grammar tokens be valid transitions. If every trajectory is below that, either the CLI is
-    broken or the training budget is too small.
+    Per-sample metric: (# of valid FSM transitions) / (# of grammar tokens). Walks the sequence
+    through :class:`GrammarFSM`; stops at the first invalid step and records how far it got.
+
+    Distributional assertion (not just "best seen"): at least
+    ``_MIN_FRACTION_SAMPLES_PASSING`` of held-out (subject, trajectory) pairs clear
+    ``_PER_SAMPLE_VALIDITY_THRESHOLD``. This rules out the "one lucky sample masks universal
+    garbage" failure mode of a naive "best seen" test while being robust to the
+    short-sample outliers that would destabilize a mean-based metric.
+
+    Samples with fewer than ``_MIN_GRAMMAR_TOKENS_FOR_SCORING`` tokens are excluded — they're too
+    short for the fraction to be a meaningful distributional signal.
     """
     by_split = _load_trajectories_by_split(grammar_generated_trajectories)
 
     # Restrict to held-out: train-split trajectories could exhibit apparent grammar signal from
     # memorization, which wouldn't prove the model generalized. Held-out subjects were never seen
     # during pretraining, so grammar adherence there is real learned signal.
-    best_fraction = 0.0
+    fractions: list[float] = []
     for _t, df in by_split[held_out_split].items():
         tokens_by_subject = grammar_tokens_from_output_df(df)
         for _subject_id, tokens in tokens_by_subject.items():
-            if not tokens:
+            if len(tokens) < _MIN_GRAMMAR_TOKENS_FOR_SCORING:
                 continue
             valid, total = _walk_grammar_tokens_ignoring_start(tokens)
-            fraction = valid / total
-            best_fraction = max(best_fraction, fraction)
+            if total == 0:
+                continue  # all-SEP edge case — nothing to score after the split
+            fractions.append(valid / total)
 
-    assert best_fraction >= 0.3, (
-        f"No generated trajectory in the held-out split had >= 30% valid grammar transitions "
-        f"(best seen: {best_fraction:.1%}). The CLI training + generation pipeline is probably "
-        f"broken — a correctly wired pipeline with the fixture's training budget should produce "
-        f"at least some coherent grammar output on unseen subjects."
+    assert fractions, (
+        f"No held-out samples had >= {_MIN_GRAMMAR_TOKENS_FOR_SCORING} grammar tokens. The "
+        f"fixture either generates nothing or generates only non-grammar codes — both indicate "
+        f"a broken pipeline."
+    )
+    passing_fraction = sum(f >= _PER_SAMPLE_VALIDITY_THRESHOLD for f in fractions) / len(fractions)
+
+    assert passing_fraction >= _MIN_FRACTION_SAMPLES_PASSING, (
+        f"Only {passing_fraction:.1%} of held-out samples ({len(fractions)} total) cleared the "
+        f"per-sample {_PER_SAMPLE_VALIDITY_THRESHOLD:.0%} grammar-validity threshold (required: "
+        f"{_MIN_FRACTION_SAMPLES_PASSING:.0%}). Either the CLI pipeline is broken, the training "
+        f"budget is too small, or a recent change regressed generalization."
+    )
+
+
+def test_grammar_cli_rolling_actually_rolls_and_preserves_signal(
+    grammar_generated_trajectories: Path,
+):
+    """Rolling-path specific content check.
+
+    The fixture sets ``rolling_generation.max_new_tokens=GRAMMAR_ROLLING_MAX_NEW_TOKENS`` (> the
+    model's ``max_seq_len``), so **at least one generated sample must have more new tokens than
+    a single HF generate call could produce** — otherwise rolling wasn't actually exercised even
+    though the fixture asked for it, and any signal-preservation claim about the rolling path is
+    vacuous.
+
+    We assert two things:
+
+    1. **Rolling happened.** Some held-out sample's (prompt + new) length exceeds
+       ``GRAMMAR_MAX_SEQ_LEN`` — a single-chunk call is capped at ``max_seq_len`` tokens total,
+       so exceeding that proves the sliding-window loop appended new tokens past the single-
+       chunk ceiling.
+    2. **Signal survives rolling.** Among the samples that rolled, at least a quarter still hit
+       the per-sample grammar-validity threshold. If rolling-boundary handling were broken (e.g.
+       positional-embedding discontinuity at the slide, missing EOS carry-over, demux corruption
+       across chunks), rolling samples would be *worse* than non-rolling samples. A complementary
+       signal check on just those samples catches regressions that the aggregate signal test
+       above would miss if non-rolling samples dominated the mean.
+    """
+    by_split = _load_trajectories_by_split(grammar_generated_trajectories)
+
+    rolling_sample_lengths: list[int] = []
+    rolling_validity_fractions: list[float] = []
+
+    for _t, df in by_split[held_out_split].items():
+        sorted_df = df.sort(["subject_id", "time"])
+        # Per-subject total length (prompt + new). A MEDS event row has a subject_id, so
+        # ``len(subject_df)`` directly equals the number of tokens emitted for that subject.
+        for _subject_id, subject_df in sorted_df.group_by("subject_id", maintain_order=True):
+            total_len = len(subject_df)
+            if total_len <= GRAMMAR_MAX_SEQ_LEN:
+                continue
+            rolling_sample_lengths.append(total_len)
+            codes = subject_df["code"].to_list()
+            tokens = [CODE_TO_TOKEN[c] for c in codes if c in CODE_TO_TOKEN]
+            if len(tokens) < _MIN_GRAMMAR_TOKENS_FOR_SCORING:
+                continue
+            valid, total = _walk_grammar_tokens_ignoring_start(tokens)
+            if total == 0:
+                continue
+            rolling_validity_fractions.append(valid / total)
+
+    assert rolling_sample_lengths, (
+        f"No held-out sample exceeded {GRAMMAR_MAX_SEQ_LEN} total tokens even though the fixture "
+        f"requested rolling_generation.max_new_tokens={GRAMMAR_ROLLING_MAX_NEW_TOKENS}. Either "
+        f"rolling isn't actually engaged or every subject hit EOS inside a single chunk — the "
+        f"rolling path is untested under this fixture."
+    )
+    assert rolling_validity_fractions, (
+        "Samples that rolled were all shorter than the grammar-token floor after filtering out "
+        "TIMELINE//* aux codes. The rolling path ran but produced nothing assessable."
+    )
+    rolling_passing = sum(f >= _PER_SAMPLE_VALIDITY_THRESHOLD for f in rolling_validity_fractions) / len(
+        rolling_validity_fractions
+    )
+    # Same threshold as the aggregate signal test: the rolling path shouldn't be *worse* than the
+    # non-rolling subset of the same distribution, so we expect the same passing rate to hold.
+    assert rolling_passing >= _MIN_FRACTION_SAMPLES_PASSING, (
+        f"Only {rolling_passing:.1%} of rolling held-out samples cleared the "
+        f"{_PER_SAMPLE_VALIDITY_THRESHOLD:.0%} per-sample threshold (required: "
+        f"{_MIN_FRACTION_SAMPLES_PASSING:.0%}). Rolling happened ({len(rolling_sample_lengths)} "
+        f"samples exceeded {GRAMMAR_MAX_SEQ_LEN} tokens) but grammar signal didn't survive it — "
+        f"suspect the sliding-window boundary handling."
     )
 
 

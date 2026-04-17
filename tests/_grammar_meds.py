@@ -48,14 +48,50 @@ CODE_TO_TOKEN: dict[str, int] = {code: token for token, code in TOKEN_TO_CODE.it
 #: every grammar token gets a vocabulary entry.
 GRAMMAR_CODES: list[str] = list(TOKEN_TO_CODE.values())
 
+# -------------------------------------------------------------------------
+# Shared training-hyperparameter constants (issue #105).
+#
+# These are the knobs both the pretrain fixture (``conftest.py::grammar_pretrained``) and the
+# generate fixture (``conftest.py::grammar_generated_trajectories``) need to agree on, and the
+# assertions in ``tests/test_pattern_generation_cli.py`` also read them so we don't have two
+# copies of "N=8" that silently drift apart. Module-level constants in a test helper are the
+# least-awkward way to share these; a pytest fixture wrapping them would also work but adds
+# indirection for no gain.
+# -------------------------------------------------------------------------
+#: ``max_seq_len`` override passed to ``MEICAR_pretrain``.
+GRAMMAR_MAX_SEQ_LEN: int = 16
+#: Number of attention heads. With ``GRAMMAR_MODEL_HEAD_DIM=32`` below:
+#: ``hidden_size = heads * head_dim = 128``.
+GRAMMAR_MODEL_HEADS: int = 4
+#: Per-head dim. At small scale the model is capacity-limited on grammar generalization;
+#: hidden_size=128 (plus more training data and more epochs, below) reliably produces an
+#: unambiguous distributional held-out grammar signal that survives sampling variance.
+GRAMMAR_MODEL_HEAD_DIM: int = 32
+#: Pretrain epoch budget. Sized to produce clear, reproducible signal on held-out — this test
+#: is intentionally the expensive end-to-end content regression test for the CLI pipeline; it
+#: can be skipped locally in favor of doctests during iteration and run in CI or pre-commit
+#: sweeps when content correctness is the question.
+GRAMMAR_PRETRAIN_EPOCHS: int = 400
+#: Batch size for pretrain.
+GRAMMAR_PRETRAIN_BATCH_SIZE: int = 16
+#: N trajectories generated per task-sample in the generate CLI call.
+GRAMMAR_N_TRAJECTORIES: int = 8
+#: Batch size for the generate CLI — deliberately not a multiple of ``GRAMMAR_N_TRAJECTORIES`` so
+#: the demux from #103 is stressed in its cross-sample-group configuration.
+GRAMMAR_GENERATE_BATCH_SIZE: int = 3
+#: Rolling-generation budget for the generate CLI. Chosen strictly above the single-chunk cap
+#: ``GRAMMAR_MAX_SEQ_LEN`` so at least one sample must cross a chunk boundary; see the rolling
+#: content assertion in ``test_grammar_cli_rolling_produces_sequences_beyond_single_chunk``.
+GRAMMAR_ROLLING_MAX_NEW_TOKENS: int = 30
+
 
 def build_grammar_meds_dataset(
     data_dir: Path,
     task_labels_dir: Path | None = None,
     *,
-    n_train: int = 24,
-    n_tuning: int = 4,
-    n_held_out: int = 4,
+    n_train: int = 64,
+    n_tuning: int = 8,
+    n_held_out: int = 8,
     seed: int = 0,
     max_len: int = 24,
 ) -> None:
@@ -71,7 +107,8 @@ def build_grammar_meds_dataset(
     Args:
         data_dir: Directory to write the MEDS files into. Created if it doesn't exist.
         n_train, n_tuning, n_held_out: Number of subjects per split.
-        seed: RNG seed for grammar sampling + subject-id assignment.
+        seed: RNG seed for per-subject grammar sampling. Subject ids are assigned
+            deterministically from ``range(1, 10_000)`` and do not depend on ``seed``.
         max_len: Max token length passed to ``sample_sequence`` for each subject.
     """
     data_dir = Path(data_dir)
@@ -186,9 +223,16 @@ def build_grammar_meds_dataset(
 def grammar_tokens_from_output_df(df: pl.DataFrame) -> dict[int, list[int]]:
     """Extract per-subject grammar-token sequences from a generated-trajectory parquet.
 
-    The output parquet has one row per emitted code, in emission order. We filter to the
-    grammar codes only (skipping ``TIMELINE//END``, time-delta tokens, and anything else the
-    preprocessing added) and group by ``subject_id``.
+    The output parquet has one row per emitted code, and the row-order in the parquet is taken
+    as generation order. This is the contract ``MEICAR_generate_trajectories`` writes with
+    today (rows are appended in the order tokens come out of the model), and the test suite
+    relies on it — if a future change starts sorting or re-ordering rows on write, this helper
+    will silently produce wrong sequences and the distinctness / grammar-signal assertions will
+    break. A more durable alternative would be an explicit generation-order field; that's out
+    of scope here (#105) but tracked as a follow-up.
+
+    We filter to the grammar codes only (skipping ``TIMELINE//END``, time-delta tokens, and
+    anything else the preprocessing added) and group by ``subject_id``.
 
     Args:
         df: A parquet read from ``<output_dir>/<split>/<trajectory_idx>.parquet``.

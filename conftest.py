@@ -16,6 +16,16 @@ from torch.utils.data import DataLoader
 
 from MEDS_EIC_AR.model.model import Model
 from MEDS_EIC_AR.training.module import MEICARModule
+from tests._grammar_meds import (
+    GRAMMAR_GENERATE_BATCH_SIZE,
+    GRAMMAR_MAX_SEQ_LEN,
+    GRAMMAR_MODEL_HEAD_DIM,
+    GRAMMAR_MODEL_HEADS,
+    GRAMMAR_N_TRAJECTORIES,
+    GRAMMAR_PRETRAIN_BATCH_SIZE,
+    GRAMMAR_PRETRAIN_EPOCHS,
+    GRAMMAR_ROLLING_MAX_NEW_TOKENS,
+)
 
 
 def run_and_check(cmd: list[str]) -> dict[str, str]:
@@ -256,14 +266,8 @@ def generated_trajectories_rolling(
 # ---------------------------------------------------------------------------
 
 
-# Training-hyperparameter overrides we pass to the grammar pretrain CLI. Centralized here so all
-# grammar fixtures agree on them — the CLI test file inlines references to these for its own
-# assertions (e.g. "generation output should not be wider than this max_seq_len"). See issue #105.
-_GRAMMAR_MAX_SEQ_LEN = 16
-_GRAMMAR_MODEL_HEADS = 2
-_GRAMMAR_MODEL_HEAD_DIM = 16
-_GRAMMAR_PRETRAIN_EPOCHS = 80
-_GRAMMAR_PRETRAIN_BATCH_SIZE = 8
+# Training-hyperparameter constants live in ``tests/_grammar_meds`` so pretrain and generate
+# fixtures + CLI test assertions all agree on them. See issue #105.
 
 
 @pytest.fixture(scope="session")
@@ -312,13 +316,13 @@ def grammar_pretrained(grammar_preprocessed: Path, tmp_path_factory: pytest.Temp
             "--config-name=_demo_pretrain",
             f"output_dir={output_dir!s}",
             f"datamodule.config.tensorized_cohort_dir={grammar_preprocessed!s}",
-            f"datamodule.batch_size={_GRAMMAR_PRETRAIN_BATCH_SIZE}",
-            f"trainer.max_epochs={_GRAMMAR_PRETRAIN_EPOCHS}",
+            f"datamodule.batch_size={GRAMMAR_PRETRAIN_BATCH_SIZE}",
+            f"trainer.max_epochs={GRAMMAR_PRETRAIN_EPOCHS}",
             "trainer.overfit_batches=0",
             "trainer.callbacks.early_stopping.patience=100000",
-            f"max_seq_len={_GRAMMAR_MAX_SEQ_LEN}",
-            f"lightning_module.model.gpt_kwargs.num_attention_heads={_GRAMMAR_MODEL_HEADS}",
-            f"lightning_module.model.gpt_kwargs.attention_head_dim={_GRAMMAR_MODEL_HEAD_DIM}",
+            f"max_seq_len={GRAMMAR_MAX_SEQ_LEN}",
+            f"lightning_module.model.gpt_kwargs.num_attention_heads={GRAMMAR_MODEL_HEADS}",
+            f"lightning_module.model.gpt_kwargs.attention_head_dim={GRAMMAR_MODEL_HEAD_DIM}",
         ]
     )
     return output_dir
@@ -348,10 +352,10 @@ def grammar_generated_trajectories(
             f"model_initialization_dir={grammar_pretrained!s}",
             f"datamodule.config.tensorized_cohort_dir={grammar_preprocessed!s}",
             f"datamodule.config.task_labels_dir={task_dir!s}",
-            "datamodule.batch_size=3",
+            f"datamodule.batch_size={GRAMMAR_GENERATE_BATCH_SIZE}",
             "trainer=demo",
-            "inference.N_trajectories_per_task_sample=8",
-            "rolling_generation.max_new_tokens=30",
+            f"inference.N_trajectories_per_task_sample={GRAMMAR_N_TRAJECTORIES}",
+            f"rolling_generation.max_new_tokens={GRAMMAR_ROLLING_MAX_NEW_TOKENS}",
         ]
     )
     return output_dir
