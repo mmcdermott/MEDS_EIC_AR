@@ -181,6 +181,20 @@ def generate_trajectories(cfg: DictConfig):
 
     M.generation_kwargs.update(rolling_kwargs)
 
+    # Wire ``inference.do_sample`` through to ``Model.generate``. Kept on the inference section
+    # rather than ``rolling_generation`` because ``do_sample`` is not rolling-specific — it
+    # applies to both single-chunk and rolling paths.
+    M.generation_kwargs["do_sample"] = cfg.inference.do_sample
+    if not cfg.inference.do_sample:
+        logger.warning(
+            "inference.do_sample is False — generation is greedy (argmax-per-step). This is an "
+            "anti-pattern for real trajectory generation: every sample with the same prompt "
+            "becomes identical, collapsing N_trajectories_per_task_sample's diversity value and "
+            "destroying variance estimates downstream. The only legitimate use is correctness "
+            "testing (e.g. regression tests that assert deterministic grammar-valid output). If "
+            "you're running this for any other purpose, set inference.do_sample=true."
+        )
+
     trainer = instantiate(cfg.trainer)
 
     inference = cfg.inference
