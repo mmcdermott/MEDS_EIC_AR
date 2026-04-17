@@ -2,7 +2,7 @@
 
 These tests only exercise the :class:`GenerationBackend` protocol contract and the
 :class:`HFBackend` adapter. They deliberately *do not* drive the full CLI pipeline — that's
-covered by ``test_generate_trajectories.py`` and ``test_pattern_generation_cli.py``. The goal
+covered by ``test_generate_trajectories.py``. The goal
 here is to lock in the contract that lets PR 2 (SGLang implementation) slot in without
 touching the rolling loop.
 """

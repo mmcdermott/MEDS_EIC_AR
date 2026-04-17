@@ -7,6 +7,7 @@ byte-identical to the pre-abstraction path.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -34,6 +35,9 @@ class HFBackend:
         generation_config: GenerationConfig,
         **kwargs,
     ) -> torch.Tensor:
+        if kwargs:
+            supported = inspect.signature(self.hf_model.generate).parameters
+            kwargs = {k: v for k, v in kwargs.items() if k in supported}
         out = self.hf_model.generate(
             input_ids,
             attention_mask=attention_mask,
