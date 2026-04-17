@@ -5,11 +5,14 @@ today, SGLang or another engine in the future — see issue #88) from *how* the 
 sliding-window loop, EOS bookkeeping, and token accounting work. Only the innermost
 ``generate_chunk`` call is swappable; everything else stays in :class:`MEDS_EIC_AR.model.model.Model`.
 
-A backend implementation takes a right-padded prompt tensor plus the HF-style ``GenerationConfig``
-the caller has already built and returns the newly generated tokens (the portion of the HF output
-that comes *after* the prompt). The slicing is deliberately the backend's responsibility: engines
-like SGLang produce "new tokens only" natively, and pushing the slice into the adapter keeps the
-calling code identical across backends.
+A backend implementation takes a padded prompt tensor (this repo pads on the left — see
+``configs/datamodule/generate_trajectories.yaml``'s ``padding_side: LEFT`` — and rolling-chunk
+prompts may additionally contain post-EOS padding on the right for samples that already
+finished) plus the HF-style ``GenerationConfig`` the caller has already built, and returns the
+newly generated tokens (the portion of the HF output that comes *after* the prompt). The
+slicing is deliberately the backend's responsibility: engines like SGLang produce "new tokens
+only" natively, and pushing the slice into the adapter keeps the calling code identical across
+backends.
 """
 
 from __future__ import annotations
@@ -42,13 +45,16 @@ class GenerationBackend(Protocol):
         """Run one generate pass and return only the newly generated tokens.
 
         Args:
-            input_ids: ``[B, L_in]`` right-padded prompt tokens.
+            input_ids: ``[B, L_in]`` padded prompt tokens. Padding direction is caller-defined;
+                ``attention_mask`` (``True`` at real positions) is what identifies real tokens.
             attention_mask: Optional ``[B, L_in]`` attention mask; ``True`` for real prompt tokens.
             generation_config: A fully-populated :class:`transformers.GenerationConfig` describing
                 per-call budget (``max_new_tokens``), sampling mode, pad/EOS ids, etc.
-            **kwargs: Forwarded to the underlying engine. Callers pass backend-specific options
-                here (e.g. HF ``logits_processor``); backends must tolerate unknown keys by
-                silently passing them through to the engine.
+            **kwargs: Backend-specific per-call options. Callers may provide keys that are only
+                meaningful to some backends (e.g. HF ``logits_processor``); implementations must
+                only forward options supported by the active engine and silently ignore or strip
+                the rest, since e.g. ``transformers.GenerationMixin.generate`` raises on unknown
+                kwargs.
 
         Returns:
             A ``[B, new_len]`` tensor of newly generated tokens, with the prompt slice already

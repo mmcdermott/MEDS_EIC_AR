@@ -49,13 +49,17 @@ def test_hf_backend_slices_prompt_off_output():
     """HFBackend must return *only* the newly generated tokens, not prompt + new.
 
     This is the invariant the rolling loop depends on — every accumulator in ``_rolling_generate``
-    assumes ``generate_chunk`` returns ``[B, new_len]``, not ``[B, L_in + new_len]``.
+    assumes ``generate_chunk`` returns ``[B, new_len]``, not ``[B, L_in + new_len]``. We prove
+    the contract by asserting byte-equality with ``HF_model.generate(...)`` sliced by the prompt
+    length: the adapter must be a no-op on top of the underlying call, and specifically must not
+    introduce its own sampling noise or truncation. Upper-bounding on ``max_new_tokens`` keeps
+    the test robust if a random-init tiny model happens to emit EOS early.
     """
+    from transformers import GenerationConfig
+
     model = _tiny_model()
     input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
     attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-
-    from transformers import GenerationConfig
 
     cfg = GenerationConfig(
         max_new_tokens=2,
@@ -64,11 +68,14 @@ def test_hf_backend_slices_prompt_off_output():
         pad_token_id=0,
         eos_token_id=model.HF_model.config.eos_token_id,
     )
+    expected = model.HF_model.generate(
+        input_ids=input_ids, attention_mask=attention_mask, generation_config=cfg
+    )[:, input_ids.shape[1] :]
     out = model.backend.generate_chunk(input_ids, attention_mask=attention_mask, generation_config=cfg)
 
-    # New-tokens-only shape: batch preserved, length equals the per-call budget (no early EOS
-    # expected from a randomly initialized tiny model in 2 steps, so this is exact).
-    assert out.shape == (2, 2)
+    assert out.shape[0] == input_ids.shape[0]
+    assert out.shape[1] <= cfg.max_new_tokens
+    assert torch.equal(out, expected)
 
 
 class _RecordingBackend:
