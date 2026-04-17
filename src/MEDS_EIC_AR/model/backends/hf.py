@@ -7,6 +7,7 @@ byte-identical to the pre-abstraction path.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -24,16 +25,14 @@ class HFBackend:
 
     **On the ``**kwargs`` forwarding policy.** The :class:`GenerationBackend` protocol says
     implementations must "only forward options supported by the active engine and silently
-    ignore or strip the rest." Here the "active engine" is HF ``generate``, whose
-    :class:`~transformers.GenerationMixin` accepts a broad ``**kwargs`` set — anything the
-    underlying model's ``forward`` accepts, plus all generation-control kwargs like
-    ``logits_processor`` / ``stopping_criteria``. We therefore forward ``**kwargs`` unchanged
-    rather than maintaining a brittle whitelist that would drift across transformers releases.
-    This satisfies the protocol because HF's supported-kwarg set is a superset of what callers
-    realistically pass through ``Model.generate``. The obligation to *strip* applies
-    asymmetrically to backends whose engine accepts a narrower set than HF — an SGLang adapter
-    (PR 2, issue #88) will need to drop HF-specific keys like ``logits_processor`` before
-    invoking ``sgl.Engine.generate``.
+    ignore or strip the rest." HF's ``generate`` accepts a broad set (anything in
+    :class:`~transformers.GenerationMixin`'s signature plus model-specific ``forward`` kwargs),
+    so in practice almost any caller-provided key is either accepted or doesn't matter. But HF
+    *does* raise on truly unknown kwargs, and future callers may pass backend-agnostic keys
+    that are meaningful to other backends (e.g. an SGLang-specific throughput knob) but not to
+    HF. To be robust, we filter ``**kwargs`` down to HF-accepted parameter names via
+    :func:`inspect.signature` before forwarding. This keeps the forward path resilient to
+    multi-backend calling code without us hand-maintaining a whitelist.
     """
 
     def __init__(self, hf_model: PreTrainedModel):
@@ -47,6 +46,9 @@ class HFBackend:
         generation_config: GenerationConfig,
         **kwargs,
     ) -> torch.Tensor:
+        if kwargs:
+            supported = inspect.signature(self.hf_model.generate).parameters
+            kwargs = {k: v for k, v in kwargs.items() if k in supported}
         out = self.hf_model.generate(
             input_ids,
             attention_mask=attention_mask,
