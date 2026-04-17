@@ -14,6 +14,8 @@ from transformers import (
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from MEDS_EIC_AR.model.backends import GenerationBackend, HFBackend
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -182,6 +184,12 @@ class Model(torch.nn.Module):
 
         self.HF_model = AutoModelForCausalLM.from_config(self.HF_model_config, **extra_kwargs)
 
+        # Generation backend abstraction (issue #88). The default HF backend is a thin wrapper
+        # that produces byte-identical behavior to the pre-abstraction direct ``HF_model.generate``
+        # call. Alternative backends (SGLang, …) can be swapped in via :meth:`set_backend`
+        # without touching the rolling loop.
+        self._backend: GenerationBackend = HFBackend(self.HF_model)
+
         self.do_demo = do_demo
         if self.do_demo:
             self.forward = self._forward_demo
@@ -199,6 +207,20 @@ class Model(torch.nn.Module):
             "precision": precision,
             "do_demo": do_demo,
         }
+
+    @property
+    def backend(self) -> GenerationBackend:
+        """The active generation backend used by :meth:`_generate_chunk`."""
+        return self._backend
+
+    def set_backend(self, backend: GenerationBackend) -> None:
+        """Swap in an alternative generation backend.
+
+        Intended for the SGLang adapter (issue #88) and for injecting deterministic fakes in
+        tests. No-op on its own — rolling-loop bookkeeping is backend-agnostic, so behavior is
+        fully determined by the backend's ``generate_chunk`` implementation.
+        """
+        self._backend = backend
 
     @property
     def max_seq_len(self) -> int:
@@ -876,15 +898,16 @@ class Model(torch.nn.Module):
         do_sample: bool,
         **kwargs,
     ) -> torch.Tensor:
-        """Run one ``HF_model.generate`` pass and return only the newly generated tokens.
+        """Run one generate pass via :attr:`backend` and return only the newly generated tokens.
 
         Shared between :meth:`generate`'s single-chunk path and :meth:`_rolling_generate`'s per-chunk
         loop so both paths build the ``GenerationConfig`` the same way and apply the same prompt-
-        stripping convention. Within a single call HF already fills positions after the first EOS per
-        row with ``pad_id`` (verified empirically on ``GPTNeoXForCausalLM``), so neither caller needs
-        to do post-EOS truncation of the per-chunk return value. ``eos_token_id`` is read from
-        ``self.HF_model.config.eos_token_id`` rather than passed in, since both callers always want the
-        model's configured EOS.
+        stripping convention. The actual engine call is delegated to :attr:`backend` (HF by default;
+        see issue #88). Within a single HF call the engine already fills positions after the first
+        EOS per row with ``pad_id`` (verified empirically on ``GPTNeoXForCausalLM``), so neither
+        caller needs to do post-EOS truncation of the per-chunk return value. ``eos_token_id`` is
+        read from ``self.HF_model.config.eos_token_id`` rather than passed in, since both callers
+        always want the model's configured EOS.
 
         Args:
             input_ids: ``[B, L_in]`` tensor of prompt tokens.
@@ -892,7 +915,7 @@ class Model(torch.nn.Module):
             max_new_tokens: Per-call budget passed into ``GenerationConfig``.
             pad_id: Pad token id. Comes from the ``batch`` at call time, not the model config.
             do_sample: Whether to sample (``True``) or greedy-decode (``False``).
-            **kwargs: Forwarded to ``HF_model.generate``.
+            **kwargs: Forwarded to the active backend's ``generate_chunk``.
 
         Returns:
             A ``[B, new_len]`` tensor of newly generated tokens, sliced off the prompt.
@@ -906,10 +929,9 @@ class Model(torch.nn.Module):
             bos_token_id=None,
             eos_token_id=self.HF_model.config.eos_token_id,
         )
-        out = self.HF_model.generate(
+        return self._backend.generate_chunk(
             input_ids,
             attention_mask=attention_mask,
             generation_config=generation_config,
             **kwargs,
         )
-        return out[:, input_ids.size(1) :]
