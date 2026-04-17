@@ -273,6 +273,12 @@ def _run_grammar_generate(
             f"datamodule.batch_size={batch_size}",
             "trainer=demo",
             f"inference.N_trajectories_per_task_sample={n_trajectories}",
+            # Restrict to held_out only. ``_demo_generate_trajectories``'s default is to
+            # generate for all three splits, but the content tests in ``test_cli.py`` only
+            # consume held_out; generating on ~``n_train`` train subjects x N trajectories is
+            # pure overhead for the grammar fixture. Structural tests (which iterate all
+            # splits) read this list back via the fixture ``grammar_generated_splits``.
+            "inference.generate_for_splits=[held_out]",
             f"inference.do_sample={str(do_sample).lower()}",
             f"rolling_generation.max_new_tokens={rolling_max_new_tokens}",
         ]

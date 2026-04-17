@@ -42,7 +42,7 @@ import subprocess
 from typing import TYPE_CHECKING
 
 import polars as pl
-from meds import held_out_split, train_split, tuning_split
+from meds import held_out_split
 
 from tests.grammar._grammar import GrammarFSM
 from tests.grammar._meds import (
@@ -75,15 +75,24 @@ _MIN_FRACTION_SAMPLES_PASSING: float = 0.50
 
 
 def _load_trajectories_by_split(root: Path) -> dict[str, dict[str, pl.DataFrame]]:
+    """Load per-split generated-trajectory parquets under ``root``.
+
+    The grammar fixtures restrict ``inference.generate_for_splits`` to ``[held_out]`` only
+    (see ``tests/grammar/conftest.py::_run_grammar_generate`` for why), so we iterate the
+    subdirectories actually present on disk rather than hardcoding the full three-split list.
+    Each subdirectory is expected to contain ``{0, 1, ..., N-1}.parquet`` for the N trajectories.
+    """
     out: dict[str, dict[str, pl.DataFrame]] = {}
-    for split in (train_split, tuning_split, held_out_split):
-        split_dir = root / split
-        out[split] = {}
-        for fp in sorted(split_dir.glob("*.parquet")):
-            df = pl.read_parquet(fp, use_pyarrow=True)
-            assert len(df) > 0, f"Empty parquet at {fp}"
-            out[split][fp.stem] = df
-        assert out[split], f"No parquets found under {split_dir}"
+    for split_dir in sorted(root.iterdir()):
+        if not split_dir.is_dir() or split_dir.name.startswith("."):
+            continue
+        parquets = sorted(split_dir.glob("*.parquet"))
+        if not parquets:
+            continue
+        out[split_dir.name] = {fp.stem: pl.read_parquet(fp, use_pyarrow=True) for fp in parquets}
+        for stem, df in out[split_dir.name].items():
+            assert len(df) > 0, f"Empty parquet at {split_dir / f'{stem}.parquet'}"
+    assert out, f"No per-split subdirectories under {root}"
     return out
 
 
@@ -118,7 +127,7 @@ def _walk_generated_strictly(prompt_tokens: list[int], generated_tokens: list[in
 def test_grammar_cli_produces_n_parquets_per_split(
     grammar_generated_trajectories: Path, grammar_n_trajectories: int
 ):
-    """N trajectories x 3 splits x correct shape — the bedrock structural signal."""
+    """N trajectories per generated split x correct shape — the bedrock structural signal."""
     by_split = _load_trajectories_by_split(grammar_generated_trajectories)
 
     for split, trajectories in by_split.items():
