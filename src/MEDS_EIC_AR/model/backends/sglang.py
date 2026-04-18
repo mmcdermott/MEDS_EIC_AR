@@ -257,11 +257,21 @@ class SGLangBackend:
         prompts = _strip_padding_to_lists(input_ids, attention_mask)
 
         # Map HF ``GenerationConfig`` → SGLang ``SamplingParams``. Intentional translations:
-        #   - ``do_sample=False`` → ``temperature=0.0`` (SGLang uses temperature=0 as greedy;
-        #     no separate boolean).
+        #   - ``do_sample=False`` → ``temperature=0.0`` regardless of the caller's configured
+        #     temperature (SGLang uses ``temperature=0`` as its greedy signal; no separate
+        #     boolean). When ``do_sample=True`` the caller's ``generation_config.temperature``
+        #     is honored. This matches HF's behavior: ``temperature`` is a no-op when
+        #     ``do_sample=False``.
         #   - ``eos_token_id`` → ``stop_token_ids=[eos]``. SGLang supports a list; we pass a
         #     single-element list to mirror HF's single-eos semantics here.
-        temperature = 1.0 if generation_config.do_sample else 0.0
+        # ``top_p``/``top_k`` are deliberately not translated yet — none of today's callers
+        # set them (see ``Model._generate_chunk`` — the only call site), and translating them
+        # is properly part of #82's logits-processor work.
+        if generation_config.do_sample:
+            configured_temp = getattr(generation_config, "temperature", None)
+            temperature = float(configured_temp) if configured_temp is not None else 1.0
+        else:
+            temperature = 0.0
         sampling_params = self._sgl.SamplingParams(
             max_new_tokens=generation_config.max_new_tokens,
             temperature=temperature,

@@ -61,6 +61,13 @@ def export_lightning_to_hf_dir(module: MEICARModule, out_dir: Path | str) -> Pat
     lands in ``<out_dir>.tmp/`` and is atomically renamed into place on success; the losing
     writer cleans up its tmp dir.
 
+    **Concurrent reader caveat**: the atomic rename protects concurrent *writers*, but a
+    reader already inside ``from_pretrained(out_dir)`` when a second writer renames a fresh
+    directory over ``out_dir`` can race (the reader may see a half-open file handle).
+    Current callers (``MEICAR_generate_trajectories`` CLI, one process per invocation) don't
+    trigger this; if a future parallel-split generation tool does, add a ``filelock`` guard
+    at the call site.
+
     Args:
         module: Lightning module whose ``model.HF_model`` will be exported.
         out_dir: Target directory. Created if absent.

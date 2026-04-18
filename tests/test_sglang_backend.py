@@ -311,6 +311,57 @@ def test_do_sample_true_uses_nonzero_temperature():
     assert sp["temperature"] > 0.0
 
 
+def test_do_sample_true_honors_caller_temperature():
+    """Caller-provided ``temperature`` on the GenerationConfig must reach SGLang under sampling.
+
+    Regression guard against a prior revision where SGLangBackend hard-coded ``temperature=1.0``
+    for the sampling branch, silently overriding the caller's choice. HF's behavior is that
+    ``temperature`` is honored when ``do_sample=True`` and ignored when ``do_sample=False``;
+    this test locks in the same semantics for SGLang.
+    """
+    backend, fake = _make_backend()
+    fake.last_engine.set_next_outputs([{"output_ids": [1]}])
+    input_ids = torch.tensor([[4]], dtype=torch.long)
+    mask = torch.tensor([[1]], dtype=torch.bool)
+    cfg = GenerationConfig(
+        max_new_tokens=1,
+        do_sample=True,
+        temperature=0.7,
+        pad_token_id=0,
+        eos_token_id=37,
+    )
+
+    backend.generate_chunk(input_ids, attention_mask=mask, generation_config=cfg)
+
+    sp = fake.last_engine.generate_calls[0]["sampling_params"]
+    assert sp["temperature"] == 0.7
+
+
+def test_do_sample_false_ignores_caller_temperature():
+    """``do_sample=False`` must always map to ``temperature=0.0`` regardless of caller config.
+
+    Matches HF's behavior (temperature is meaningless under greedy). Prevents a subtle bug
+    where a caller passing ``do_sample=False, temperature=2.0`` could inadvertently enable
+    sampling inside SGLang by leaking the non-zero temperature through.
+    """
+    backend, fake = _make_backend()
+    fake.last_engine.set_next_outputs([{"output_ids": [1]}])
+    input_ids = torch.tensor([[4]], dtype=torch.long)
+    mask = torch.tensor([[1]], dtype=torch.bool)
+    cfg = GenerationConfig(
+        max_new_tokens=1,
+        do_sample=False,
+        temperature=2.0,
+        pad_token_id=0,
+        eos_token_id=37,
+    )
+
+    backend.generate_chunk(input_ids, attention_mask=mask, generation_config=cfg)
+
+    sp = fake.last_engine.generate_calls[0]["sampling_params"]
+    assert sp["temperature"] == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
