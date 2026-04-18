@@ -168,7 +168,15 @@ class Model(torch.nn.Module):
         for key, val in gpt_kwargs.items():
             if key == "attention_head_dim":
                 # Derived into ``hidden_size`` via the config's ``int_prod`` expression; Llama
-                # infers ``head_dim`` from ``hidden_size // num_attention_heads`` itself.
+                # infers ``head_dim`` from ``hidden_size // num_attention_heads`` itself. Logging at
+                # debug level so a caller who passes this via the Python API (bypassing the YAML
+                # ``int_prod`` resolver) can see why it had no effect.
+                logger.debug(
+                    "Ignoring gpt_kwargs key 'attention_head_dim' — it is consumed by the YAML "
+                    "``int_prod`` resolver to derive ``hidden_size`` and has no direct LlamaConfig "
+                    "equivalent. Set ``head_dim`` directly if you want to override Llama's "
+                    "``hidden_size // num_attention_heads`` default."
+                )
                 continue
             if not hasattr(self.HF_model_config, key):
                 raise ValueError(
@@ -187,9 +195,15 @@ class Model(torch.nn.Module):
         if "num_key_value_heads" not in gpt_kwargs:
             self.HF_model_config.num_key_value_heads = self.HF_model_config.num_attention_heads
         if "head_dim" not in gpt_kwargs:
-            self.HF_model_config.head_dim = (
-                self.HF_model_config.hidden_size // self.HF_model_config.num_attention_heads
-            )
+            hidden = self.HF_model_config.hidden_size
+            heads = self.HF_model_config.num_attention_heads
+            if hidden % heads != 0:
+                raise ValueError(
+                    f"hidden_size ({hidden}) must be divisible by num_attention_heads ({heads}) to "
+                    "derive ``head_dim`` implicitly. Pass ``head_dim`` explicitly in gpt_kwargs, or "
+                    "adjust ``hidden_size`` / ``num_attention_heads`` so the division is exact."
+                )
+            self.HF_model_config.head_dim = hidden // heads
 
         extra_kwargs = {"dtype": self.PRECISION_TO_MODEL_WEIGHTS_DTYPE.get(precision)}
 
