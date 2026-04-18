@@ -59,5 +59,12 @@ class GenerationBackend(Protocol):
         Returns:
             A ``[B, new_len]`` tensor of newly generated tokens, with the prompt slice already
             stripped. ``new_len`` is ``generation_config.max_new_tokens`` or less if the engine
-            emitted EOS earlier.
+            emitted EOS earlier. **Per-row post-EOS invariant:** if a row emits
+            ``generation_config.eos_token_id`` before the end of the returned chunk, all later
+            positions in that same row must be filled with ``generation_config.pad_token_id``
+            (or the row may be truncated so those positions do not exist). The rolling loop in
+            ``Model._rolling_generate`` relies on this — it does not re-scan the returned chunk
+            for post-EOS truncation, only masks rows that finished in *earlier* chunks.
+            :class:`HFBackend` gets this for free because HF's ``generate`` pads post-EOS
+            natively; non-HF backends must honor it explicitly.
         """

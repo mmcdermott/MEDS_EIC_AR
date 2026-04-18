@@ -903,11 +903,14 @@ class Model(torch.nn.Module):
         Shared between :meth:`generate`'s single-chunk path and :meth:`_rolling_generate`'s per-chunk
         loop so both paths build the ``GenerationConfig`` the same way and apply the same prompt-
         stripping convention. The actual engine call is delegated to :attr:`backend` (HF by default;
-        see issue #88). Within a single HF call the engine already fills positions after the first
-        EOS per row with ``pad_id`` (verified empirically on ``GPTNeoXForCausalLM``), so neither
-        caller needs to do post-EOS truncation of the per-chunk return value. ``eos_token_id`` is
-        read from ``self.HF_model.config.eos_token_id`` rather than passed in, since both callers
-        always want the model's configured EOS.
+        see issue #88). The :class:`~MEDS_EIC_AR.model.backends.GenerationBackend` contract requires
+        backends to return chunk outputs such that, within a single call, positions after the first
+        EOS per row are already filled with ``pad_id`` — so neither caller here has to do post-EOS
+        truncation of the per-chunk return value. :class:`~MEDS_EIC_AR.model.backends.HFBackend`
+        satisfies this for free because HF's ``generate`` pads post-EOS natively (verified
+        empirically on ``GPTNeoXForCausalLM``); non-HF backends must honor the invariant
+        explicitly. ``eos_token_id`` is read from ``self.HF_model.config.eos_token_id`` rather than
+        passed in, since both callers always want the model's configured EOS.
 
         Args:
             input_ids: ``[B, L_in]`` tensor of prompt tokens.
