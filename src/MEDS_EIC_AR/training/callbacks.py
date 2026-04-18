@@ -23,6 +23,12 @@ class GenerationSpeedLogger(Callback):
     def on_predict_end(self, trainer, pl_module) -> None:
         if not self._epoch_times:
             return
+        # Rank-gate: in distributed predict, every rank hits ``on_predict_end``. Writing
+        # ``log_metrics`` from every rank produces duplicated metric writes and races some
+        # backends (e.g., MLflow), so only rank-zero logs. ``_epoch_times`` measurement itself
+        # is per-rank and independent, which is fine — we just restrict the *write*.
+        if not trainer.is_global_zero:
+            return
         avg_epoch_time = sum(self._epoch_times) / len(self._epoch_times)
         metrics = {"predict/avg_epoch_time_sec": avg_epoch_time}
         for logger in _ensure_logger_sequence(trainer.loggers):

@@ -405,12 +405,27 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
         >>> disk = '''
         ... loggers:
         ...   "mlflow_run_id.txt": abc
+        ...   "mlflow_tracking_uri.txt": file:///tmp/mlruns_original
         ...   "wandb_run_id.txt": xyz
         ... '''
         >>> with yaml_disk(disk) as run_dir:
         ...     apply_saved_logger_run_ids(cfg, run_dir)
-        ...     print(cfg.loggers[0]["run_id"], cfg.loggers[1]["id"], cfg.loggers[1]["resume"])
-        abc xyz allow
+        ...     print(cfg.loggers[0]["run_id"], cfg.loggers[0]["tracking_uri"])
+        ...     print(cfg.loggers[1]["id"], cfg.loggers[1]["resume"])
+        abc file:///tmp/mlruns_original
+        xyz allow
+
+    A caller who explicitly set ``tracking_uri`` in the current config wins — the saved value
+    is only restored when the field is absent. This is the escape hatch for "yes, log into a
+    new store" while keeping the default "resume into the original store" behavior:
+
+        >>> cfg = DictConfig(
+        ...     {"loggers": [{"_target_": "MLFlowLogger", "tracking_uri": "file:///tmp/new_store"}]}
+        ... )
+        >>> with yaml_disk(disk) as run_dir:
+        ...     apply_saved_logger_run_ids(cfg, run_dir)
+        ...     print(cfg.loggers[0]["run_id"], cfg.loggers[0]["tracking_uri"])
+        abc file:///tmp/new_store
     """
 
     if trainer_cfg is None:
@@ -435,6 +450,16 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
             fp = log_dir / "mlflow_run_id.txt"
             if fp.is_file() and not logger_cfg.get("run_id"):
                 logger_cfg["run_id"] = fp.read_text().strip()
+            # Restore ``tracking_uri`` too. An MLflow ``run_id`` is only resolvable against the
+            # tracking store it was created in — in this repo the default tracking_uri is derived
+            # from ``${log_dir}`` (i.e. the current run's ``output_dir``), so reusing a saved
+            # run_id in a fresh output dir without also restoring the original tracking_uri sends
+            # the resumed run to the wrong store (or 404s). If the caller explicitly set
+            # ``tracking_uri`` in the current config, we don't override it — that's the escape
+            # hatch for "yes, I really do want to log into a new store." See PR #73 review.
+            tracking_fp = log_dir / "mlflow_tracking_uri.txt"
+            if tracking_fp.is_file() and not logger_cfg.get("tracking_uri"):
+                logger_cfg["tracking_uri"] = tracking_fp.read_text().strip()
 
 
 def save_logger_run_ids(loggers: Sequence[Logger], run_dir: Path) -> None:
@@ -480,6 +505,16 @@ def save_logger_run_ids(loggers: Sequence[Logger], run_dir: Path) -> None:
     for logger in loggers:
         if is_mlflow_logger(logger):
             (log_dir / "mlflow_run_id.txt").write_text(str(logger.run_id))
+            # Persist ``tracking_uri`` too so ``apply_saved_logger_run_ids`` can attach the
+            # resumed run back to the store it was created in. Attribute is
+            # ``_tracking_uri`` (private) on Lightning's MLFlowLogger; fall back to any
+            # public ``tracking_uri`` if a future Lightning version exposes one. Missing
+            # attribute is survivable — the resume call will work in the common case where
+            # the current tracking_uri happens to match the saved one, and fail with a
+            # clear error otherwise.
+            tracking_uri = getattr(logger, "_tracking_uri", None) or getattr(logger, "tracking_uri", None)
+            if tracking_uri:
+                (log_dir / "mlflow_tracking_uri.txt").write_text(str(tracking_uri))
             continue
 
         if is_wandb_logger(logger):
