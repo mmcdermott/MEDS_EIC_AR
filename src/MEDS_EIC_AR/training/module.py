@@ -268,6 +268,11 @@ class MEICARModule(L.LightningModule):
     def _is_norm_bias_param(n: str) -> bool:
         """Checks if a parameter name corresponds to a bias or normalization layer.
 
+        The ``norm`` stem is matched with an optional ``layer_?`` prefix so the pattern covers both the
+        older NeoX naming (``final_layer_norm.weight``, ``input_layernorm.weight``) and Llama-style
+        RMSNorm names where the final norm is just ``norm.weight``. Without the bare-``norm`` match,
+        Llama's final RMSNorm would incorrectly end up in the weight-decay group.
+
         Args:
             n: The name of the parameter.
 
@@ -283,10 +288,12 @@ class MEICARModule(L.LightningModule):
             True
             >>> MEICARModule._is_norm_bias_param("model.decoder.weight")
             False
-            >>> MEICARModule._is_norm_bias_param("model.HF_model.gpt_neox.final_layer_norm.weight")
+            >>> MEICARModule._is_norm_bias_param("model.HF_model.model.layers.0.input_layernorm.weight")
+            True
+            >>> MEICARModule._is_norm_bias_param("model.HF_model.model.norm.weight")
             True
         """
-        return bool(re.search(r"(bias|layer(_?)norm(\d*)\.weight)", n, re.IGNORECASE))
+        return bool(re.search(r"(bias|(layer_?)?norm(\d*)\.weight)", n, re.IGNORECASE))
 
     def _norm_bias_param_names(self) -> Iterator[str]:
         """Yields the names of parameters corresponding to the bias and normalization layers.
@@ -294,25 +301,16 @@ class MEICARModule(L.LightningModule):
         These parameters should not be subject to weight decay by the optimizer.
 
         Examples:
+            Llama has no biases by default (``attention_bias=False``, MLP/LM-head biases absent) and
+            uses RMSNorm, so the only matches are the three norm weights per layer plus the final
+            ``model.norm.weight``:
+
             >>> list(pretrained_module._norm_bias_param_names())
-            ['model.HF_model.gpt_neox.layers.0.input_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.0.input_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.0.post_attention_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.0.post_attention_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.0.attention.query_key_value.bias',
-             'model.HF_model.gpt_neox.layers.0.attention.dense.bias',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_h_to_4h.bias',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_4h_to_h.bias',
-             'model.HF_model.gpt_neox.layers.1.input_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.1.input_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.1.post_attention_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.1.post_attention_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.1.attention.query_key_value.bias',
-             'model.HF_model.gpt_neox.layers.1.attention.dense.bias',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_h_to_4h.bias',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_4h_to_h.bias',
-             'model.HF_model.gpt_neox.final_layer_norm.weight',
-             'model.HF_model.gpt_neox.final_layer_norm.bias']
+            ['model.HF_model.model.layers.0.input_layernorm.weight',
+             'model.HF_model.model.layers.0.post_attention_layernorm.weight',
+             'model.HF_model.model.layers.1.input_layernorm.weight',
+             'model.HF_model.model.layers.1.post_attention_layernorm.weight',
+             'model.HF_model.model.norm.weight']
         """
 
         for name, _ in self.named_parameters():
@@ -331,17 +329,28 @@ class MEICARModule(L.LightningModule):
         These parameters should be subject to weight decay by the optimizer.
 
         Examples:
+            Under Llama the non-norm/bias params are the token embedding, the four attention
+            projections (``q_proj``/``k_proj``/``v_proj``/``o_proj``) per layer, the three
+            SwiGLU MLP projections (``gate_proj``/``up_proj``/``down_proj``) per layer, and the
+            output ``lm_head`` — no fused ``query_key_value``, no biases:
+
             >>> list(pretrained_module._non_norm_bias_param_names())
-            ['model.HF_model.gpt_neox.embed_in.weight',
-             'model.HF_model.gpt_neox.layers.0.attention.query_key_value.weight',
-             'model.HF_model.gpt_neox.layers.0.attention.dense.weight',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_h_to_4h.weight',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_4h_to_h.weight',
-             'model.HF_model.gpt_neox.layers.1.attention.query_key_value.weight',
-             'model.HF_model.gpt_neox.layers.1.attention.dense.weight',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_h_to_4h.weight',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_4h_to_h.weight',
-             'model.HF_model.embed_out.weight']
+            ['model.HF_model.model.embed_tokens.weight',
+             'model.HF_model.model.layers.0.self_attn.q_proj.weight',
+             'model.HF_model.model.layers.0.self_attn.k_proj.weight',
+             'model.HF_model.model.layers.0.self_attn.v_proj.weight',
+             'model.HF_model.model.layers.0.self_attn.o_proj.weight',
+             'model.HF_model.model.layers.0.mlp.gate_proj.weight',
+             'model.HF_model.model.layers.0.mlp.up_proj.weight',
+             'model.HF_model.model.layers.0.mlp.down_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.q_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.k_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.v_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.o_proj.weight',
+             'model.HF_model.model.layers.1.mlp.gate_proj.weight',
+             'model.HF_model.model.layers.1.mlp.up_proj.weight',
+             'model.HF_model.model.layers.1.mlp.down_proj.weight',
+             'model.HF_model.lm_head.weight']
         """
 
         for name, _ in self.named_parameters():
