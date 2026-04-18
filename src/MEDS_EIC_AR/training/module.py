@@ -13,6 +13,7 @@ from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from ..generation.repeated_dataset import PredictBatch
 from ..model import Model
 from .metrics import NextCodeMetrics
 
@@ -204,6 +205,14 @@ class MEICARModule(L.LightningModule):
         self.metrics = metrics
         self.optimizer_factory = optimizer
         self.LR_scheduler_factory = LR_scheduler
+
+        # Per-prediction generation kwargs (e.g. rolling_generation.{max_new_tokens, rolling_context_size}).
+        # Intentionally NOT passed to save_hyperparameters: these are set at the start of each
+        # MEICAR_generate_trajectories CLI invocation from that run's Hydra config, not baked into the
+        # training-time checkpoint. A saved checkpoint can be reloaded and then driven with different
+        # generation settings (different rolling budgets, different stopping criteria) without having to
+        # reconcile stale training-era values.
+        self.generation_kwargs: dict[str, Any] = {}
 
         self.save_hyperparameters(
             {
@@ -439,6 +448,29 @@ class MEICARModule(L.LightningModule):
 
         return {"optimizer": optimizer, "lr_scheduler": LR_config}
 
-    def predict_step(self, batch: MEDSTorchBatch):
-        """Produces generated trajectories for a given batch of data."""
-        return self.model.generate(batch)
+    def predict_step(self, batch: PredictBatch) -> dict[str, torch.Tensor]:
+        """Produces generated trajectories for a given batch of data.
+
+        Expects the :data:`PredictBatch` shape yielded by
+        :func:`MEDS_EIC_AR.generation.collate_with_meta` — a three-tuple
+        ``(batch, subject_idxs, trajectory_idxs)`` — as produced by the expanded dataset that
+        ``MEICAR_generate_trajectories`` builds. The bare-``MEDSTorchBatch`` form supported by the
+        prior iteration is no longer accepted; callers wanting a single trajectory per subject
+        should set ``n_trajectories=1`` on :class:`RepeatedPredictionDataset`, which still yields
+        this tuple shape (just with a trivial ``trajectory_idxs`` axis).
+
+        Any keyword arguments stashed on ``self.generation_kwargs`` (typically set from the
+        top-level ``generate_trajectories`` CLI before ``trainer.predict`` is invoked) are
+        forwarded to :meth:`MEDS_EIC_AR.model.model.Model.generate`. This is how
+        rolling-generation settings such as ``max_new_tokens`` and ``rolling_context_size`` reach
+        the model at prediction time without going through the saved Lightning hparams.
+
+        Returns a dict with:
+            - ``tokens``: ``[B, L]`` generated-token tensor from the model.
+            - ``subject_idxs``: ``[B]`` long tensor, which base-dataset subject each row came from.
+            - ``trajectory_idxs``: ``[B]`` long tensor, which of the N trajectories-per-subject
+              each row corresponds to.
+        """
+        mdata_batch, subject_idxs, trajectory_idxs = batch
+        tokens = self.model.generate(mdata_batch, **self.generation_kwargs)
+        return {"tokens": tokens, "subject_idxs": subject_idxs, "trajectory_idxs": trajectory_idxs}

@@ -2,6 +2,7 @@ import logging
 import os
 import shutil
 from datetime import UTC, datetime
+from functools import partial
 from importlib.resources import files
 from pathlib import Path
 
@@ -11,12 +12,19 @@ import torch
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from meds import held_out_split, train_split, tuning_split
-from meds_torchdata import MEDSTorchDataConfig
+from meds_torchdata import MEDSTorchBatch, MEDSTorchDataConfig
 from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
 from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
 
-from .generation import format_trajectories, get_timeline_end_token_idx
+from .generation import (
+    RepeatedPredictionDataset,
+    collate_with_meta,
+    format_trajectories,
+    get_timeline_end_token_idx,
+    validate_rolling_cfg,
+)
 from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
@@ -134,8 +142,62 @@ def generate_trajectories(cfg: DictConfig):
 
     D = instantiate(cfg.datamodule)
 
+    # Validate rolling-generation config early — before loading the checkpoint and before running any
+    # batches — so bad values (zero or negative budgets) fail fast with a clear message instead of
+    # surfacing deep inside ``Model._rolling_generate`` after minutes of setup. The in-method checks in
+    # ``_rolling_generate`` stay as a defensive backstop for direct library callers that bypass this CLI.
+    rolling_kwargs = validate_rolling_cfg(cfg.get("rolling_generation", None))
+    rolling_requested = "max_new_tokens" in rolling_kwargs
+
     M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path))
     M.eval()
+
+    # Auto-populate ``eos_token_id`` on the loaded checkpoint if it's unset. Models pretrained through
+    # ``MEICAR_pretrain`` already have it populated from ``get_timeline_end_token_idx(D.config)``, but
+    # older checkpoints (or models instantiated directly) may not. Doing this here means every
+    # checkpoint driven through the generation CLI has a usable eos for both single-chunk and rolling
+    # generation without requiring manual config intervention.
+    if M.model.HF_model.config.eos_token_id is None:
+        timeline_end_idx = get_timeline_end_token_idx(D.config)
+        logger.info(
+            f"Checkpoint {cfg.ckpt_path} has no eos_token_id set; defaulting to "
+            f"get_timeline_end_token_idx(dataset_config) = {timeline_end_idx}."
+        )
+        M.model.HF_model.config.eos_token_id = timeline_end_idx
+
+    # Fail fast if rolling was requested but eos is still unset (e.g. dataset config doesn't have a
+    # TIMELINE//END token) or collides with PAD_INDEX. This is the same invariant ``_rolling_generate``
+    # enforces internally, hoisted to config-load time so we don't spend any compute before diagnosing.
+    if rolling_requested:
+        eos_id = M.model.HF_model.config.eos_token_id
+        if eos_id is None:
+            raise ValueError(
+                "rolling_generation.max_new_tokens is set but the model's eos_token_id could not be "
+                "auto-populated from the dataset config. Rolling generation needs a valid eos token "
+                "to handle cross-chunk stopping."
+            )
+        if eos_id == MEDSTorchBatch.PAD_INDEX:
+            raise ValueError(
+                f"Rolling generation requires eos_token_id ({eos_id}) to differ from "
+                f"MEDSTorchBatch.PAD_INDEX ({MEDSTorchBatch.PAD_INDEX}). The finished-mask and "
+                "post-EOS truncation would otherwise collapse onto padding."
+            )
+
+    M.generation_kwargs.update(rolling_kwargs)
+
+    # Wire ``inference.do_sample`` through to ``Model.generate``. Kept on the inference section
+    # rather than ``rolling_generation`` because ``do_sample`` is not rolling-specific — it
+    # applies to both single-chunk and rolling paths.
+    M.generation_kwargs["do_sample"] = cfg.inference.do_sample
+    if not cfg.inference.do_sample:
+        logger.warning(
+            "inference.do_sample is False — generation is greedy (argmax-per-step). This is an "
+            "anti-pattern for real trajectory generation: every sample with the same prompt "
+            "becomes identical, collapsing N_trajectories_per_task_sample's diversity value and "
+            "destroying variance estimates downstream. The only legitimate use is correctness "
+            "testing (e.g. regression tests that assert deterministic grammar-valid output). If "
+            "you're running this for any other purpose, set inference.do_sample=true."
+        )
 
     apply_saved_logger_run_ids(cfg.trainer, Path(cfg.model_initialization_dir))
     trainer = instantiate(cfg.trainer)
@@ -145,34 +207,91 @@ def generate_trajectories(cfg: DictConfig):
     if cfg.get("seed", None):
         seed_everything(cfg.get("seed", 1), workers=True)
 
+    n_trajectories = inference.N_trajectories_per_task_sample
+
     for split in inference.generate_for_splits:
         if split == train_split:
-            dataloader = D.train_dataloader()
+            base_loader = D.train_dataloader()
         elif split == tuning_split:
-            dataloader = D.val_dataloader()
+            base_loader = D.val_dataloader()
         elif split == held_out_split:
-            dataloader = D.test_dataloader()
+            base_loader = D.test_dataloader()
         else:
             raise ValueError(f"Unknown split {split}.")
 
-        for sample in range(inference.N_trajectories_per_task_sample):
-            out_fp = Path(cfg.output_dir) / split / f"{sample}.parquet"
-            out_fp.parent.mkdir(parents=True, exist_ok=True)
+        # Skip work for trajectories whose output parquet already exists. If every requested
+        # trajectory is already on disk and ``do_overwrite`` is false, skip the predict pass
+        # entirely; otherwise we still run a single pass over the full ``N``-expanded dataset and
+        # just don't write the parquets that already exist. (Partial-skip support is a minor
+        # wrinkle — it keeps existing checkpointed runs idempotent without making us special-case
+        # mid-run resumption.)
+        trajectory_paths = {
+            trajectory_idx: Path(cfg.output_dir) / split / f"{trajectory_idx}.parquet"
+            for trajectory_idx in range(n_trajectories)
+        }
+        for trajectory_fp in trajectory_paths.values():
+            trajectory_fp.parent.mkdir(parents=True, exist_ok=True)
+        if not cfg.do_overwrite and all(p.is_file() for p in trajectory_paths.values()):
+            logger.info(
+                f"Skipping all {n_trajectories} trajectories for split {split}: every parquet exists."
+            )
+            continue
 
+        # Expand the base dataset so each subject contributes ``n_trajectories`` consecutive rows.
+        # See issue #89 for the motivation: one predict pass instead of ``N``, tighter padding,
+        # and prefix-cache reuse on backends that have one (#88, #97). The ordering invariant —
+        # subject changes slow, trajectory_idx changes fast — means rows for trajectory ``t``
+        # extracted from each batch in order land in subject-index order overall, which is what
+        # ``format_trajectories`` needs so its sequential ``schema_df.slice(...)`` lines up with
+        # the right subject metadata.
+        base_dataset = base_loader.dataset
+        expanded_dataset = RepeatedPredictionDataset(base_dataset, n_trajectories=n_trajectories)
+        expanded_loader = DataLoader(
+            expanded_dataset,
+            batch_size=base_loader.batch_size,
+            shuffle=False,
+            num_workers=base_loader.num_workers,
+            collate_fn=partial(collate_with_meta, base_collate=base_dataset.collate),
+            pin_memory=base_loader.pin_memory,
+        )
+
+        seed = hash_based_seed(cfg.get("seed", None), split)
+        logger.info(
+            f"Generating {n_trajectories} trajectories for each of {len(base_dataset)} subjects "
+            f"in split {split} (one interleaved predict pass over {len(expanded_dataset)} "
+            f"expanded rows, seed={seed})."
+        )
+        seed_everything(seed, workers=True)
+        predictions = trainer.predict(model=M, dataloaders=expanded_loader)
+
+        # Demux the flat predictions into per-trajectory, per-batch token lists. Within each batch
+        # the rows for trajectory ``t`` are in subject-index order (because the expanded dataset
+        # was built with subject-changes-slow ordering and ``shuffle=False``), and across batches
+        # the subject-index ranges are non-overlapping and increasing — so the concatenation per
+        # trajectory ``t`` is exactly the order that ``format_trajectories`` consumes from
+        # ``base_dataset.schema_df``.
+        #
+        # ``trajectory_idxs`` is a [B] long tensor recording, for each batch row, which of the N
+        # trajectories-per-subject that row corresponds to (0..N-1). It's distinct from
+        # ``subject_idxs`` which records the base-dataset index the row came from.
+        per_trajectory_batches: dict[int, list[torch.Tensor]] = {t: [] for t in range(n_trajectories)}
+        for pred in predictions:
+            tokens = pred["tokens"]
+            trajectory_idxs = pred["trajectory_idxs"]
+            # Iterate over the trajectories actually present in this batch rather than always
+            # doing N boolean compares. For batches that cover every trajectory (the common case
+            # when batch_size >= N), this is the same work; for tail batches or small batch sizes,
+            # it scales with the number of distinct trajectory_idxs in the batch instead.
+            for t in trajectory_idxs.unique().tolist():
+                mask = trajectory_idxs == t
+                per_trajectory_batches[t].append(tokens[mask])
+
+        for trajectory_idx, out_fp in trajectory_paths.items():
             if out_fp.is_file() and not cfg.do_overwrite:
                 logger.info(f"Skipping {out_fp} as it already exists.")
                 continue
-            else:
-                out_fp.parent.mkdir(parents=True, exist_ok=True)
-
-            seed = hash_based_seed(cfg.get("seed", None), split, sample)
-
-            logger.info(f"Generating trajectories for {split} sample {sample} to {out_fp} with seed {seed}.")
-
-            seed_everything(seed, workers=True)
-            predictions = trainer.predict(model=M, dataloaders=dataloader)
-            predictions_df = format_trajectories(dataloader.dataset, predictions)
-
+            logger.info(f"Writing trajectory {trajectory_idx} for split {split} to {out_fp}.")
+            predictions_df = format_trajectories(base_dataset, per_trajectory_batches[trajectory_idx])
             pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
             pq.write_table(pa_table, out_fp)
 
