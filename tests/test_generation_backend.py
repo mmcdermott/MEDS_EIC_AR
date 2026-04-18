@@ -150,3 +150,114 @@ def test_backend_protocol_structural_check():
     """
     recorder = _RecordingBackend(torch.zeros(2, 5, dtype=torch.long))
     assert isinstance(recorder, GenerationBackend)
+
+
+# -- Kwarg-filter behavior --------------------------------------------------
+# HFBackend's ``**kwargs`` handling has two cases:
+#  (a) HF ``generate`` has a VAR_KEYWORD ``**kwargs`` — the common case — in which case we
+#      forward all caller kwargs unchanged and let HF validate. This is what preserves
+#      dynamic-kwarg generation controls like ``temperature`` / ``top_p`` / ``top_k`` that
+#      flow through HF's catch-all rather than being explicit named parameters.
+#  (b) HF ``generate`` has a fixed signature with no VAR_KEYWORD — a hypothetical future
+#      transformers layout — in which case we fall back to name-filtering so unknown kwargs
+#      don't reach HF and raise.
+# The two tests below lock in that branching. The fake-model approach lets us verify
+# behavior independently of whichever transformers signature shape is currently installed.
+
+
+class _FakeVarKeywordModel:
+    """A fake ``hf_model`` whose ``generate`` has a ``**kwargs`` VAR_KEYWORD parameter."""
+
+    class _Cfg:
+        eos_token_id = 0
+
+    config = _Cfg()
+
+    def __init__(self) -> None:
+        self.last_kwargs: dict = {}
+
+    def generate(self, input_ids, attention_mask=None, generation_config=None, **kwargs):
+        # Record what was forwarded so the test can assert on it.
+        self.last_kwargs = dict(kwargs)
+        # Return prompt + one dummy new token per row so the slice in HFBackend works.
+        batch_size = input_ids.shape[0]
+        new_tokens = torch.zeros((batch_size, 1), dtype=input_ids.dtype)
+        return torch.cat([input_ids, new_tokens], dim=1)
+
+
+class _FakeFixedSignatureModel:
+    """A fake ``hf_model`` whose ``generate`` has *no* VAR_KEYWORD — only named params."""
+
+    class _Cfg:
+        eos_token_id = 0
+
+    config = _Cfg()
+
+    def __init__(self) -> None:
+        self.last_kwargs: dict = {}
+
+    def generate(self, input_ids, attention_mask=None, generation_config=None, known_kwarg=None):
+        self.last_kwargs = {"known_kwarg": known_kwarg}
+        batch_size = input_ids.shape[0]
+        new_tokens = torch.zeros((batch_size, 1), dtype=input_ids.dtype)
+        return torch.cat([input_ids, new_tokens], dim=1)
+
+
+def _trivial_generation_config():
+    from transformers import GenerationConfig
+
+    return GenerationConfig(max_new_tokens=1, do_sample=False, num_beams=1, pad_token_id=0)
+
+
+def test_hf_backend_forwards_dynamic_kwargs_when_var_keyword_present():
+    """VAR_KEYWORD case: ``temperature`` / ``top_p`` and other dynamic kwargs must reach HF unchanged.
+
+    Regression guard for the earlier revision where the backend filtered ``**kwargs`` to names
+    in ``inspect.signature(generate).parameters`` — which silently dropped VAR_KEYWORD-only
+    options like ``temperature``. The current branch detects VAR_KEYWORD and skips filtering.
+    """
+    fake = _FakeVarKeywordModel()
+    backend = HFBackend(fake)
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    backend.generate_chunk(
+        input_ids,
+        attention_mask=torch.ones_like(input_ids, dtype=torch.bool),
+        generation_config=_trivial_generation_config(),
+        temperature=0.5,
+        top_p=0.9,
+        top_k=40,
+        some_model_forward_kwarg=True,
+    )
+    # All four kwargs must have been forwarded — the filter is a no-op when VAR_KEYWORD is
+    # present, so HF gets the chance to validate / consume them itself.
+    assert fake.last_kwargs == {
+        "temperature": 0.5,
+        "top_p": 0.9,
+        "top_k": 40,
+        "some_model_forward_kwarg": True,
+    }
+
+
+def test_hf_backend_strips_unknown_kwargs_when_no_var_keyword():
+    """Fixed-signature case: kwargs not in the explicit parameter list get stripped.
+
+    This is the fallback path for a hypothetical transformers where ``generate`` has no
+    ``**kwargs`` VAR_KEYWORD. Without filtering, passing an unknown kwarg would raise
+    ``TypeError``; with filtering, the unknown kwarg is silently dropped and known kwargs
+    are preserved.
+    """
+    fake = _FakeFixedSignatureModel()
+    backend = HFBackend(fake)
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    # ``known_kwarg`` is a real param and should reach the model. ``some_sglang_thing`` is
+    # unknown and must be stripped — without stripping, the call would TypeError.
+    backend.generate_chunk(
+        input_ids,
+        attention_mask=torch.ones_like(input_ids, dtype=torch.bool),
+        generation_config=_trivial_generation_config(),
+        known_kwarg="reaches_model",
+        some_sglang_thing="stripped",
+    )
+    assert fake.last_kwargs == {"known_kwarg": "reaches_model"}
