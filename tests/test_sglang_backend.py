@@ -221,6 +221,22 @@ def test_generate_chunk_accepts_legacy_token_ids_key():
     assert out.tolist() == [[1, 2, 3]]
 
 
+def test_generate_chunk_raises_on_unknown_output_key():
+    """Unknown output key must raise ``KeyError`` rather than silently producing empty rows.
+
+    A future SGLang version using a different field name (e.g. ``new_token_ids``) should fail
+    loudly so the issue is immediately obvious rather than manifesting as all-pad output tensors.
+    """
+    backend, fake = _make_backend()
+    fake.last_engine.set_next_outputs([{"new_token_ids": [1, 2, 3]}])
+    input_ids = torch.tensor([[4, 5]], dtype=torch.long)
+    mask = torch.tensor([[1, 1]], dtype=torch.bool)
+    cfg = GenerationConfig(max_new_tokens=3, do_sample=False, pad_token_id=0, eos_token_id=99)
+
+    with pytest.raises(KeyError, match="new_token_ids"):
+        backend.generate_chunk(input_ids, attention_mask=mask, generation_config=cfg)
+
+
 # ---------------------------------------------------------------------------
 # Kwarg stripping
 # ---------------------------------------------------------------------------

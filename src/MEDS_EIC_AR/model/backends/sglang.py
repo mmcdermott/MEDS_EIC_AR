@@ -30,8 +30,8 @@ Why this file is non-trivial despite the thin public surface:
 Gotchas accounted for:
 
 - **Return format might include the prompt.** Historically SGLang has changed whether
-  ``token_ids`` means "prompt + new" or "new only" between releases. The pinned version
-  (``0.5.10.post1``) returns new-only, which is what our contract wants. A smoke assertion in
+  ``token_ids`` means "prompt + new" or "new only" between releases. The version validated
+  at the time this was written returns new-only, which is what our contract wants. A smoke assertion in
   the unit test catches a regression loudly.
 - **``skip_tokenizer_init=True``** is essential — MEDS codes are already token ids, not text,
   and SGLang's tokenizer path would otherwise try to load a tokenizer from the HF directory
@@ -70,6 +70,12 @@ _HF_ONLY_KWARGS: frozenset[str] = frozenset(
         "negative_prompt_attention_mask",
     }
 )
+
+#: The field names SGLang has used for the newly-generated token ids in its output dicts.
+#: ``output_ids`` is the current (v0.5.x) name; ``token_ids`` was used in older releases.
+#: We probe for both so a version bump in either direction doesn't silently produce empty rows;
+#: if neither key is found we raise loudly (see ``generate_chunk``).
+_SGLANG_OUTPUT_KEYS: tuple[str, ...] = ("output_ids", "token_ids")
 
 
 def _strip_padding_to_lists(input_ids: torch.Tensor, attention_mask: torch.Tensor | None) -> list[list[int]]:
@@ -209,7 +215,12 @@ class SGLangBackend:
             self._engine.shutdown()
         except Exception as e:  # pragma: no cover — best-effort cleanup on exit
             logger.warning(f"SGLangBackend.shutdown() raised {type(e).__name__}: {e}")
-        self._is_shutdown = True
+        finally:
+            self._is_shutdown = True
+            # Unregister the atexit handler so it doesn't accumulate in long-running processes or
+            # test suites that create many backends. ``atexit.unregister`` is idempotent (safe if
+            # the handler was already removed) and doesn't raise.
+            atexit.unregister(self.shutdown)
 
     def __enter__(self) -> SGLangBackend:
         return self
@@ -264,7 +275,18 @@ class SGLangBackend:
         # lived under the ``output_ids`` key (v0.5.x) or ``token_ids`` (older releases). Probe
         # both and prefer ``output_ids`` when present. The mock tests assert both variants are
         # accepted so a version bump that flips the field name doesn't silently regress.
-        new_tokens_per_row = [list(out.get("output_ids", out.get("token_ids", []))) for out in outputs]
+        # Raise explicitly rather than falling back to ``[]`` so a future SGLang version that
+        # uses yet another field name fails loudly rather than producing silent all-pad outputs.
+        new_tokens_per_row = []
+        for i, out in enumerate(outputs):
+            tokens = next((out[k] for k in _SGLANG_OUTPUT_KEYS if k in out), None)
+            if tokens is None:
+                raise KeyError(
+                    f"SGLang output[{i}] has none of the expected token-id keys {_SGLANG_OUTPUT_KEYS}. "
+                    f"Got keys: {sorted(out)}. This may indicate a SGLang version mismatch — "
+                    "check whether the installed version returns tokens under a different field name."
+                )
+            new_tokens_per_row.append(list(tokens))
         return _pad_right_to_tensor(
             new_tokens_per_row,
             pad_value=generation_config.pad_token_id,
