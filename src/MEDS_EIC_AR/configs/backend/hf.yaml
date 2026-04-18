@@ -1,0 +1,7 @@
+# Default inference backend — thin wrapper around HuggingFace ``PreTrainedModel.generate``
+# (see ``MEDS_EIC_AR.model.backends.HFBackend``). Behavior is byte-identical to the
+# pre-backend-abstraction direct ``HF_model.generate`` path.
+#
+# This is the selected-by-default backend; other backends live as sibling files (e.g.
+# ``sglang.yaml``) and are activated via ``backend=sglang`` on the CLI.
+name: hf

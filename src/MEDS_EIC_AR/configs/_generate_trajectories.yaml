@@ -2,6 +2,7 @@ defaults:
   - datamodule: generate_trajectories
   - trainer: default
   - inference: default
+  - backend: hf
   - _self_
 
 model_initialization_dir: ???

@@ -2,5 +2,6 @@
 
 from .base import GenerationBackend
 from .hf import HFBackend
+from .sglang import SGLangBackend
 
-__all__ = ["GenerationBackend", "HFBackend"]
+__all__ = ["GenerationBackend", "HFBackend", "SGLangBackend"]

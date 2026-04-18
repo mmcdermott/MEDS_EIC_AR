@@ -9,6 +9,9 @@ configuration structure is as follows:
 ├── _demo_pretrain.yaml
 ├── _generate_trajectories.yaml
 ├── _pretrain.yaml
+├── backend
+│   ├── hf.yaml
+│   └── sglang.yaml
 ├── datamodule
 │   ├── default.yaml
 │   ├── generate_trajectories.yaml
@@ -76,6 +79,15 @@ size and how many workers to use. `pretrain.yaml` sets the random sampling
 strategy and references `max_seq_len` from the top level while
 `generate_trajectories.yaml` adjusts the sampling strategy so that the input
 sequence is taken up to the prediction time and pads on the left.
+
+## `backend` configuration:
+
+Selects the inference engine used inside `Model._generate_chunk`. The default
+`hf.yaml` wraps HuggingFace's `generate` and is byte-identical to the original
+path (no engine dependency beyond `transformers`). `sglang.yaml` activates the
+SGLang engine adapter — see `MEDS_EIC_AR.model.backends.SGLangBackend` and
+issue #88. The SGLang backend requires the optional `sglang` extra; pick it
+with `backend=sglang` on the CLI.
 
 ## `inference` configuration:
 

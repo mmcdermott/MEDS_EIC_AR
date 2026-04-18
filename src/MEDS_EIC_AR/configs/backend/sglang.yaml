@@ -1,0 +1,28 @@
+# SGLang inference backend — issue #88.
+#
+# Requires the optional ``sglang`` extra (see ``pyproject.toml``). Installing is the caller's
+# responsibility: ``uv sync --extra sglang`` or ``pip install MEDS_EIC_AR[sglang]``.
+#
+# Activation: ``MEICAR_generate_trajectories backend=sglang ...``. The CLI
+# (``__main__.py::generate_trajectories``) will export the Lightning checkpoint to an HF
+# directory on the first call, then instantiate ``SGLangBackend`` against it and swap the
+# model's backend via ``Model.set_backend``.
+name: sglang
+
+# Kwargs forwarded verbatim to ``sglang.Engine(...)``. Keys worth overriding from the CLI:
+#  - ``mem_fraction_static``: fraction of GPU memory SGLang keeps for KV cache. 0.85 leaves
+#    ~15% free for everything else (Lightning, HF backbone copy if the user forgets to free
+#    it, other processes sharing the GPU).
+#  - ``max_running_requests``: cap on concurrent in-flight requests. At our default N=8
+#    trajectories per subject × typical ``datamodule.batch_size``, 256 is plenty.
+#  - ``tp_size``: tensor-parallel degree. 1 for single-GPU; set higher only for multi-GPU
+#    deployments (currently out-of-scope).
+#  - ``disable_cuda_graph``: ``true`` for our short-lived CLI — piecewise CUDA graph capture
+#    takes 30–60s at startup and we don't amortize that over enough decode steps to break
+#    even at our ≤ 50M model size. Flip to ``false`` if you're running long-lived generation
+#    (e.g. batched inference over a full dataset) where the capture cost amortizes.
+engine:
+  mem_fraction_static: 0.85
+  max_running_requests: 256
+  tp_size: 1
+  disable_cuda_graph: true
