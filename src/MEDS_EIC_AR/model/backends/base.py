@@ -6,10 +6,11 @@ sliding-window loop, EOS bookkeeping, and token accounting work. Only the innerm
 ``generate_chunk`` call is swappable; everything else stays in :class:`MEDS_EIC_AR.model.model.Model`.
 
 A backend implementation takes a padded prompt tensor (this repo pads on the left — see
-``configs/datamodule/generate_trajectories.yaml``'s ``padding_side: LEFT`` — and rolling-chunk
-prompts may additionally contain post-EOS padding on the right for samples that already
-finished) plus the HF-style ``GenerationConfig`` the caller has already built, and returns the
-newly generated tokens (the portion of the HF output that comes *after* the prompt). The
+``src/MEDS_EIC_AR/configs/datamodule/generate_trajectories.yaml``'s ``padding_side: LEFT``
+— and rolling-chunk prompts may additionally contain post-EOS padding on the right for
+samples that already finished) plus the HF-style ``GenerationConfig`` the caller has already
+built, and returns the newly generated tokens (the portion of the HF output that comes *after*
+the prompt). The
 slicing is deliberately the backend's responsibility: engines like SGLang produce "new tokens
 only" natively, and pushing the slice into the adapter keeps the calling code identical across
 backends.
@@ -52,9 +53,16 @@ class GenerationBackend(Protocol):
                 per-call budget (``max_new_tokens``), sampling mode, pad/EOS ids, etc.
             **kwargs: Backend-specific per-call options. Callers may provide keys that are only
                 meaningful to some backends (e.g. HF ``logits_processor``); implementations must
-                only forward options supported by the active engine and silently ignore or strip
-                the rest, since e.g. ``transformers.GenerationMixin.generate`` raises on unknown
-                kwargs.
+                only forward keys the active engine accepts. "Accepts" is implementation-defined:
+                a backend may strip keys ahead of time against an explicit allowlist, or defer to
+                the engine's own validation if the engine accepts a broad-and-dynamic set (e.g.
+                ``transformers.GenerationMixin.generate``'s ``**kwargs`` VAR_KEYWORD, which HF
+                validates at call time). In the latter case a truly-unknown key may raise from
+                the engine rather than being silently stripped; this is permitted. What is *not*
+                permitted is forwarding a key that the engine is known to reject without
+                filtering it first — callers must be able to assume a cross-backend option
+                dictionary passes through without TypeError as long as each backend's known
+                accepted set is respected.
 
         Returns:
             A ``[B, new_len]`` tensor of newly generated tokens, with the prompt slice already
