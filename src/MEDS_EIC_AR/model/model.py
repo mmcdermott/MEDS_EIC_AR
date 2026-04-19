@@ -44,8 +44,11 @@ class Model(torch.nn.Module):
     """A Llama-style decoder-only transformer for pre-training an autoregressive, "everything-is-code" model.
 
     Wraps :class:`~transformers.LlamaForCausalLM` so it runs over MEDS-TorchData batches. The rolling-
-    generation loop and everything downstream of :attr:`HF_model` are architecture-agnostic, so the base
-    is contained to :meth:`__init__` — swapping to a different HF architecture is a one-spot change.
+    generation loop and much of the code downstream of :attr:`HF_model` are architecture-agnostic, so
+    :meth:`__init__` is the primary integration point with the underlying HF model. Swapping to a
+    different HF architecture may still require updates elsewhere — architecture-specific config keys,
+    or parameter-name-based logic like the no-weight-decay grouping in
+    :meth:`MEICARModule._is_norm_bias_param`.
 
     Args:
         gpt_kwargs: A dictionary of keyword arguments to pass to the underlying HF config constructor (a
@@ -99,7 +102,7 @@ class Model(torch.nn.Module):
                dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
 
-    The models parameters can be accessed in the normal way. The first named parameter is the token
+    The model's parameters can be accessed in the normal way. The first named parameter is the token
     embedding matrix:
 
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
