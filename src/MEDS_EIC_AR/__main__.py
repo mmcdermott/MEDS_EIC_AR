@@ -199,6 +199,16 @@ def generate_trajectories(cfg: DictConfig):
             "you're running this for any other purpose, set inference.do_sample=true."
         )
 
+    # Backend selection (issue #88). Each ``configs/backend/*.yaml`` names a builder via
+    # ``_target_`` — ``build_hf_backend`` returns ``None`` (meaning "keep the default
+    # HFBackend the model constructed in __init__"); ``build_sglang_backend`` materializes
+    # an HF directory from the Lightning checkpoint and returns an ``SGLangBackend``. Adding
+    # a new backend is one new builder + one new yaml, no code change here.
+    if "backend" in cfg:
+        backend = instantiate(cfg.backend, module=M, model_init_dir=cfg.model_initialization_dir)
+        if backend is not None:
+            M.model.set_backend(backend)
+
     apply_saved_logger_run_ids(cfg.trainer, Path(cfg.model_initialization_dir))
     trainer = instantiate(cfg.trainer)
 

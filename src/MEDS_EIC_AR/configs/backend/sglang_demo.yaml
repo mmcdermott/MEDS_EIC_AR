@@ -1,0 +1,20 @@
+# SGLang inference backend — test/demo defaults. Paired with the production ``sglang.yaml``
+# and used by the gated integration test (``tests/grammar/test_cli_sglang.py``) and anyone
+# running a short-lived SGLang generation that doesn't amortize CUDA-graph capture cost.
+#
+# Key difference from ``sglang.yaml``:
+#  - ``disable_cuda_graph: true`` — piecewise CUDA graph capture takes 30–60s at startup,
+#    and a short-lived test/demo run finishes before that cost breaks even. Disabling
+#    capture trades per-step decode speed for fast cold-start. Flip to ``false`` (or
+#    switch to ``backend=sglang``) for batched-inference-over-a-full-dataset workloads.
+#  - ``max_running_requests: 8`` — test scale. Production ``sglang.yaml`` uses 256.
+#
+# Activation: ``MEICAR_generate_trajectories backend=sglang_demo ...`` (or referenced via
+# ``_demo_generate_trajectories.yaml`` defaults when that CLI runs).
+_target_: MEDS_EIC_AR.model.backends.build_sglang_backend
+
+engine_kwargs:
+  mem_fraction_static: 0.85
+  max_running_requests: 8
+  tp_size: 1
+  disable_cuda_graph: true

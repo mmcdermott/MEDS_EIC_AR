@@ -9,6 +9,10 @@ configuration structure is as follows:
 ├── _demo_pretrain.yaml
 ├── _generate_trajectories.yaml
 ├── _pretrain.yaml
+├── backend
+│   ├── hf.yaml
+│   ├── sglang.yaml
+│   └── sglang_demo.yaml
 ├── datamodule
 │   ├── default.yaml
 │   ├── generate_trajectories.yaml
@@ -80,6 +84,31 @@ size and how many workers to use. `pretrain.yaml` sets the random sampling
 strategy and references `max_seq_len` from the top level while
 `generate_trajectories.yaml` adjusts the sampling strategy so that the input
 sequence is taken up to the prediction time and pads on the left.
+
+## `backend` configuration:
+
+Selects the inference engine used inside `Model._generate_chunk`. Each file names
+a builder via `_target_` that Hydra instantiates at run time; adding a new
+backend is one builder function + one yaml, no CLI code change.
+
+- `hf.yaml` (default) — wraps HuggingFace's `generate` and is byte-identical
+    to the original path (no engine dependency beyond `transformers`). Returns
+    `None` from its builder, which tells the CLI to leave the model's default
+    `HFBackend` in place.
+- `sglang.yaml` — activates the SGLang engine adapter
+    (`MEDS_EIC_AR.model.backends.SGLangBackend`, issue #88) with production
+    defaults: CUDA graph capture enabled (amortizes over long batched-inference
+    runs), `max_running_requests=256`. Requires the optional `sglang` extra and
+    a CUDA device.
+- `sglang_demo.yaml` — SGLang with test/demo defaults
+    (`disable_cuda_graph=true`, `max_running_requests=8`). Trades peak decode
+    throughput for fast cold-start, which is the right choice for short-lived
+    runs (integration tests, one-shot debug generation) where CUDA-graph capture
+    wouldn't pay for itself. Selected by the GPU-gated grammar test
+    (`tests/grammar/test_cli_sglang.py`).
+
+Pick one with `backend=<name>` on the CLI. Production SGLang inference uses
+`backend=sglang`; the gated integration test uses `backend=sglang_demo`.
 
 ## `inference` configuration:
 
