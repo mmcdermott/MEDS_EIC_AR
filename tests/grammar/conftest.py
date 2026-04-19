@@ -278,8 +278,11 @@ def _run_grammar_generate(
 
     Centralized so the sampling and greedy fixtures only differ by ``do_sample`` and can't
     drift on other knobs. ``backend`` defaults to ``"hf"`` (the CPU-runnable default backend);
-    gated GPU tests pass ``backend="sglang"`` to drive the end-to-end pipeline through the
-    SGLang engine, which requires both the optional ``sglang`` extra and a CUDA device.
+    the gated GPU test (``tests/grammar/test_cli_sglang.py``) passes ``backend="sglang_demo"``
+    to drive the end-to-end pipeline through the SGLang engine with the test-scale config
+    (disabled CUDA-graph capture, ``max_running_requests=8``). Requires both the optional
+    ``sglang`` extra and a CUDA device. Production-scale ``backend="sglang"`` is also valid
+    here; nothing in this helper assumes a particular name.
     """
     args = [
         "MEICAR_generate_trajectories",

@@ -15,6 +15,12 @@ These tests cover:
 3. Re-export is idempotent — calling twice with unchanged weights skips the heavy write
    on the second call (detected by fingerprint-only read on the marker file).
 4. Re-export after weight mutation re-writes, because the fingerprint changes.
+5. Re-export also fires when *config-only* metadata changes (e.g. ``eos_token_id``
+   auto-populated at runtime), even though the weights didn't change — the fingerprint
+   folds in ``config.to_dict()`` alongside the state_dict.
+6. Re-export fires when a fingerprint-matching output directory is structurally corrupt
+   (missing ``*.safetensors`` shards, missing ``config.json``, etc.), so a partial-cleanup
+   scenario doesn't leave an unloadable directory in place.
 
 Why not test idempotency via timing: the first export is already fast enough at our scale
 that wall-clock variance makes a timing assertion flaky. Instead we probe that the existing
