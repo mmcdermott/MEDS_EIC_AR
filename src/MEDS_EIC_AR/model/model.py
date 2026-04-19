@@ -6,11 +6,10 @@ import torch.nn.functional as F
 from meds_torchdata import MEDSTorchBatch
 from omegaconf import DictConfig, OmegaConf
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
     GenerationConfig,
-    GPTNeoXConfig,
-    GPTNeoXForCausalLM,
+    LlamaConfig,
+    LlamaForCausalLM,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -42,14 +41,20 @@ def _val(tensor: torch.Tensor) -> int | bool | float:
 
 
 class Model(torch.nn.Module):
-    """A basic GPT-NeoX like model for pre-training an autoregressive, "everything-is-code" model.
+    """A Llama-style decoder-only transformer for pre-training an autoregressive, "everything-is-code" model.
 
-    This model is a wrapper around the Hugging Face GPTNeoXForCausalLM model to run it over MEDS-TorchData
-    batches.
+    Wraps :class:`~transformers.LlamaForCausalLM` so it runs over MEDS-TorchData batches. The rolling-
+    generation loop and much of the code downstream of :attr:`HF_model` are architecture-agnostic, so
+    :meth:`__init__` is the primary integration point with the underlying HF model. Swapping to a
+    different HF architecture may still require updates elsewhere — architecture-specific config keys,
+    or parameter-name-based logic like the no-weight-decay grouping in
+    :meth:`MEICARModule._is_norm_bias_param`.
 
     Args:
-        gpt_kwargs: A dictionary of keyword arguments to pass to the GPTNeoXConfig constructor. These can
-            include 'max_position_embeddings', 'vocab_size', 'hidden_size', etc.
+        gpt_kwargs: A dictionary of keyword arguments to pass to the underlying HF config constructor (a
+            :class:`~transformers.LlamaConfig` today). These can include ``max_position_embeddings``,
+            ``vocab_size``, ``hidden_size``, etc. The historical name ``gpt_kwargs`` is retained for
+            backwards-compatibility with existing config files.
 
     Raises:
         ValueError: If the gpt_kwargs contains a key that is not supported.
@@ -85,24 +90,25 @@ class Model(torch.nn.Module):
 
         >>> loss, outputs = model(sample_batch)
         >>> print(loss)
-        tensor(3.6602, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
+        tensor(3.6543, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
         >>> print(f"Outputs have keys: {', '.join(outputs.keys())}")
         Outputs have keys: logits, past_key_values
         >>> print(f"Logits shape: {outputs.logits.shape}")
         Logits shape: torch.Size([2, 9, 39])
         >>> print(outputs.logits)
-        tensor([[[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.3962e-02, ...,  1.6510e-02]],
+        tensor([[[ 2.5539e-03, ..., -3.0045e-02], ..., [-8.3694e-03, ...,  3.0487e-02]],
         <BLANKLINE>
-                [[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.4549e-02, ...,  1.6312e-02]]],
+                [[ 2.5539e-03, ..., -3.0045e-02], ..., [-9.0561e-03, ...,  3.5919e-02]]],
                dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
 
-    The models parameters can be accessed in the normal way.
+    The model's parameters can be accessed in the normal way. The first named parameter is the token
+    embedding matrix:
 
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
         >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
-        HF_model.gpt_neox.embed_in.weight (torch.Size([39, 4])): Parameter containing:
-        tensor([[-0.0247, -0.0222,  0.0160,  0.0219], ..., [-0.0050, -0.0061, -0.0358,  0.0136]],
+        HF_model.model.embed_tokens.weight (torch.Size([39, 4])): Parameter containing:
+        tensor([[ 0.0069,  0.0068, -0.0367,  0.0099], ..., [-0.0085, -0.0223, -0.0185,  0.0032]],
                dtype=torch.float16,
                requires_grad=True)
 
@@ -115,7 +121,7 @@ class Model(torch.nn.Module):
         Sample parameter grad?:
         tensor([[ 0.0000,  0.0000,  0.0000,  0.0000],
                 ...,
-                [ 0.0341, -0.0679, -0.0286,  0.0625]],
+                [-0.1140, -0.0175,  0.0645, -0.0845]],
                dtype=torch.float16)
 
     With a single backward pass, we should not get any infinite gradients:
@@ -125,16 +131,65 @@ class Model(torch.nn.Module):
         ...         if not _val(torch.isfinite(param.grad).all()):
         ...             raise ValueError(f"Gradient for {name} is not finite.")
 
-    Model errors are raised if we pass invalid GPT kwargs to the constructor:
+    Model errors are raised if we pass invalid kwargs to the constructor. The architecture name in the
+    error message is derived from the active HF config's ``model_type`` so it stays accurate if we ever
+    swap the base architecture again:
 
         >>> Model({"foobar": 2})
         Traceback (most recent call last):
             ...
-        ValueError: Config for HF model gpt-neox does not have attribute foobar
+        ValueError: Config for HF model llama does not have attribute foobar
+
+    Post-override snap: ``num_key_value_heads`` and ``head_dim`` are recomputed from the caller's
+    ``hidden_size`` / ``num_attention_heads`` unless the caller set them explicitly. The default is
+    plain MHA (``num_key_value_heads == num_attention_heads``) — matching what vanilla
+    :class:`~transformers.LlamaConfig` does when either field is left unset:
+
+        >>> tiny = Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 2,
+        ...     "hidden_size": 4,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": 40,
+        ... }, precision="32-true")
+        >>> tiny.HF_model_config.num_key_value_heads
+        2
+        >>> tiny.HF_model_config.head_dim
+        2
+
+    A caller who wants GQA sets ``num_key_value_heads`` explicitly:
+
+        >>> gqa = Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 4,
+        ...     "num_key_value_heads": 2,
+        ...     "hidden_size": 8,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": 40,
+        ... }, precision="32-true")
+        >>> gqa.HF_model_config.num_key_value_heads
+        2
+        >>> gqa.HF_model_config.head_dim
+        2
+
+    And a non-divisible ``hidden_size`` / ``num_attention_heads`` combination is rejected at
+    construction time rather than producing a silently-wrong ``head_dim`` that only surfaces as a
+    cryptic shape error on the first forward pass:
+
+        >>> Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 3,
+        ...     "hidden_size": 4,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": 40,
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: hidden_size (4) must be divisible by num_attention_heads (3) to derive ...
     """
 
-    HF_model_config: GPTNeoXConfig
-    HF_model: GPTNeoXForCausalLM
+    HF_model_config: LlamaConfig
+    HF_model: LlamaForCausalLM
     do_demo: bool
     precision: str
 
@@ -154,16 +209,47 @@ class Model(torch.nn.Module):
     def __init__(self, gpt_kwargs: dict | DictConfig, precision: str = "32-true", do_demo: bool = False):
         super().__init__()
 
-        self.HF_model_config: GPTNeoXConfig = AutoConfig.from_pretrained("EleutherAI/gpt-neox-20b")
+        self.HF_model_config: LlamaConfig = LlamaConfig()
 
         for key, val in gpt_kwargs.items():
+            # ``attention_head_dim`` is consumed by the YAML ``int_prod`` resolver to derive
+            # ``hidden_size`` (``hidden_size = num_attention_heads * attention_head_dim``). The
+            # config expresses the product form so HPO search over ``num_attention_heads`` and
+            # ``attention_head_dim`` independently can never produce a non-divisible
+            # ``hidden_size``. It isn't a real LlamaConfig attribute — skip it on its way in.
             if key == "attention_head_dim":
                 continue
             if not hasattr(self.HF_model_config, key):
-                raise ValueError(f"Config for HF model gpt-neox does not have attribute {key}")
+                raise ValueError(
+                    f"Config for HF model {self.HF_model_config.model_type} does not have attribute {key}"
+                )
             setattr(self.HF_model_config, key, val)
 
-        extra_kwargs = {"torch_dtype": self.PRECISION_TO_MODEL_WEIGHTS_DTYPE.get(precision)}
+        # ``LlamaConfig()``'s default values for ``num_key_value_heads`` and ``head_dim`` come from
+        # the vanilla 7B config — they aren't recomputed from the ``hidden_size`` /
+        # ``num_attention_heads`` the caller just overrode. Snap them back to the values implied
+        # by the overrides unless the caller also set them explicitly. Plain MHA
+        # (``num_key_value_heads == num_attention_heads``) and
+        # ``head_dim == hidden_size // num_attention_heads`` are what vanilla Llama uses when the
+        # fields are left unset at config-construction time; this just preserves that after our
+        # post-hoc attribute mutation.
+        if "num_key_value_heads" not in gpt_kwargs:
+            self.HF_model_config.num_key_value_heads = self.HF_model_config.num_attention_heads
+        if "head_dim" not in gpt_kwargs:
+            hidden = self.HF_model_config.hidden_size
+            heads = self.HF_model_config.num_attention_heads
+            if hidden % heads != 0:
+                raise ValueError(
+                    f"hidden_size ({hidden}) must be divisible by num_attention_heads ({heads}) to "
+                    "derive ``head_dim`` implicitly. Pass ``head_dim`` explicitly in gpt_kwargs, or "
+                    "adjust ``hidden_size`` / ``num_attention_heads`` so the division is exact. "
+                    "Configs built via the ``attention_head_dim`` resolver at "
+                    "``configs/lightning_module/model/default.yaml`` cannot hit this — the product "
+                    "form makes divisibility impossible-by-construction."
+                )
+            self.HF_model_config.head_dim = hidden // heads
+
+        extra_kwargs = {"dtype": self.PRECISION_TO_MODEL_WEIGHTS_DTYPE.get(precision)}
 
         if HAS_FLASH_ATTN:
             logger.info("Using FlashAttention 2 for the model.")
@@ -348,6 +434,9 @@ class Model(torch.nn.Module):
             - The parameters are not inf.
 
         Examples:
+            We corrupt a ``RMSNorm`` weight to exercise the warning path. The parameter choice
+            doesn't matter; any tensor with known ``numel`` works.
+
             >>> model = Model({
             ...     "num_hidden_layers": 2,
             ...     "num_attention_heads": 2,
@@ -355,17 +444,15 @@ class Model(torch.nn.Module):
             ...     "max_position_embeddings": 3,
             ...     "vocab_size": 10,
             ... })
-            >>> model.HF_model.gpt_neox.layers[1].attention.query_key_value.bias.shape
-            torch.Size([12])
-            >>> model.HF_model.gpt_neox.layers[1].attention.query_key_value.bias = torch.nn.Parameter(
-            ...     torch.tensor([float("nan"), 0., float("inf"), 0., 0., 0., 0., 0., 0., 0., 0., 0.])
+            >>> model.HF_model.model.layers[1].input_layernorm.weight.shape
+            torch.Size([4])
+            >>> model.HF_model.model.layers[1].input_layernorm.weight = torch.nn.Parameter(
+            ...     torch.tensor([float("nan"), 0., float("inf"), 0.])
             ... )
             >>> with print_warnings():
             ...     model._check_parameters()
-            Warning: Parameter HF_model.gpt_neox.layers.1.attention.query_key_value.bias contains 1/12 nan
-                values.
-            Warning: Parameter HF_model.gpt_neox.layers.1.attention.query_key_value.bias contains 1/12 inf
-                values.
+            Warning: Parameter HF_model.model.layers.1.input_layernorm.weight contains 1/4 nan values.
+            Warning: Parameter HF_model.model.layers.1.input_layernorm.weight contains 1/4 inf values.
         """
 
         for n, p in self.named_parameters():
@@ -433,7 +520,7 @@ class Model(torch.nn.Module):
         HF relevant input keys:
             - input_ids: The input sequence of token IDs. Captured in `batch.code`.
             - attention_mask: A mask to avoid attending to padding tokens. See the
-              [documentation](https://huggingface.co/docs/transformers/en/model_doc/gpt_neox#transformers.GPTNeoXModel.forward.attention_mask)
+              [documentation](https://huggingface.co/docs/transformers/en/model_doc/llama#transformers.LlamaModel.forward.attention_mask)
               for more details. Should be a tensor of shape `(batch_size, seq_len)` (same as `input_ids`) with
               0s for tokens that are masked and 1s for tokens that are not masked. This means it is given by
               `batch.code != batch.PAD_INDEX` as whenever the code is not a padding token, it should be
@@ -535,8 +622,8 @@ class Model(torch.nn.Module):
         This means that by default, the model will generate 1 token:
 
             >>> print(model.generate(sample_batch, do_sample=False))
-            tensor([[2],
-                    [2]])
+            tensor([[38],
+                    [38]])
 
         If we create a model with a maximum sequence length of 20, we can generate 11 tokens:
 
@@ -549,8 +636,8 @@ class Model(torch.nn.Module):
             ...     "vocab_size": dataset_config.vocab_size,
             ... }, precision="32-true")
             >>> print(model.generate(sample_batch, do_sample=False))
-            tensor([[ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
-                    [ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]])
+            tensor([[38,  7,  8, 28, 15,  7,  8, 28, 15,  7,  8],
+                    [38,  7,  8, 28, 15,  7,  8, 28, 15,  7,  8]])
 
         Setting ``max_new_tokens`` explicitly enables the sliding-window path, which can emit more tokens than
         the model's context window would normally allow. Here the model has ``max_position_embeddings=10`` but
@@ -569,22 +656,23 @@ class Model(torch.nn.Module):
             ... }, precision="32-true")
             >>> model.HF_model.config.eos_token_id = 37  # TIMELINE//END for the test vocab
             >>> model.generate(sample_batch, do_sample=False, max_new_tokens=15)
-            tensor([[ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
-                    [ 2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]])
+            tensor([[38,  7,  8, 28, 15,  7,  8, 28, 15,  7,  8, 28, 15,  7,  8],
+                    [38,  7,  8, 28, 15,  7,  8, 28, 15,  7,  8, 28, 15,  7,  8]])
 
         Note that here, as we've turned sampling off for determinism in these testing algorithms, the
         generated samples are clearly visibly not meaningful — a randomly initialized model greedy-decodes
-        to a single high-probability token and then repeats it. This is completely expected. What if we try
-        with a model that has undergone a (tiny) bit of pre-training? TODO(generation test).
+        to a small cycle of high-probability tokens and repeats it. This is completely expected. What if
+        we try with a model that has undergone a (tiny) bit of pre-training? TODO(generation test).
 
         Note on HF library support: HF Transformers does not currently provide a built-in way to generate
         more tokens than the model's ``max_position_embeddings`` for architectures without native sliding-
-        window attention. GPTNeoX, which this model wraps, is one such architecture. The earlier
-        ``SinkCache`` / StreamingLLM approach was removed from recent releases; its replacement lives
-        inside the model implementations themselves and only applies to architectures that advertise
-        sliding-window attention (Mistral, Gemma2, Llama4). That's why we maintain our own rolling loop
-        here — see :meth:`_rolling_generate` for the trade-offs, including the positional-embedding
-        correctness consideration when the window slides.
+        window attention. ``LlamaForCausalLM``, which this model wraps, is one such architecture (plain
+        Llama is MHA + full attention; the sliding-window variants — Mistral, Gemma2, Llama4 — are
+        separate architectures). The earlier ``SinkCache`` / StreamingLLM approach was removed from
+        recent releases; its replacement lives inside the model implementations themselves and only
+        applies to architectures that advertise sliding-window attention. That's why we maintain our
+        own rolling loop here — see :meth:`_rolling_generate` for the trade-offs, including the
+        positional-embedding correctness consideration when the window slides.
         """
 
         if max_new_tokens is not None:
@@ -636,8 +724,9 @@ class Model(torch.nn.Module):
         **Why we maintain our own loop.** HF Transformers mainline currently exposes no first-class
         primitive for generating past a full-attention model's ``max_position_embeddings``. ``SinkCache``
         was removed in 4.53.0; the sliding-window-attention replacements live inside specific architectures
-        (Mistral, Gemma2, Llama4) that handle the sliding in-kernel, and don't apply to GPTNeoX, which this
-        repo's :class:`Model` wraps. The remaining HF caches (``DynamicCache``, ``StaticCache``,
+        (Mistral, Gemma2, Llama4) that handle the sliding in-kernel, and don't apply to plain
+        ``LlamaForCausalLM``, which this repo's :class:`Model` wraps. The remaining HF caches
+        (``DynamicCache``, ``StaticCache``,
         ``QuantizedCache``, offloaded variants) only manage memory — none of them let the model see
         positions beyond ``max_position_embeddings``. A community port
         (`transformers-community/sink_cache <https://huggingface.co/transformers-community/sink_cache>`_)
@@ -724,8 +813,8 @@ class Model(torch.nn.Module):
             >>> model._rolling_generate(
             ...     batch, max_new_tokens=12, rolling_context_size=None, do_sample=False
             ... )
-            tensor([[17, 19, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
-                    [17, 19, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]])
+            tensor([[ 3, 38,  7,  8, 28, 15,  7,  8, 28, 15,  7,  8],
+                    [ 3, 38,  7,  8, 28, 15,  7,  8, 28, 15,  7,  8]])
             >>> model.HF_model.generate.call_count >= 3
             True
             >>> model.HF_model.generate = _real_generate
@@ -748,8 +837,8 @@ class Model(torch.nn.Module):
             >>> model._rolling_generate(
             ...     batch, max_new_tokens=2, rolling_context_size=None, do_sample=False
             ... )
-            tensor([[17, 19],
-                    [17, 19]])
+            tensor([[ 3, 38],
+                    [ 3, 38]])
 
         Validation errors:
 
@@ -908,7 +997,7 @@ class Model(torch.nn.Module):
         EOS per row are already filled with ``pad_id`` — so neither caller here has to do post-EOS
         truncation of the per-chunk return value. :class:`~MEDS_EIC_AR.model.backends.HFBackend`
         satisfies this for free because HF's ``generate`` pads post-EOS natively (verified
-        empirically on ``GPTNeoXForCausalLM``); non-HF backends must honor the invariant
+        empirically on ``LlamaForCausalLM``); non-HF backends must honor the invariant
         explicitly. ``eos_token_id`` is read from ``self.HF_model.config.eos_token_id`` rather than
         passed in, since both callers always want the model's configured EOS.
 

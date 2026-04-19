@@ -1,6 +1,6 @@
 """HuggingFace :class:`~transformers.GenerationMixin` implementation of :class:`GenerationBackend`.
 
-Wraps a ``GPTNeoXForCausalLM`` (or any other ``PreTrainedModel`` with a usable ``generate``
+Wraps a ``LlamaForCausalLM`` (or any other ``PreTrainedModel`` with a usable ``generate``
 method) and forwards per-chunk calls straight through. This is the default backend; behavior is
 byte-identical to the pre-abstraction path.
 """

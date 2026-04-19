@@ -268,6 +268,20 @@ class MEICARModule(L.LightningModule):
     def _is_norm_bias_param(n: str) -> bool:
         """Checks if a parameter name corresponds to a bias or normalization layer.
 
+        Standard AdamW practice: bias parameters and the gain parameters of normalization layers
+        (LayerNorm / RMSNorm) should not receive weight decay — they have different geometry from
+        linear weights, and decaying them pulls normalizations toward collapse. The optimizer groups
+        everything matching this predicate into a no-decay group.
+
+        The regex matches ``bias`` anywhere in the name plus any weight whose last component looks
+        like an optional ``layer_?`` prefix followed by ``norm`` (with optional trailing digits).
+        That covers Llama's RMSNorm names (``input_layernorm.weight``, ``post_attention_layernorm.weight``,
+        and the final ``model.norm.weight``) as well as LayerNorm-style names a different HF
+        architecture might expose. Llama has no biases by default (``attention_bias=False``, MLP/LM-
+        head biases absent), so in practice the ``bias`` branch is dormant for the current base — it
+        stays in the regex as cheap insurance for callers who override ``attention_bias=True`` or
+        swap to a bias-enabled architecture.
+
         Args:
             n: The name of the parameter.
 
@@ -283,10 +297,12 @@ class MEICARModule(L.LightningModule):
             True
             >>> MEICARModule._is_norm_bias_param("model.decoder.weight")
             False
-            >>> MEICARModule._is_norm_bias_param("model.HF_model.gpt_neox.final_layer_norm.weight")
+            >>> MEICARModule._is_norm_bias_param("model.HF_model.model.layers.0.input_layernorm.weight")
+            True
+            >>> MEICARModule._is_norm_bias_param("model.HF_model.model.norm.weight")
             True
         """
-        return bool(re.search(r"(bias|layer(_?)norm(\d*)\.weight)", n, re.IGNORECASE))
+        return bool(re.search(r"(bias|(layer_?)?norm(\d*)\.weight)", n, re.IGNORECASE))
 
     def _norm_bias_param_names(self) -> Iterator[str]:
         """Yields the names of parameters corresponding to the bias and normalization layers.
@@ -294,25 +310,17 @@ class MEICARModule(L.LightningModule):
         These parameters should not be subject to weight decay by the optimizer.
 
         Examples:
+            Llama has no biases by default (``attention_bias=False``, MLP/LM-head biases absent) and
+            uses RMSNorm, so the only matches are the two norm weights per layer
+            (``input_layernorm.weight`` + ``post_attention_layernorm.weight``) plus the final
+            ``model.norm.weight``:
+
             >>> list(pretrained_module._norm_bias_param_names())
-            ['model.HF_model.gpt_neox.layers.0.input_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.0.input_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.0.post_attention_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.0.post_attention_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.0.attention.query_key_value.bias',
-             'model.HF_model.gpt_neox.layers.0.attention.dense.bias',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_h_to_4h.bias',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_4h_to_h.bias',
-             'model.HF_model.gpt_neox.layers.1.input_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.1.input_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.1.post_attention_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.1.post_attention_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.1.attention.query_key_value.bias',
-             'model.HF_model.gpt_neox.layers.1.attention.dense.bias',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_h_to_4h.bias',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_4h_to_h.bias',
-             'model.HF_model.gpt_neox.final_layer_norm.weight',
-             'model.HF_model.gpt_neox.final_layer_norm.bias']
+            ['model.HF_model.model.layers.0.input_layernorm.weight',
+             'model.HF_model.model.layers.0.post_attention_layernorm.weight',
+             'model.HF_model.model.layers.1.input_layernorm.weight',
+             'model.HF_model.model.layers.1.post_attention_layernorm.weight',
+             'model.HF_model.model.norm.weight']
         """
 
         for name, _ in self.named_parameters():
@@ -331,17 +339,28 @@ class MEICARModule(L.LightningModule):
         These parameters should be subject to weight decay by the optimizer.
 
         Examples:
+            Under Llama the non-norm/bias params are the token embedding, the four attention
+            projections (``q_proj``/``k_proj``/``v_proj``/``o_proj``) per layer, the three
+            SwiGLU MLP projections (``gate_proj``/``up_proj``/``down_proj``) per layer, and the
+            output ``lm_head`` — no fused ``query_key_value``, no biases:
+
             >>> list(pretrained_module._non_norm_bias_param_names())
-            ['model.HF_model.gpt_neox.embed_in.weight',
-             'model.HF_model.gpt_neox.layers.0.attention.query_key_value.weight',
-             'model.HF_model.gpt_neox.layers.0.attention.dense.weight',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_h_to_4h.weight',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_4h_to_h.weight',
-             'model.HF_model.gpt_neox.layers.1.attention.query_key_value.weight',
-             'model.HF_model.gpt_neox.layers.1.attention.dense.weight',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_h_to_4h.weight',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_4h_to_h.weight',
-             'model.HF_model.embed_out.weight']
+            ['model.HF_model.model.embed_tokens.weight',
+             'model.HF_model.model.layers.0.self_attn.q_proj.weight',
+             'model.HF_model.model.layers.0.self_attn.k_proj.weight',
+             'model.HF_model.model.layers.0.self_attn.v_proj.weight',
+             'model.HF_model.model.layers.0.self_attn.o_proj.weight',
+             'model.HF_model.model.layers.0.mlp.gate_proj.weight',
+             'model.HF_model.model.layers.0.mlp.up_proj.weight',
+             'model.HF_model.model.layers.0.mlp.down_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.q_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.k_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.v_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.o_proj.weight',
+             'model.HF_model.model.layers.1.mlp.gate_proj.weight',
+             'model.HF_model.model.layers.1.mlp.up_proj.weight',
+             'model.HF_model.model.layers.1.mlp.down_proj.weight',
+             'model.HF_model.lm_head.weight']
         """
 
         for name, _ in self.named_parameters():
