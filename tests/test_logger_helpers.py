@@ -42,6 +42,74 @@ def test_apply_saved_logger_run_ids(tmp_path):
     assert cfg.loggers[1]["resume"] == "allow"
 
 
+def test_apply_saved_logger_run_ids_overrides_default_mlflow_tracking_uri(tmp_path):
+    """Saved tracking_uri must override a repo-default tracking_uri when a saved run_id is applied.
+
+    Regression guard for the case Copilot flagged on PR #73: the default
+    ``configs/trainer/logger/mlflow.yaml`` sets ``tracking_uri: ${log_dir}/mlflow/mlruns``,
+    which post-interpolation is a truthy non-empty string. A naive "only restore if absent"
+    rule would then never fire, and a resumed ``run_id`` would point at the *new* run's
+    tracking store — 404 on resume, or quiet log-to-wrong-store. The current rule is:
+    when a saved ``run_id`` is applied, the saved ``tracking_uri`` overrides whatever
+    the current config contained. This test locks that rule in against both the default
+    config's tracking_uri and a caller-set tracking_uri.
+    """
+    cfg = DictConfig(
+        {
+            "loggers": [
+                {
+                    "_target_": "MLFlowLogger",
+                    "tracking_uri": str(tmp_path / "current-output" / "mlruns"),
+                },
+                {"_target_": "WandbLogger"},
+            ]
+        }
+    )
+
+    log_dir = tmp_path / "loggers"
+    log_dir.mkdir()
+    (log_dir / "mlflow_run_id.txt").write_text("abc")
+    (log_dir / "mlflow_tracking_uri.txt").write_text(str(tmp_path / "original" / "mlruns"))
+    (log_dir / "wandb_run_id.txt").write_text("xyz")
+
+    utils.apply_saved_logger_run_ids(cfg, tmp_path)
+
+    assert cfg.loggers[0]["run_id"] == "abc"
+    assert cfg.loggers[0]["tracking_uri"] == str(tmp_path / "original" / "mlruns")
+    assert cfg.loggers[1]["id"] == "xyz"
+    assert cfg.loggers[1]["resume"] == "allow"
+
+
+def test_apply_saved_logger_run_ids_preserves_explicit_run_id(tmp_path):
+    """If the caller explicitly set ``run_id``, neither ``run_id`` nor ``tracking_uri`` is restored.
+
+    This is the escape hatch for "log a fresh run into a different MLflow store." Without it,
+    a caller who wants a new run in a new store would always have their ``tracking_uri`` silently
+    overwritten by the saved one when a ``mlflow_tracking_uri.txt`` sits in the run_dir.
+    """
+    cfg = DictConfig(
+        {
+            "loggers": [
+                {
+                    "_target_": "MLFlowLogger",
+                    "run_id": "fresh",
+                    "tracking_uri": str(tmp_path / "new-store" / "mlruns"),
+                },
+            ]
+        }
+    )
+
+    log_dir = tmp_path / "loggers"
+    log_dir.mkdir()
+    (log_dir / "mlflow_run_id.txt").write_text("abc")
+    (log_dir / "mlflow_tracking_uri.txt").write_text(str(tmp_path / "original" / "mlruns"))
+
+    utils.apply_saved_logger_run_ids(cfg, tmp_path)
+
+    assert cfg.loggers[0]["run_id"] == "fresh"
+    assert cfg.loggers[0]["tracking_uri"] == str(tmp_path / "new-store" / "mlruns")
+
+
 def test_save_logger_run_ids(tmp_path, monkeypatch):
     # Patch lightning logger classes so helpers recognise the dummy objects
     import importlib

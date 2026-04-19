@@ -415,17 +415,37 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
         abc file:///tmp/mlruns_original
         xyz allow
 
-    A caller who explicitly set ``tracking_uri`` in the current config wins — the saved value
-    is only restored when the field is absent. This is the escape hatch for "yes, log into a
-    new store" while keeping the default "resume into the original store" behavior:
+    The restore is all-or-nothing: when we apply a saved ``run_id``, we also override
+    ``tracking_uri`` with the saved value — including when the current config sets
+    ``tracking_uri`` to something else (the default ``configs/trainer/logger/mlflow.yaml``
+    does). That is intentional: resuming a ``run_id`` in a store it wasn't created in is
+    incoherent (the run doesn't exist there), and the repo default interpolates
+    ``tracking_uri`` off the current ``${log_dir}``, so without this override a resumed run
+    would 404 or log to a new store.
 
         >>> cfg = DictConfig(
-        ...     {"loggers": [{"_target_": "MLFlowLogger", "tracking_uri": "file:///tmp/new_store"}]}
+        ...     {"loggers": [{"_target_": "MLFlowLogger", "tracking_uri": "file:///tmp/default_store"}]}
         ... )
         >>> with yaml_disk(disk) as run_dir:
         ...     apply_saved_logger_run_ids(cfg, run_dir)
         ...     print(cfg.loggers[0]["run_id"], cfg.loggers[0]["tracking_uri"])
-        abc file:///tmp/new_store
+        abc file:///tmp/mlruns_original
+
+    To log a new run into a different store (no resume), set ``run_id`` explicitly in the
+    current config — that suppresses the saved-``run_id`` restore, which in turn suppresses
+    the saved-``tracking_uri`` restore:
+
+        >>> cfg = DictConfig(
+        ...     {"loggers": [{
+        ...         "_target_": "MLFlowLogger",
+        ...         "run_id": "fresh",
+        ...         "tracking_uri": "file:///tmp/new_store",
+        ...     }]}
+        ... )
+        >>> with yaml_disk(disk) as run_dir:
+        ...     apply_saved_logger_run_ids(cfg, run_dir)
+        ...     print(cfg.loggers[0]["run_id"], cfg.loggers[0]["tracking_uri"])
+        fresh file:///tmp/new_store
     """
 
     if trainer_cfg is None:
@@ -448,17 +468,26 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
                 logger_cfg.setdefault("resume", "allow")
         elif "mlflow" in target:
             fp = log_dir / "mlflow_run_id.txt"
+            applied_saved_run_id = False
             if fp.is_file() and not logger_cfg.get("run_id"):
                 logger_cfg["run_id"] = fp.read_text().strip()
-            # Restore ``tracking_uri`` too. An MLflow ``run_id`` is only resolvable against the
-            # tracking store it was created in — in this repo the default tracking_uri is derived
-            # from ``${log_dir}`` (i.e. the current run's ``output_dir``), so reusing a saved
-            # run_id in a fresh output dir without also restoring the original tracking_uri sends
-            # the resumed run to the wrong store (or 404s). If the caller explicitly set
-            # ``tracking_uri`` in the current config, we don't override it — that's the escape
-            # hatch for "yes, I really do want to log into a new store." See PR #73 review.
+                applied_saved_run_id = True
+            # Restore ``tracking_uri`` whenever we just applied a saved ``run_id``, overriding
+            # whatever the current config had there. An MLflow ``run_id`` is only resolvable
+            # against the tracking store it was created in; the in-repo default
+            # (``configs/trainer/logger/mlflow.yaml``) sets ``tracking_uri: ${log_dir}/mlflow/mlruns``,
+            # which derives from the *current* run's ``output_dir``, so gating the restore on
+            # ``not logger_cfg.get("tracking_uri")`` (what this code did initially) would never
+            # fire in the common case — the default already populates the field with the new
+            # run's path, and we'd quietly resume a run_id against the wrong store.
+            #
+            # The escape hatch moves: to log to a different store for a genuinely new run, the
+            # caller leaves ``run_id`` explicitly set (or absent from disk) so the restore above
+            # doesn't fire, and we leave ``tracking_uri`` alone. That's coherent. The opposite —
+            # "resume this run_id, but log to a new store" — is incoherent (the run_id doesn't
+            # exist in the new store), and this code now prevents it by construction.
             tracking_fp = log_dir / "mlflow_tracking_uri.txt"
-            if tracking_fp.is_file() and not logger_cfg.get("tracking_uri"):
+            if tracking_fp.is_file() and applied_saved_run_id:
                 logger_cfg["tracking_uri"] = tracking_fp.read_text().strip()
 
 
