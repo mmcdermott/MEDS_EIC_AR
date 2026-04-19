@@ -26,31 +26,52 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import torch
-
     from ...training.module import MEICARModule
 
 logger = logging.getLogger(__name__)
 
 
-def _state_dict_hash(state_dict: dict[str, torch.Tensor]) -> str:
-    """Deterministic content hash of a state_dict.
+def _model_fingerprint(hf_model) -> str:
+    """Deterministic content hash covering both weights and config.
 
-    Used to decide whether a previously-exported HF directory is still current. Hashes the sorted
-    param names concatenated with each tensor's raw bytes. Not meant to survive a tensor-dtype change
-    — a dtype flip produces a different hash, which is the correct "re-export" signal.
+    Used to decide whether a previously-exported HF directory is still current. A stale export
+    would be reused when:
+
+    - **Weights changed**: hashing the state_dict catches this.
+    - **Config changed but weights didn't**: a real case in this repo — the generation CLI
+      auto-populates ``config.eos_token_id`` from the dataset if it's unset, which mutates
+      ``hf_model.config`` without touching any param tensors. Without hashing config too, the
+      second run would reuse a directory with the old ``config.json`` on disk and SGLang/HF
+      would load a stale ``eos_token_id``, breaking cross-chunk stopping in the rolling loop.
 
     Byte extraction goes through ``untyped_storage()`` rather than ``.numpy().tobytes()`` because
     NumPy has no ``bfloat16`` dtype, and Lightning checkpoints trained under
     ``precision: bf16-true`` produce bf16 tensors. The untyped-storage path is dtype-agnostic.
     """
     hasher = hashlib.sha256()
+    # Weights first, in deterministic name order.
+    state_dict = hf_model.state_dict()
     for name in sorted(state_dict):
         t = state_dict[name].detach().cpu().contiguous()
         hasher.update(name.encode())
         hasher.update(b"\x00")
         hasher.update(bytes(t.untyped_storage()))
         hasher.update(b"\x00")
+    # Config next. Any attribute mutation (eos_token_id, max_position_embeddings, etc.)
+    # should flip the hash so callers that modify config-only state trigger re-export.
+    #
+    # ``save_pretrained`` mutates the in-memory config post-hoc — HF adds ``architectures``
+    # and ``dtype`` keys during save that weren't present on first construction. If we hashed
+    # the raw ``to_json_string()`` we'd be non-idempotent: first call (pre-save) and second
+    # call (post-save) would produce different hashes even with no caller-visible changes.
+    # Strip the save-time additions from a ``to_dict()`` copy before hashing so the
+    # fingerprint stays stable across the save boundary. Any future HF-added save-time key
+    # would make the idempotency test fail loudly, which is easy to diagnose.
+    config_dict = hf_model.config.to_dict()
+    for k in ("architectures", "dtype", "torch_dtype"):
+        config_dict.pop(k, None)
+    hasher.update(b"__config__\x00")
+    hasher.update(json.dumps(config_dict, sort_keys=True).encode())
     return hasher.hexdigest()
 
 
@@ -147,7 +168,7 @@ def export_lightning_to_hf_dir(module: MEICARModule, out_dir: Path | str) -> Pat
     out_dir.parent.mkdir(parents=True, exist_ok=True)
 
     hf_model = module.model.HF_model
-    fingerprint = _state_dict_hash(hf_model.state_dict())
+    fingerprint = _model_fingerprint(hf_model)
 
     marker = out_dir / ".export_fingerprint"
     if _is_existing_export_reusable(out_dir, marker, fingerprint):

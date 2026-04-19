@@ -148,6 +148,39 @@ def test_export_rewrites_after_weight_mutation(tmp_path: Path):
     )
 
 
+def test_export_rewrites_when_config_changes_but_weights_do_not(tmp_path: Path):
+    """Config mutations without weight changes must still trigger a re-export.
+
+    Real scenario: ``MEICAR_generate_trajectories`` auto-populates
+    ``hf_model.config.eos_token_id`` from the dataset if it's unset, mutating the config
+    without touching any param tensors. A weights-only fingerprint would happily reuse a
+    stale ``config.json`` with the old eos_token_id and break cross-chunk stopping in the
+    rolling loop. The fingerprint now hashes ``config.to_json_string()`` alongside the
+    state_dict to close that gap.
+    """
+    mod = _tiny_module()
+    out = tmp_path / "hf_model"
+
+    export_lightning_to_hf_dir(mod, out)
+    fp1 = (out / ".export_fingerprint").read_text()
+
+    # Mutate a config attribute without changing any weights.
+    mod.model.HF_model.config.eos_token_id = 99
+
+    export_lightning_to_hf_dir(mod, out)
+    fp2 = (out / ".export_fingerprint").read_text()
+
+    assert fp1 != fp2, (
+        "Fingerprint did not change after config-only mutation — re-export would silently "
+        "reuse a stale config.json (e.g., with the old eos_token_id)."
+    )
+    # Re-loaded config should carry the new value:
+    from transformers import LlamaConfig
+
+    reloaded = LlamaConfig.from_pretrained(out)
+    assert reloaded.eos_token_id == 99
+
+
 def test_export_rewrites_when_structurally_corrupt(tmp_path: Path):
     """A fingerprint-matching directory that's missing load-time files must trigger re-export.
 

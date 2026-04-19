@@ -98,7 +98,11 @@ def sglang_grammar_generated_greedy(
         n_trajectories=grammar_n_trajectories,
         batch_size=grammar_generate_batch_size,
         rolling_max_new_tokens=grammar_rolling_max_new_tokens,
-        backend="sglang",
+        # Uses the demo-scale SGLang config (``max_running_requests=8``,
+        # ``disable_cuda_graph=true``) rather than the production ``sglang`` defaults.
+        # Fast cold-start is a lot more useful than peak decode throughput for a single
+        # grammar-validation test run that exits after one pass.
+        backend="sglang_demo",
     )
     return output_dir
 

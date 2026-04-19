@@ -199,24 +199,15 @@ def generate_trajectories(cfg: DictConfig):
             "you're running this for any other purpose, set inference.do_sample=true."
         )
 
-    # Backend selection (issue #88). ``backend=hf`` is the default and is a no-op — ``Model``
-    # already constructs an ``HFBackend`` in ``__init__``. ``backend=sglang`` materializes an
-    # HF directory from the Lightning checkpoint (idempotent; cached next to the checkpoint),
-    # then swaps ``Model._backend`` for the SGLang engine adapter. Other backend values raise
-    # a clear error here rather than later.
-    backend_cfg = cfg.get("backend", None)
-    if backend_cfg is not None and backend_cfg.get("name", "hf") != "hf":
-        backend_name = backend_cfg.name
-        if backend_name == "sglang":
-            from .model.backends import SGLangBackend
-            from .model.backends.export import export_lightning_to_hf_dir
-
-            hf_dir = export_lightning_to_hf_dir(M, Path(cfg.model_initialization_dir) / "hf_model")
-            engine_kwargs = OmegaConf.to_container(backend_cfg.get("engine", {}), resolve=True)
-            M.model.set_backend(SGLangBackend(hf_dir, engine_kwargs=engine_kwargs))
-            logger.info(f"Generation backend switched to SGLang (engine at {hf_dir}).")
-        else:
-            raise ValueError(f"Unknown backend name {backend_name!r}. Supported values: 'hf', 'sglang'.")
+    # Backend selection (issue #88). Each ``configs/backend/*.yaml`` names a builder via
+    # ``_target_`` — ``build_hf_backend`` returns ``None`` (meaning "keep the default
+    # HFBackend the model constructed in __init__"); ``build_sglang_backend`` materializes
+    # an HF directory from the Lightning checkpoint and returns an ``SGLangBackend``. Adding
+    # a new backend is one new builder + one new yaml, no code change here.
+    if "backend" in cfg:
+        backend = instantiate(cfg.backend, module=M, model_init_dir=cfg.model_initialization_dir)
+        if backend is not None:
+            M.model.set_backend(backend)
 
     apply_saved_logger_run_ids(cfg.trainer, Path(cfg.model_initialization_dir))
     trainer = instantiate(cfg.trainer)
