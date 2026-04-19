@@ -295,5 +295,10 @@ def generate_trajectories(cfg: DictConfig):
             pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
             pq.write_table(pa_table, out_fp)
 
-    save_logger_run_ids(trainer.loggers, Path(cfg.model_initialization_dir))
+    # Save the generation run's logger ids into the *generation* ``output_dir``, not the
+    # training checkpoint's ``model_initialization_dir``. A caller using the escape hatch
+    # described in ``apply_saved_logger_run_ids`` (explicit fresh ``run_id`` for generation)
+    # would otherwise overwrite the training run's saved ids and change what future pretrain-
+    # resume attaches to. Separating the two directories keeps the pretrain save-point frozen.
+    save_logger_run_ids(trainer.loggers, Path(cfg.output_dir))
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")

@@ -80,6 +80,36 @@ def test_apply_saved_logger_run_ids_overrides_default_mlflow_tracking_uri(tmp_pa
     assert cfg.loggers[1]["resume"] == "allow"
 
 
+def test_apply_saved_logger_run_ids_handles_disabled_logger(tmp_path):
+    """``trainer.logger=false`` / ``trainer.logger=null`` must not crash.
+
+    Lightning accepts ``logger: bool | Logger | Iterable[Logger]``. A Hydra user who disables
+    logging via ``trainer.logger=false`` would have previously tripped an ``AttributeError``
+    inside this helper when it tried ``logger_cfg.get("_target_", "")`` on a bool. The
+    normalization step now skips non-mapping entries silently.
+    """
+    log_dir = tmp_path / "loggers"
+    log_dir.mkdir()
+    (log_dir / "mlflow_run_id.txt").write_text("abc")
+
+    # Case: single logger disabled via bool.
+    cfg_bool = DictConfig({"logger": False})
+    utils.apply_saved_logger_run_ids(cfg_bool, tmp_path)  # does not raise
+
+    # Case: single logger disabled via null.
+    cfg_null = DictConfig({"logger": None})
+    utils.apply_saved_logger_run_ids(cfg_null, tmp_path)
+
+    # Case: ``loggers`` key holds a bool rather than a list.
+    cfg_list_bool = DictConfig({"loggers": False})
+    utils.apply_saved_logger_run_ids(cfg_list_bool, tmp_path)
+
+    # Case: mixed — real dict entry alongside a null entry in the list; real entry still patched.
+    cfg_mixed = DictConfig({"loggers": [None, {"_target_": "MLFlowLogger"}]})
+    utils.apply_saved_logger_run_ids(cfg_mixed, tmp_path)
+    assert cfg_mixed.loggers[1]["run_id"] == "abc"
+
+
 def test_apply_saved_logger_run_ids_preserves_explicit_run_id(tmp_path):
     """If the caller explicitly set ``run_id``, neither ``run_id`` nor ``tracking_uri`` is restored.
 
@@ -146,22 +176,44 @@ def test_generation_speed_logger_logs_once_on_rank_zero():
             self.is_global_zero = is_global_zero
             self.global_step = global_step
 
-    # Rank-zero happy path: one epoch, one metric written.
+    # Rank-zero happy path: one epoch with two batches → all mean/min/max/std metrics written.
     rec = RecordingLogger()
     cb = GenerationSpeedLogger()
     trainer = FakeTrainer(loggers=[rec])
     cb.on_predict_start(trainer, pl_module=None)
     cb.on_predict_epoch_start(trainer, pl_module=None)
+    cb.on_predict_batch_start(trainer, pl_module=None, batch=None, batch_idx=0)
+    cb.on_predict_batch_end(trainer, pl_module=None, outputs=None, batch=None, batch_idx=0)
+    cb.on_predict_batch_start(trainer, pl_module=None, batch=None, batch_idx=1)
+    cb.on_predict_batch_end(trainer, pl_module=None, outputs=None, batch=None, batch_idx=1)
     cb.on_predict_epoch_end(trainer, pl_module=None)
     cb.on_predict_end(trainer, pl_module=None)
 
     assert len(rec.calls) == 1
     metrics, step = rec.calls[0]
-    assert set(metrics) == {"predict/avg_epoch_time_sec"}
-    assert metrics["predict/avg_epoch_time_sec"] >= 0.0
+    expected_keys = {
+        "predict/total_time_sec",
+        "predict/num_batches",
+        "predict/epoch_time_sec_mean",
+        "predict/epoch_time_sec_min",
+        "predict/epoch_time_sec_max",
+        "predict/epoch_time_sec_std",
+        "predict/batch_time_sec_mean",
+        "predict/batch_time_sec_min",
+        "predict/batch_time_sec_max",
+        "predict/batch_time_sec_std",
+    }
+    assert set(metrics) == expected_keys
+    assert metrics["predict/num_batches"] == 2
+    # All time-like values are non-negative; min <= mean <= max for both granularities.
+    for prefix in ("predict/epoch_time_sec", "predict/batch_time_sec"):
+        assert metrics[f"{prefix}_min"] <= metrics[f"{prefix}_mean"] <= metrics[f"{prefix}_max"]
+        assert metrics[f"{prefix}_std"] >= 0.0
+    # Single-epoch case collapses epoch std to 0.0 (population stdev of one sample is 0).
+    assert metrics["predict/epoch_time_sec_std"] == 0.0
     assert step == 42
 
-    # Non-rank-zero path: nothing logged even though epoch times were recorded.
+    # Non-rank-zero path: nothing logged even though epoch/batch times were recorded.
     rec2 = RecordingLogger()
     cb2 = GenerationSpeedLogger()
     trainer2 = FakeTrainer(loggers=[rec2], is_global_zero=False)

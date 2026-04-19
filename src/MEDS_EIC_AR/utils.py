@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from lightning.pytorch.loggers import Logger
 from MEDS_transforms.configs.utils import OmegaConfResolver
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
@@ -451,11 +451,25 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
     if trainer_cfg is None:
         return
 
-    loggers = []
+    # Lightning accepts ``logger: bool | Logger | Iterable[Logger]``; Hydra lets users disable
+    # logging entirely with ``trainer.logger=false`` or ``trainer.logger=null``. Normalize all
+    # three cases into a flat list of dict-like configs before we start indexing with ``.get``.
+    # Anything non-mapping (``True``/``False``/``None``, concrete Logger instances from Hydra
+    # ``_target_`` resolution — though this helper usually runs *before* instantiation, it can
+    # also be called on already-resolved configs) is skipped silently.
+    raw_entries: list = []
     if "logger" in trainer_cfg:
-        loggers.append(trainer_cfg.logger)
+        raw_entries.append(trainer_cfg.logger)
     if "loggers" in trainer_cfg:
-        loggers.extend(trainer_cfg.loggers)
+        loggers_field = trainer_cfg.loggers
+        if isinstance(loggers_field, DictConfig | dict):
+            raw_entries.append(loggers_field)
+        elif isinstance(loggers_field, list | ListConfig):
+            raw_entries.extend(loggers_field)
+        # Any other shape (bool, None, concrete object) is just a single non-mapping entry;
+        # the ``hasattr`` guard below skips it.
+
+    loggers = [e for e in raw_entries if e is not None and hasattr(e, "get")]
 
     log_dir = Path(run_dir) / "loggers"
 
