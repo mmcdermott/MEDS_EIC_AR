@@ -272,33 +272,37 @@ def _run_grammar_generate(
     n_trajectories: int,
     batch_size: int,
     rolling_max_new_tokens: int,
+    backend: str = "hf",
 ) -> None:
     """Invoke ``MEICAR_generate_trajectories`` with the shared grammar fixture config.
 
     Centralized so the sampling and greedy fixtures only differ by ``do_sample`` and can't
-    drift on other knobs.
+    drift on other knobs. ``backend`` defaults to ``"hf"`` (the CPU-runnable default backend);
+    gated GPU tests pass ``backend="sglang"`` to drive the end-to-end pipeline through the
+    SGLang engine, which requires both the optional ``sglang`` extra and a CUDA device.
     """
-    _run_and_check(
-        [
-            "MEICAR_generate_trajectories",
-            "--config-name=_demo_generate_trajectories",
-            f"output_dir={output_dir!s}",
-            f"model_initialization_dir={grammar_pretrained!s}",
-            f"datamodule.config.tensorized_cohort_dir={grammar_preprocessed!s}",
-            f"datamodule.config.task_labels_dir={task_dir!s}",
-            f"datamodule.batch_size={batch_size}",
-            "trainer=demo",
-            f"inference.N_trajectories_per_task_sample={n_trajectories}",
-            # Restrict to held_out only. ``_demo_generate_trajectories``'s default is to
-            # generate for all three splits, but the content tests in ``test_cli.py`` only
-            # consume held_out; generating on ~``n_train`` train subjects x N trajectories is
-            # pure overhead for the grammar fixture. Structural tests (which iterate all
-            # splits) read this list back via the fixture ``grammar_generated_splits``.
-            "inference.generate_for_splits=[held_out]",
-            f"inference.do_sample={str(do_sample).lower()}",
-            f"rolling_generation.max_new_tokens={rolling_max_new_tokens}",
-        ]
-    )
+    args = [
+        "MEICAR_generate_trajectories",
+        "--config-name=_demo_generate_trajectories",
+        f"output_dir={output_dir!s}",
+        f"model_initialization_dir={grammar_pretrained!s}",
+        f"datamodule.config.tensorized_cohort_dir={grammar_preprocessed!s}",
+        f"datamodule.config.task_labels_dir={task_dir!s}",
+        f"datamodule.batch_size={batch_size}",
+        "trainer=demo",
+        f"inference.N_trajectories_per_task_sample={n_trajectories}",
+        # Restrict to held_out only. ``_demo_generate_trajectories``'s default is to
+        # generate for all three splits, but the content tests in ``test_cli.py`` only
+        # consume held_out; generating on ~``n_train`` train subjects x N trajectories is
+        # pure overhead for the grammar fixture. Structural tests (which iterate all
+        # splits) read this list back via the fixture ``grammar_generated_splits``.
+        "inference.generate_for_splits=[held_out]",
+        f"inference.do_sample={str(do_sample).lower()}",
+        f"rolling_generation.max_new_tokens={rolling_max_new_tokens}",
+    ]
+    if backend != "hf":
+        args.append(f"backend={backend}")
+    _run_and_check(args)
 
 
 @pytest.fixture(scope="session")
