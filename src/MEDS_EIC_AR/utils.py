@@ -1,12 +1,13 @@
 import logging
 import multiprocessing
+from collections.abc import Sequence
 from hashlib import sha256
 from pathlib import Path
 
 import torch
 from lightning.pytorch.loggers import Logger
 from MEDS_transforms.configs.utils import OmegaConfResolver
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
@@ -25,29 +26,60 @@ def is_mlflow_logger(logger: Logger) -> bool:
         return False
 
 
-def hash_based_seed(seed: int | None, split: str, sample: int) -> int:
+def is_wandb_logger(logger: Logger) -> bool:
+    """Check whether a Lightning logger is a WandB logger.
+
+    The import of :class:`~lightning.pytorch.loggers.WandbLogger` may fail if
+    the optional ``wandb`` dependency is not installed. This helper safely
+    returns ``False`` in that situation.
+
+    Example:
+        >>> class DummyLogger:
+        ...     ...
+        >>> is_wandb_logger(DummyLogger())
+        False
+        >>> import builtins
+        >>> from unittest.mock import patch
+        >>> original_import = builtins.__import__
+        >>> def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        ...     if name == "lightning.pytorch.loggers" and "WandbLogger" in fromlist:
+        ...         raise ImportError
+        ...     return original_import(name, globals, locals, fromlist, level)
+        >>> with patch.object(builtins, "__import__", fake_import):
+        ...     is_wandb_logger(DummyLogger())
+        False
+    """
+
+    try:
+        from lightning.pytorch.loggers import WandbLogger
+
+        return isinstance(logger, WandbLogger)
+    except ImportError:
+        return False
+
+
+def hash_based_seed(seed: int | None, split: str) -> int:
     """Generates a hash-based seed for reproducibility.
 
-    This function generates a hash-based seed using the provided seed, split, and sample values. It is
+    This function generates a hash-based seed using the provided seed and split values. It is
     designed to be used in conjunction with OmegaConf for configuration management.
 
     Args:
         seed: The original seed value. THIS WILL NOT OVERWRITE THE OUTPUT. Rather, this just ensures the
             sequence of seeds chosen can be deterministically updated by changing a base parameter.
         split: The split identifier.
-        sample: The sample index.
 
     Returns:
         A hash-based seed value.
 
     Examples:
-        >>> hash_based_seed(42, "train", 0)
-        1508872876
-        >>> hash_based_seed(None, "held_out", 1)
-        3132876237
+        >>> hash_based_seed(42, "train")
+        1631825622
+        >>> hash_based_seed(None, "held_out")
+        1088888987
     """
 
-    hash_str = f"{seed}_{split}_{sample}"
+    hash_str = f"{seed}_{split}"
     return int(sha256(hash_str.encode()).hexdigest(), 16) % (2**32 - 1)
 
 
@@ -356,3 +388,201 @@ def save_resolved_config(cfg: DictConfig, fp: Path) -> bool:
     except Exception as e:
         logger.warning(f"Could not save resolved config: {e}")
         return False
+
+
+def _read_saved_id(fp: Path) -> str | None:
+    """Read a saved-id file defensively; return ``None`` if the file is missing, unreadable, or blank.
+
+    Called by :func:`apply_saved_logger_run_ids` for every ``mlflow_run_id.txt`` /
+    ``wandb_run_id.txt`` / ``mlflow_tracking_uri.txt`` lookup. Treating an empty or
+    whitespace-only file as "no saved id" matches user intent: a sentinel with no content
+    shouldn't silently poison downstream logger instantiation with an invalid ``run_id=""``.
+    I/O errors (permission denied, concurrent delete, disk failures) are logged at warning
+    level and treated as "no saved id" — the caller's run proceeds with the pre-restore
+    config rather than crashing before any compute has run.
+    """
+    if not fp.is_file():
+        return None
+    try:
+        content = fp.read_text().strip()
+    except OSError as e:
+        logger.warning(f"Could not read saved logger id at {fp}: {e}. Skipping restore.")
+        return None
+    return content or None
+
+
+def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
+    """Populate logger configs with saved experiment IDs if present.
+
+    This helper mutates the provided trainer configuration in-place and reads
+    any saved run IDs from ``<run_dir>/loggers``. It is kept separate from
+    OmegaConf resolvers so configuration loading remains straightforward.
+
+    Example:
+        >>> from yaml_to_disk import yaml_disk
+        >>> cfg = DictConfig(
+        ...     {"loggers": [{"_target_": "MLFlowLogger"}, {"_target_": "WandbLogger"}]}
+        ... )
+        >>> disk = '''
+        ... loggers:
+        ...   "mlflow_run_id.txt": abc
+        ...   "mlflow_tracking_uri.txt": file:///tmp/mlruns_original
+        ...   "wandb_run_id.txt": xyz
+        ... '''
+        >>> with yaml_disk(disk) as run_dir:
+        ...     apply_saved_logger_run_ids(cfg, run_dir)
+        ...     print(cfg.loggers[0]["run_id"], cfg.loggers[0]["tracking_uri"])
+        ...     print(cfg.loggers[1]["id"], cfg.loggers[1]["resume"])
+        abc file:///tmp/mlruns_original
+        xyz allow
+
+    The restore is all-or-nothing: when we apply a saved ``run_id``, we also override
+    ``tracking_uri`` with the saved value — including when the current config sets
+    ``tracking_uri`` to something else (the default ``configs/trainer/logger/mlflow.yaml``
+    does). That is intentional: resuming a ``run_id`` in a store it wasn't created in is
+    incoherent (the run doesn't exist there), and the repo default interpolates
+    ``tracking_uri`` off the current ``${log_dir}``, so without this override a resumed run
+    would 404 or log to a new store.
+
+        >>> cfg = DictConfig(
+        ...     {"loggers": [{"_target_": "MLFlowLogger", "tracking_uri": "file:///tmp/default_store"}]}
+        ... )
+        >>> with yaml_disk(disk) as run_dir:
+        ...     apply_saved_logger_run_ids(cfg, run_dir)
+        ...     print(cfg.loggers[0]["run_id"], cfg.loggers[0]["tracking_uri"])
+        abc file:///tmp/mlruns_original
+
+    To log a new run into a different store (no resume), set ``run_id`` explicitly in the
+    current config — that suppresses the saved-``run_id`` restore, which in turn suppresses
+    the saved-``tracking_uri`` restore:
+
+        >>> cfg = DictConfig(
+        ...     {"loggers": [{
+        ...         "_target_": "MLFlowLogger",
+        ...         "run_id": "fresh",
+        ...         "tracking_uri": "file:///tmp/new_store",
+        ...     }]}
+        ... )
+        >>> with yaml_disk(disk) as run_dir:
+        ...     apply_saved_logger_run_ids(cfg, run_dir)
+        ...     print(cfg.loggers[0]["run_id"], cfg.loggers[0]["tracking_uri"])
+        fresh file:///tmp/new_store
+    """
+
+    if trainer_cfg is None:
+        return
+
+    # Lightning accepts ``logger: bool | Logger | Iterable[Logger]``; Hydra lets users disable
+    # logging entirely with ``trainer.logger=false`` or ``trainer.logger=null``. Normalize all
+    # three cases into a flat list of dict-like configs before we start indexing with ``.get``.
+    # Anything non-mapping (``True``/``False``/``None``, concrete Logger instances from Hydra
+    # ``_target_`` resolution — though this helper usually runs *before* instantiation, it can
+    # also be called on already-resolved configs) is skipped silently.
+    raw_entries: list = []
+    if "logger" in trainer_cfg:
+        raw_entries.append(trainer_cfg.logger)
+    if "loggers" in trainer_cfg:
+        loggers_field = trainer_cfg.loggers
+        if isinstance(loggers_field, DictConfig | dict):
+            raw_entries.append(loggers_field)
+        elif isinstance(loggers_field, list | ListConfig):
+            raw_entries.extend(loggers_field)
+        # Any other shape (bool, None, concrete object) is just a single non-mapping entry;
+        # the ``hasattr`` guard below skips it.
+
+    loggers = [e for e in raw_entries if e is not None and hasattr(e, "get")]
+
+    log_dir = Path(run_dir) / "loggers"
+
+    for logger_cfg in loggers:
+        target = str(logger_cfg.get("_target_", "")).lower()
+        if "wandb" in target:
+            fp = log_dir / "wandb_run_id.txt"
+            saved = _read_saved_id(fp)
+            if saved and not logger_cfg.get("id"):
+                logger_cfg["id"] = saved
+                logger_cfg.setdefault("resume", "allow")
+        elif "mlflow" in target:
+            fp = log_dir / "mlflow_run_id.txt"
+            applied_saved_run_id = False
+            saved = _read_saved_id(fp)
+            if saved and not logger_cfg.get("run_id"):
+                logger_cfg["run_id"] = saved
+                applied_saved_run_id = True
+            # Restore ``tracking_uri`` whenever we just applied a saved ``run_id``, overriding
+            # whatever the current config had there. An MLflow ``run_id`` is only resolvable
+            # against the tracking store it was created in; the in-repo default
+            # (``configs/trainer/logger/mlflow.yaml``) sets ``tracking_uri: ${log_dir}/mlflow/mlruns``,
+            # which derives from the *current* run's ``output_dir``, so gating the restore on
+            # ``not logger_cfg.get("tracking_uri")`` (what this code did initially) would never
+            # fire in the common case — the default already populates the field with the new
+            # run's path, and we'd quietly resume a run_id against the wrong store.
+            #
+            # The escape hatch moves: to log to a different store for a genuinely new run, the
+            # caller leaves ``run_id`` explicitly set (or absent from disk) so the restore above
+            # doesn't fire, and we leave ``tracking_uri`` alone. That's coherent. The opposite —
+            # "resume this run_id, but log to a new store" — is incoherent (the run_id doesn't
+            # exist in the new store), and this code now prevents it by construction.
+            if applied_saved_run_id:
+                saved_uri = _read_saved_id(log_dir / "mlflow_tracking_uri.txt")
+                if saved_uri:
+                    logger_cfg["tracking_uri"] = saved_uri
+
+
+def save_logger_run_ids(loggers: Sequence[Logger], run_dir: Path) -> None:
+    """Save experiment IDs for MLFlow and WandB loggers.
+
+    Args:
+        loggers: Collection of :class:`~lightning.pytorch.loggers.Logger` objects
+            used during the run.
+        run_dir: Directory where run IDs should be stored.
+
+    Example:
+        >>> class DummyMLFlowLogger:
+        ...     def __init__(self, run_id="foo"):
+        ...         self.run_id = run_id
+        >>> class DummyWandBExp:
+        ...     def __init__(self, id="bar"):
+        ...         self.id = id
+        >>> class DummyWandbLogger:
+        ...     def __init__(self, exp_id="bar"):
+        ...         self.experiment = DummyWandBExp(exp_id)
+        >>> import tempfile
+        >>> from unittest.mock import patch
+        >>> mlflow_patch = patch(
+        ...     "lightning.pytorch.loggers.MLFlowLogger", DummyMLFlowLogger, create=True
+        ... )
+        >>> wandb_patch = patch(
+        ...     "lightning.pytorch.loggers.WandbLogger", DummyWandbLogger, create=True
+        ... )
+        >>> with mlflow_patch, wandb_patch, tempfile.TemporaryDirectory() as tmp:
+        ...     run_dir = Path(tmp)
+        ...     save_logger_run_ids(
+        ...         [DummyMLFlowLogger("mlflow"), DummyWandbLogger("wandb")], run_dir
+        ...     )
+        ...     print((run_dir / "loggers" / "mlflow_run_id.txt").read_text())
+        ...     print((run_dir / "loggers" / "wandb_run_id.txt").read_text())
+        mlflow
+        wandb
+    """
+
+    log_dir = Path(run_dir) / "loggers"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    for logger in loggers:
+        if is_mlflow_logger(logger):
+            (log_dir / "mlflow_run_id.txt").write_text(str(logger.run_id))
+            # Persist ``tracking_uri`` too so ``apply_saved_logger_run_ids`` can attach the
+            # resumed run back to the store it was created in. Attribute is
+            # ``_tracking_uri`` (private) on Lightning's MLFlowLogger; fall back to any
+            # public ``tracking_uri`` if a future Lightning version exposes one. Missing
+            # attribute is survivable — the resume call will work in the common case where
+            # the current tracking_uri happens to match the saved one, and fail with a
+            # clear error otherwise.
+            tracking_uri = getattr(logger, "_tracking_uri", None) or getattr(logger, "tracking_uri", None)
+            if tracking_uri:
+                (log_dir / "mlflow_tracking_uri.txt").write_text(str(tracking_uri))
+            continue
+
+        if is_wandb_logger(logger):
+            (log_dir / "wandb_run_id.txt").write_text(str(logger.experiment.id))

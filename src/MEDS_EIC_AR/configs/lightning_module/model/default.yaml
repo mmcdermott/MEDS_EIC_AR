@@ -13,8 +13,6 @@ gpt_kwargs:
 
   # Regularization
   attention_dropout: 0.0
-  hidden_dropout: 0.0
-  classifier_dropout: 0.1
 
   # Dictated by the data
 

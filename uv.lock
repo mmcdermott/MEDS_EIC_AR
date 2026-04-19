@@ -1609,7 +1609,7 @@ requires-dist = [
     { name = "pytest" },
     { name = "torch" },
     { name = "torchmetrics" },
-    { name = "transformers" },
+    { name = "transformers", specifier = ">=4.56" },
     { name = "wandb", marker = "extra == 'wandb'" },
 ]
 provides-extras = ["wandb", "mlflow"]
