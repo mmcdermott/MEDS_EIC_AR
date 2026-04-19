@@ -1,7 +1,6 @@
 import logging
 import os
 import subprocess
-import sys
 from importlib.resources import files
 from pathlib import Path
 
@@ -30,11 +29,14 @@ def _run_streamed(cmd: list[str], *, env: dict[str, str] | None = None, stage_na
     parent's streams removes that asymmetry entirely — failure output is already visible.
     """
     logger.info(f"Running command: {' '.join(cmd)}")
-    # ``stdout`` / ``stderr`` defaulting to ``None`` in subprocess.run means "inherit the
-    # parent's file descriptors," which is the streaming behavior we want. Explicitly naming
-    # ``sys.stdout`` / ``sys.stderr`` so this stays correct under Hydra loggers that have
-    # redirected Python's streams (the underlying OS fd is still the right destination).
-    result = subprocess.run(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr, check=False)
+    # Letting ``stdout`` / ``stderr`` default to ``None`` in ``subprocess.run`` means "inherit
+    # the parent process's OS-level file descriptors," which is exactly the streaming behavior
+    # we want. Previously we passed ``sys.stdout`` / ``sys.stderr`` explicitly, but those are
+    # Python-level wrappers that can be swapped by pytest capture, Jupyter notebooks, or any
+    # logging wrapper — in those environments ``sys.stdout`` has no real ``fileno()`` and
+    # ``subprocess.run`` either raises or redirects to an unintended destination. Default
+    # (inherit) is both sufficient and robust to all such wrappers.
+    result = subprocess.run(cmd, env=env, check=False)
     if result.returncode != 0:  # pragma: no cover
         raise RuntimeError(
             f"{stage_name} failed with exit code {result.returncode}. "
