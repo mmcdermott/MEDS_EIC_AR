@@ -9,9 +9,6 @@ gpt_kwargs:
   num_attention_heads: ???
   attention_head_dim: ???
   hidden_size: ${int_prod:${.num_attention_heads},${.attention_head_dim}}
-  # Llama uses SwiGLU (3 projections vs NeoX GELU's 2), so matching NeoX parameter count would
-  # need intermediate_size ≈ (8/3)*hidden_size. We keep 4× here to preserve the YAML formula;
-  # callers targeting strict NeoX-param-parity can override intermediate_size explicitly.
   intermediate_size: ${int_prod:${.hidden_size},4}
 
   # Regularization
