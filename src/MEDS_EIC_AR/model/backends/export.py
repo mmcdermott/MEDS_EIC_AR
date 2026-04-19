@@ -54,6 +54,36 @@ def _state_dict_hash(state_dict: dict[str, torch.Tensor]) -> str:
     return hasher.hexdigest()
 
 
+def _is_existing_export_reusable(out_dir: Path, marker: Path, fingerprint: str) -> bool:
+    """Decide whether an existing export directory can be reused without re-writing.
+
+    Fingerprint match alone isn't sufficient — an external cleanup step (partial ``rm``,
+    aborted sync, user hand-editing the directory, an earlier exporter that crashed mid-write
+    but managed to land the marker) could have deleted weight shards or ``config.json`` while
+    leaving ``.export_fingerprint`` intact. The fast-path needs to verify the directory still
+    has the files SGLang/HF will look for at load time; otherwise we'd skip the re-export and
+    fail later with an opaque loader error.
+
+    Structural check: ``config.json`` + ``tokenizer_config.json`` + at least one
+    ``*.safetensors`` shard. If any is missing, return ``False`` so the caller falls through
+    to a fresh export. Emits a warning in that case so the user knows what happened.
+    """
+    if not (out_dir.is_dir() and marker.is_file() and marker.read_text().strip() == fingerprint):
+        return False
+    structural_ok = (
+        (out_dir / "config.json").is_file()
+        and (out_dir / "tokenizer_config.json").is_file()
+        and any(out_dir.glob("*.safetensors"))
+    )
+    if not structural_ok:
+        logger.warning(
+            f"Fingerprint at {out_dir} matches but the directory is missing expected files "
+            "(config.json / tokenizer_config.json / *.safetensors); re-exporting."
+        )
+        return False
+    return True
+
+
 def export_lightning_to_hf_dir(module: MEICARModule, out_dir: Path | str) -> Path:
     """Materialize a ``MEICARModule``'s HF submodel as an on-disk HF directory.
 
@@ -120,7 +150,7 @@ def export_lightning_to_hf_dir(module: MEICARModule, out_dir: Path | str) -> Pat
     fingerprint = _state_dict_hash(hf_model.state_dict())
 
     marker = out_dir / ".export_fingerprint"
-    if out_dir.is_dir() and marker.is_file() and marker.read_text().strip() == fingerprint:
+    if _is_existing_export_reusable(out_dir, marker, fingerprint):
         logger.debug(f"Reusing existing HF export at {out_dir} (fingerprint match).")
         return out_dir
 
@@ -144,9 +174,11 @@ def export_lightning_to_hf_dir(module: MEICARModule, out_dir: Path | str) -> Pat
         raise
 
     # Atomic-ish swap: remove any stale destination then rename tmp → out_dir. If a concurrent
-    # export already landed a fresh directory with matching fingerprint, skip our write entirely
-    # and clean up — the losing writer's staging dir goes away, the winner's final dir stands.
-    if out_dir.is_dir() and marker.is_file() and marker.read_text().strip() == fingerprint:
+    # export already landed a structurally-complete directory with matching fingerprint, skip
+    # our write entirely and clean up — the losing writer's staging dir goes away, the
+    # winner's final dir stands. If the winner's directory is corrupt we fall through and
+    # install ours over it.
+    if _is_existing_export_reusable(out_dir, marker, fingerprint):
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.debug(
             f"Concurrent export already landed at {out_dir} with matching fingerprint; "

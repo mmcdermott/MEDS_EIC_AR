@@ -146,3 +146,32 @@ def test_export_rewrites_after_weight_mutation(tmp_path: Path):
     assert fp1 != fp2, (
         "Fingerprint did not change after weight mutation — re-export would silently reuse stale weights."
     )
+
+
+def test_export_rewrites_when_structurally_corrupt(tmp_path: Path):
+    """A fingerprint-matching directory that's missing load-time files must trigger re-export.
+
+    Reliability guard: an external cleanup step (partial ``rm``, aborted sync, user editing)
+    could delete weight shards while leaving ``.export_fingerprint`` intact. The fast-path
+    skip used to fire anyway, then SGLang/HF would fail at load time with an opaque error.
+    Now the fast-path verifies structural integrity (config.json + tokenizer_config.json +
+    at least one *.safetensors) before reusing; if any is missing, it re-exports.
+    """
+    mod = _tiny_module()
+    out = tmp_path / "hf_model"
+
+    first = export_lightning_to_hf_dir(mod, out)
+    # Delete every safetensors shard but keep the fingerprint marker. A pure fingerprint check
+    # would happily skip the re-export and leave the directory unloadable.
+    shards = list(first.glob("*.safetensors"))
+    assert shards, "test setup: initial export should produce at least one safetensors shard"
+    for shard in shards:
+        shard.unlink()
+    assert (first / ".export_fingerprint").is_file()
+
+    # Re-run: should detect the missing shard, warn, and re-export.
+    export_lightning_to_hf_dir(mod, out)
+
+    assert list(first.glob("*.safetensors")), (
+        "Structural re-check should have triggered a re-export and restored the safetensors shards."
+    )
