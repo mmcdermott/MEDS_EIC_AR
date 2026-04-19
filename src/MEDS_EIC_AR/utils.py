@@ -390,6 +390,27 @@ def save_resolved_config(cfg: DictConfig, fp: Path) -> bool:
         return False
 
 
+def _read_saved_id(fp: Path) -> str | None:
+    """Read a saved-id file defensively; return ``None`` if the file is missing, unreadable, or blank.
+
+    Called by :func:`apply_saved_logger_run_ids` for every ``mlflow_run_id.txt`` /
+    ``wandb_run_id.txt`` / ``mlflow_tracking_uri.txt`` lookup. Treating an empty or
+    whitespace-only file as "no saved id" matches user intent: a sentinel with no content
+    shouldn't silently poison downstream logger instantiation with an invalid ``run_id=""``.
+    I/O errors (permission denied, concurrent delete, disk failures) are logged at warning
+    level and treated as "no saved id" — the caller's run proceeds with the pre-restore
+    config rather than crashing before any compute has run.
+    """
+    if not fp.is_file():
+        return None
+    try:
+        content = fp.read_text().strip()
+    except OSError as e:
+        logger.warning(f"Could not read saved logger id at {fp}: {e}. Skipping restore.")
+        return None
+    return content or None
+
+
 def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
     """Populate logger configs with saved experiment IDs if present.
 
@@ -477,14 +498,16 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
         target = str(logger_cfg.get("_target_", "")).lower()
         if "wandb" in target:
             fp = log_dir / "wandb_run_id.txt"
-            if fp.is_file() and not logger_cfg.get("id"):
-                logger_cfg["id"] = fp.read_text().strip()
+            saved = _read_saved_id(fp)
+            if saved and not logger_cfg.get("id"):
+                logger_cfg["id"] = saved
                 logger_cfg.setdefault("resume", "allow")
         elif "mlflow" in target:
             fp = log_dir / "mlflow_run_id.txt"
             applied_saved_run_id = False
-            if fp.is_file() and not logger_cfg.get("run_id"):
-                logger_cfg["run_id"] = fp.read_text().strip()
+            saved = _read_saved_id(fp)
+            if saved and not logger_cfg.get("run_id"):
+                logger_cfg["run_id"] = saved
                 applied_saved_run_id = True
             # Restore ``tracking_uri`` whenever we just applied a saved ``run_id``, overriding
             # whatever the current config had there. An MLflow ``run_id`` is only resolvable
@@ -500,9 +523,10 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
             # doesn't fire, and we leave ``tracking_uri`` alone. That's coherent. The opposite —
             # "resume this run_id, but log to a new store" — is incoherent (the run_id doesn't
             # exist in the new store), and this code now prevents it by construction.
-            tracking_fp = log_dir / "mlflow_tracking_uri.txt"
-            if tracking_fp.is_file() and applied_saved_run_id:
-                logger_cfg["tracking_uri"] = tracking_fp.read_text().strip()
+            if applied_saved_run_id:
+                saved_uri = _read_saved_id(log_dir / "mlflow_tracking_uri.txt")
+                if saved_uri:
+                    logger_cfg["tracking_uri"] = saved_uri
 
 
 def save_logger_run_ids(loggers: Sequence[Logger], run_dir: Path) -> None:
