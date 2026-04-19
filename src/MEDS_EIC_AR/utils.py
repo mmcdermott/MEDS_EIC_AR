@@ -421,34 +421,21 @@ def save_environment_snapshot(fp: Path) -> bool:
     Returns:
         ``True`` if the snapshot was written successfully, ``False`` otherwise.
 
-    Examples:
+    Example:
         >>> with tempfile.NamedTemporaryFile(suffix=".txt") as tmp_file:
-        ...     saved = save_environment_snapshot(Path(tmp_file.name))
-        ...     contents = Path(tmp_file.name).read_text()
-        ...     print(f"Saved: {saved}")
-        ...     print(contents.splitlines()[0])  # Header format is stable
-        ...     print(contents.splitlines()[1].startswith("# python: "))
-        ...     print(contents.splitlines()[2].startswith("# platform: "))
-        ...     # Every non-header line looks like a pip-freeze entry:
-        ...     pkg_lines = [line for line in contents.splitlines() if not line.startswith("#")]
-        ...     print(all("==" in line for line in pkg_lines))
-        ...     # Case-insensitive sort; matches the helper's ordering key.
-        ...     print(pkg_lines == sorted(pkg_lines, key=str.lower))
-        Saved: True
+        ...     save_environment_snapshot(Path(tmp_file.name))
+        ...     print(Path(tmp_file.name).read_text())  # doctest: +ELLIPSIS
+        True
         # MEDS_EIC_AR run environment snapshot
-        True
-        True
-        True
-        True
+        # python: ...
+        # platform: ...
+        ...==...
+        ...
 
-    A missing parent directory is handled rather than erroring:
-
-        >>> with tempfile.TemporaryDirectory() as tmp:
-        ...     fp = Path(tmp) / "missing_subdir" / "env.txt"
-        ...     print(save_environment_snapshot(fp))
-        ...     print(fp.is_file())
-        True
-        True
+    Per-invariant assertions (header format, pip-freeze line shape, sort order,
+    missing-parent-dir handling, etc.) live in
+    ``tests/test_environment_snapshot.py`` as readable pytest cases rather than
+    cluttering the docstring.
     """
     import importlib.metadata
     import platform
