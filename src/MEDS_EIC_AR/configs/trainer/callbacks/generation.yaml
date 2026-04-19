@@ -1,5 +1,10 @@
+# Generation-time callback set. Deliberately does NOT inherit ``default`` because that brings
+# in ``model_checkpoint`` / ``early_stopping`` / ``learning_rate_monitor`` — all training-
+# lifecycle callbacks that don't fire under ``trainer.predict()``. They were inert but visibly
+# present in the config, which misled readers copy-pasting from here into related scenarios
+# (e.g. a future ``score_trajectories`` entrypoint). Keeping only callbacks that actually do
+# something during predict: the speed logger.
 defaults:
-  - default
   - generation_speed_logger
   - _self_
 
