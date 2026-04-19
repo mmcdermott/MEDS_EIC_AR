@@ -11,7 +11,8 @@ configuration structure is as follows:
 ├── _pretrain.yaml
 ├── backend
 │   ├── hf.yaml
-│   └── sglang.yaml
+│   ├── sglang.yaml
+│   └── sglang_demo.yaml
 ├── datamodule
 │   ├── default.yaml
 │   ├── generate_trajectories.yaml
