@@ -268,10 +268,19 @@ class MEICARModule(L.LightningModule):
     def _is_norm_bias_param(n: str) -> bool:
         """Checks if a parameter name corresponds to a bias or normalization layer.
 
-        The ``norm`` stem is matched with an optional ``layer_?`` prefix so the pattern covers both the
-        older NeoX naming (``final_layer_norm.weight``, ``input_layernorm.weight``) and Llama-style
-        RMSNorm names where the final norm is just ``norm.weight``. Without the bare-``norm`` match,
-        Llama's final RMSNorm would incorrectly end up in the weight-decay group.
+        Standard AdamW practice: bias parameters and the gain parameters of normalization layers
+        (LayerNorm / RMSNorm) should not receive weight decay — they have different geometry from
+        linear weights, and decaying them pulls normalizations toward collapse. The optimizer groups
+        everything matching this predicate into a no-decay group.
+
+        The regex matches ``bias`` anywhere in the name plus any weight whose last component looks
+        like an optional ``layer_?`` prefix followed by ``norm`` (with optional trailing digits).
+        That covers Llama's RMSNorm names (``input_layernorm.weight``, ``post_attention_layernorm.weight``,
+        and the final ``model.norm.weight``) as well as LayerNorm-style names a different HF
+        architecture might expose. Llama has no biases by default (``attention_bias=False``, MLP/LM-
+        head biases absent), so in practice the ``bias`` branch is dormant for the current base — it
+        stays in the regex as cheap insurance for callers who override ``attention_bias=True`` or
+        swap to a bias-enabled architecture.
 
         Args:
             n: The name of the parameter.
@@ -302,7 +311,8 @@ class MEICARModule(L.LightningModule):
 
         Examples:
             Llama has no biases by default (``attention_bias=False``, MLP/LM-head biases absent) and
-            uses RMSNorm, so the only matches are the three norm weights per layer plus the final
+            uses RMSNorm, so the only matches are the two norm weights per layer
+            (``input_layernorm.weight`` + ``post_attention_layernorm.weight``) plus the final
             ``model.norm.weight``:
 
             >>> list(pretrained_module._norm_bias_param_names())

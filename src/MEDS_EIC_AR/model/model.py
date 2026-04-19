@@ -41,14 +41,14 @@ def _val(tensor: torch.Tensor) -> int | bool | float:
 
 
 class Model(torch.nn.Module):
-    """A decoder-only transformer (Llama-style) for pre-training an autoregressive, "everything-is-code"
-    model.
+    """A Llama-style decoder-only transformer for pre-training an autoregressive, "everything-is-code" model.
 
-    This model is a wrapper around the Hugging Face ``LlamaForCausalLM`` model to run it over MEDS-TorchData
-    batches. The earlier revision wrapped ``GPTNeoXForCausalLM``; see issue #108 for the rationale behind the
-    swap (RMSNorm + SwiGLU + full-dim RoPE, and first-class support in modern inference engines like SGLang
-    / vLLM). The rolling-generation loop and everything downstream of :attr:`HF_model` are
-    architecture-agnostic, so swapping the base is contained to :meth:`__init__`.
+    Wraps :class:`~transformers.LlamaForCausalLM` so it runs over MEDS-TorchData batches. The rolling-
+    generation loop and much of the code downstream of :attr:`HF_model` are architecture-agnostic, so
+    :meth:`__init__` is the primary integration point with the underlying HF model. Swapping to a
+    different HF architecture may still require updates elsewhere — architecture-specific config keys,
+    or parameter-name-based logic like the no-weight-decay grouping in
+    :meth:`MEICARModule._is_norm_bias_param`.
 
     Args:
         gpt_kwargs: A dictionary of keyword arguments to pass to the underlying HF config constructor (a
@@ -102,9 +102,8 @@ class Model(torch.nn.Module):
                dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
 
-    The models parameters can be accessed in the normal way. The first named parameter is the token
-    embedding matrix — Llama names it ``model.embed_tokens.weight`` (nested under our ``HF_model``
-    wrapper), versus NeoX's ``gpt_neox.embed_in.weight``:
+    The model's parameters can be accessed in the normal way. The first named parameter is the token
+    embedding matrix:
 
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
         >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
@@ -140,6 +139,53 @@ class Model(torch.nn.Module):
         Traceback (most recent call last):
             ...
         ValueError: Config for HF model llama does not have attribute foobar
+
+    Post-override snap: ``num_key_value_heads`` and ``head_dim`` are recomputed from the caller's
+    ``hidden_size`` / ``num_attention_heads`` unless the caller set them explicitly. The default is
+    plain MHA (``num_key_value_heads == num_attention_heads``) — matching what vanilla
+    :class:`~transformers.LlamaConfig` does when either field is left unset:
+
+        >>> tiny = Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 2,
+        ...     "hidden_size": 4,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": 40,
+        ... }, precision="32-true")
+        >>> tiny.HF_model_config.num_key_value_heads
+        2
+        >>> tiny.HF_model_config.head_dim
+        2
+
+    A caller who wants GQA sets ``num_key_value_heads`` explicitly:
+
+        >>> gqa = Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 4,
+        ...     "num_key_value_heads": 2,
+        ...     "hidden_size": 8,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": 40,
+        ... }, precision="32-true")
+        >>> gqa.HF_model_config.num_key_value_heads
+        2
+        >>> gqa.HF_model_config.head_dim
+        2
+
+    And a non-divisible ``hidden_size`` / ``num_attention_heads`` combination is rejected at
+    construction time rather than producing a silently-wrong ``head_dim`` that only surfaces as a
+    cryptic shape error on the first forward pass:
+
+        >>> Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 3,
+        ...     "hidden_size": 4,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": 40,
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: hidden_size (4) must be divisible by num_attention_heads (3) to derive ...
     """
 
     HF_model_config: LlamaConfig
@@ -166,9 +212,12 @@ class Model(torch.nn.Module):
         self.HF_model_config: LlamaConfig = LlamaConfig()
 
         for key, val in gpt_kwargs.items():
+            # ``attention_head_dim`` is consumed by the YAML ``int_prod`` resolver to derive
+            # ``hidden_size`` (``hidden_size = num_attention_heads * attention_head_dim``). The
+            # config expresses the product form so HPO search over ``num_attention_heads`` and
+            # ``attention_head_dim`` independently can never produce a non-divisible
+            # ``hidden_size``. It isn't a real LlamaConfig attribute — skip it on its way in.
             if key == "attention_head_dim":
-                # Derived into ``hidden_size`` via the config's ``int_prod`` expression; Llama
-                # infers ``head_dim`` from ``hidden_size // num_attention_heads`` itself.
                 continue
             if not hasattr(self.HF_model_config, key):
                 raise ValueError(
@@ -176,20 +225,29 @@ class Model(torch.nn.Module):
                 )
             setattr(self.HF_model_config, key, val)
 
-        # Llama's ``num_key_value_heads`` (GQA) and ``head_dim`` are set from vanilla defaults at
-        # ``LlamaConfig()`` construction and are *not* recomputed when the caller overrides
-        # ``hidden_size`` / ``num_attention_heads`` via ``setattr`` above. Snap both back to the
-        # values implied by the caller's overrides unless the caller passed them explicitly:
-        # plain MHA (``num_key_value_heads == num_attention_heads``) matches the NeoX behavior
-        # this swap replaces (issue #108), and ``head_dim = hidden_size // num_attention_heads``
-        # is the same implicit relation NeoX used. A caller who wants GQA simply sets
-        # ``num_key_value_heads`` explicitly in ``gpt_kwargs``.
+        # ``LlamaConfig()``'s default values for ``num_key_value_heads`` and ``head_dim`` come from
+        # the vanilla 7B config — they aren't recomputed from the ``hidden_size`` /
+        # ``num_attention_heads`` the caller just overrode. Snap them back to the values implied
+        # by the overrides unless the caller also set them explicitly. Plain MHA
+        # (``num_key_value_heads == num_attention_heads``) and
+        # ``head_dim == hidden_size // num_attention_heads`` are what vanilla Llama uses when the
+        # fields are left unset at config-construction time; this just preserves that after our
+        # post-hoc attribute mutation.
         if "num_key_value_heads" not in gpt_kwargs:
             self.HF_model_config.num_key_value_heads = self.HF_model_config.num_attention_heads
         if "head_dim" not in gpt_kwargs:
-            self.HF_model_config.head_dim = (
-                self.HF_model_config.hidden_size // self.HF_model_config.num_attention_heads
-            )
+            hidden = self.HF_model_config.hidden_size
+            heads = self.HF_model_config.num_attention_heads
+            if hidden % heads != 0:
+                raise ValueError(
+                    f"hidden_size ({hidden}) must be divisible by num_attention_heads ({heads}) to "
+                    "derive ``head_dim`` implicitly. Pass ``head_dim`` explicitly in gpt_kwargs, or "
+                    "adjust ``hidden_size`` / ``num_attention_heads`` so the division is exact. "
+                    "Configs built via the ``attention_head_dim`` resolver at "
+                    "``configs/lightning_module/model/default.yaml`` cannot hit this — the product "
+                    "form makes divisibility impossible-by-construction."
+                )
+            self.HF_model_config.head_dim = hidden // heads
 
         extra_kwargs = {"dtype": self.PRECISION_TO_MODEL_WEIGHTS_DTYPE.get(precision)}
 
@@ -376,9 +434,8 @@ class Model(torch.nn.Module):
             - The parameters are not inf.
 
         Examples:
-            Llama has no attention biases by default (``attention_bias=False``), so the NeoX-era
-            ``query_key_value.bias`` target doesn't exist — we corrupt a ``RMSNorm`` weight instead.
-            The parameter choice doesn't matter; any tensor with known ``numel`` works.
+            We corrupt a ``RMSNorm`` weight to exercise the warning path. The parameter choice
+            doesn't matter; any tensor with known ``numel`` works.
 
             >>> model = Model({
             ...     "num_hidden_layers": 2,

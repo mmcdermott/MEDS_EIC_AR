@@ -30,7 +30,7 @@ dependencies = [
   "meds_testing_helpers~=0.3.0",
   "MEDS-transforms~=0.5.2",
   "meds-torch-data[lightning]~=0.7.0",
-  "transformers",
+  "transformers>=4.56",
   "torch",
   "torchmetrics",
   "lightning~=2.5.1",
