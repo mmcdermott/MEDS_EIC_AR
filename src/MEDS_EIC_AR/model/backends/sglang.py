@@ -302,7 +302,26 @@ class SGLangBackend:
                     f"Got keys: {sorted(out)}. This may indicate a SGLang version mismatch — "
                     "check whether the installed version returns tokens under a different field name."
                 )
-            new_tokens_per_row.append(list(tokens))
+            row_tokens = list(tokens)
+            # Defensive: the ``GenerationBackend`` contract is that ``generate_chunk`` returns
+            # *new-only* tokens, and SGLang's current ``output_ids`` key holds new tokens only.
+            # A future SGLang version that flips back to "prompt + new" semantics (as older
+            # releases did) would silently corrupt the rolling loop — the extra prompt tokens
+            # would be fed back as "newly generated" on the next chunk, duplicating the prompt
+            # in the accumulated sequence. Fail loudly instead: the only way a row's length can
+            # exceed ``max_new_tokens`` under new-only semantics is if the engine included the
+            # prompt.
+            if len(row_tokens) > generation_config.max_new_tokens:
+                raise RuntimeError(
+                    f"SGLang output[{i}] returned {len(row_tokens)} tokens but "
+                    f"``max_new_tokens={generation_config.max_new_tokens}`` — the engine appears "
+                    "to be returning the prompt prefix plus new tokens rather than new-only. "
+                    "This breaks the GenerationBackend contract and would silently corrupt the "
+                    "rolling loop. Check the installed SGLang version's ``Engine.generate`` "
+                    "return-format semantics and, if needed, strip the prompt here before "
+                    "emitting."
+                )
+            new_tokens_per_row.append(row_tokens)
         return _pad_right_to_tensor(
             new_tokens_per_row,
             pad_value=generation_config.pad_token_id,

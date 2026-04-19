@@ -239,6 +239,33 @@ def test_generate_chunk_accepts_legacy_token_ids_key():
     assert out.tolist() == [[1, 2, 3]]
 
 
+def test_generate_chunk_rejects_prompt_prefixed_engine_output():
+    """A future SGLang version flipping to ``prompt + new`` semantics must fail loudly.
+
+    The :class:`GenerationBackend` contract is new-only. SGLang's current release returns
+    new-only tokens under ``output_ids``, but historical releases used ``token_ids`` with
+    variable (prompt-inclusive vs. new-only) semantics. Silently accepting prompt-prefixed
+    output would corrupt the rolling loop — the prompt tokens would get fed back as "newly
+    generated" on the next chunk, duplicating the prompt in the accumulated sequence.
+
+    The backend's defensive check: any row whose returned length exceeds ``max_new_tokens``
+    can only happen if the engine included the prompt, so we raise a ``RuntimeError`` with a
+    version-mismatch pointer. This test drives a fake engine that emits ``prompt + new`` and
+    asserts the error fires.
+    """
+    backend, fake = _make_backend()
+    # Simulate "prompt + new" semantics: prompt length was 3 (mask sums), max_new_tokens is 2,
+    # so new-only output would be ≤2 tokens. Emit 5 tokens (3 prompt + 2 new) to trigger the
+    # defensive check.
+    fake.last_engine.set_next_outputs([{"output_ids": [4, 5, 6, 7, 8]}])
+    input_ids = torch.tensor([[0, 4, 5, 6]], dtype=torch.long)
+    mask = torch.tensor([[0, 1, 1, 1]], dtype=torch.bool)
+    cfg = GenerationConfig(max_new_tokens=2, do_sample=False, pad_token_id=0, eos_token_id=99)
+
+    with pytest.raises(RuntimeError, match=r"prompt prefix plus new tokens"):
+        backend.generate_chunk(input_ids, attention_mask=mask, generation_config=cfg)
+
+
 def test_generate_chunk_raises_on_unknown_output_key():
     """Unknown output key must raise ``KeyError`` rather than silently producing empty rows.
 
