@@ -30,7 +30,12 @@ dependencies = [
   "meds_testing_helpers~=0.3.0",
   "MEDS-transforms~=0.5.2",
   "meds-torch-data[lightning]~=0.7.0",
-  "transformers",
+  # Lower-bounded for the ``dtype=`` kwarg on ``AutoModelForCausalLM.from_config`` (4.56
+  # renamed ``torch_dtype`` → ``dtype`` and started deprecating the old name). ``head_dim`` as
+  # an explicit ``LlamaConfig`` attribute also landed in this era; the post-override snap
+  # logic in ``Model.__init__`` depends on it. Pinning a minimum avoids a class of obscure
+  # runtime failures on old installations.
+  "transformers>=4.56",
   "torch",
   "torchmetrics",
   "lightning~=2.5.1",

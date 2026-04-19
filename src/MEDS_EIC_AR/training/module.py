@@ -302,7 +302,8 @@ class MEICARModule(L.LightningModule):
 
         Examples:
             Llama has no biases by default (``attention_bias=False``, MLP/LM-head biases absent) and
-            uses RMSNorm, so the only matches are the three norm weights per layer plus the final
+            uses RMSNorm, so the only matches are the two norm weights per layer
+            (``input_layernorm.weight`` + ``post_attention_layernorm.weight``) plus the final
             ``model.norm.weight``:
 
             >>> list(pretrained_module._norm_bias_param_names())

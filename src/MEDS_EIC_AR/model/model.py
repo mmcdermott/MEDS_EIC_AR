@@ -140,6 +140,53 @@ class Model(torch.nn.Module):
         Traceback (most recent call last):
             ...
         ValueError: Config for HF model llama does not have attribute foobar
+
+    Llama-specific post-override semantics: ``num_key_value_heads`` and ``head_dim`` are recomputed
+    from the caller's ``hidden_size`` / ``num_attention_heads`` overrides unless the caller set them
+    explicitly. Default is plain MHA (``num_key_value_heads == num_attention_heads``) to match the
+    NeoX behavior this swap replaces:
+
+        >>> tiny = Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 2,
+        ...     "hidden_size": 4,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": 40,
+        ... }, precision="32-true")
+        >>> tiny.HF_model_config.num_key_value_heads
+        2
+        >>> tiny.HF_model_config.head_dim
+        2
+
+    A caller who wants GQA sets ``num_key_value_heads`` explicitly:
+
+        >>> gqa = Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 4,
+        ...     "num_key_value_heads": 2,
+        ...     "hidden_size": 8,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": 40,
+        ... }, precision="32-true")
+        >>> gqa.HF_model_config.num_key_value_heads
+        2
+        >>> gqa.HF_model_config.head_dim
+        2
+
+    And a non-divisible ``hidden_size`` / ``num_attention_heads`` combination is rejected at
+    construction time rather than producing a silently-wrong ``head_dim`` that only surfaces as a
+    cryptic shape error on the first forward pass:
+
+        >>> Model({
+        ...     "num_hidden_layers": 2,
+        ...     "num_attention_heads": 3,
+        ...     "hidden_size": 4,
+        ...     "max_position_embeddings": 10,
+        ...     "vocab_size": 40,
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: hidden_size (4) must be divisible by num_attention_heads (3) to derive ...
     """
 
     HF_model_config: LlamaConfig
