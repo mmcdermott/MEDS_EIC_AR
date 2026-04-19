@@ -38,6 +38,7 @@ from .utils import (
     num_gpus,
     oc_min,
     resolve_generation_context_size,
+    save_environment_snapshot,
     save_logger_run_ids,
     save_resolved_config,
     sub,
@@ -84,6 +85,11 @@ def pretrain(cfg: DictConfig):
     else:
         OmegaConf.save(cfg, output_dir / "config.yaml")
         save_resolved_config(cfg, output_dir / "resolved_config.yaml")
+        # Capture the Python environment once at run-creation time (not on resume — the point
+        # of an environment snapshot is "what was installed when this run was configured",
+        # and a resumed run reusing the same output_dir should point at that original snapshot
+        # rather than a fresh one capturing whatever's installed today).
+        save_environment_snapshot(output_dir / "environment.txt")
 
     logger.info("Setting torch float32 matmul precision to 'medium'.")
     torch.set_float32_matmul_precision("medium")
