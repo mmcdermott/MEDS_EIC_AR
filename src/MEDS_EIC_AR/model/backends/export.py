@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import shutil
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -35,16 +36,20 @@ logger = logging.getLogger(__name__)
 def _state_dict_hash(state_dict: dict[str, torch.Tensor]) -> str:
     """Deterministic content hash of a state_dict.
 
-    Used to decide whether a previously-exported HF directory is still current. Hashes the sorted param names
-    concatenated with each tensor's SHA-256 of its raw bytes. Not meant to survive a tensor-dtype change — a
-    dtype flip produces a different hash, which is the correct "re-export" signal.
+    Used to decide whether a previously-exported HF directory is still current. Hashes the sorted
+    param names concatenated with each tensor's raw bytes. Not meant to survive a tensor-dtype change
+    — a dtype flip produces a different hash, which is the correct "re-export" signal.
+
+    Byte extraction goes through ``untyped_storage()`` rather than ``.numpy().tobytes()`` because
+    NumPy has no ``bfloat16`` dtype, and Lightning checkpoints trained under
+    ``precision: bf16-true`` produce bf16 tensors. The untyped-storage path is dtype-agnostic.
     """
     hasher = hashlib.sha256()
     for name in sorted(state_dict):
         t = state_dict[name].detach().cpu().contiguous()
         hasher.update(name.encode())
         hasher.update(b"\x00")
-        hasher.update(t.numpy().tobytes())
+        hasher.update(bytes(t.untyped_storage()))
         hasher.update(b"\x00")
     return hasher.hexdigest()
 
@@ -57,9 +62,11 @@ def export_lightning_to_hf_dir(module: MEICARModule, out_dir: Path | str) -> Pat
     ``skip_tokenizer_init=True`` path doesn't warn about a missing tokenizer.
 
     **Idempotency**: if ``<out_dir>/.export_fingerprint`` matches the current state_dict
-    hash, re-export is skipped. Two concurrent exporters won't corrupt each other — the write
-    lands in ``<out_dir>.tmp/`` and is atomically renamed into place on success; the losing
-    writer cleans up its tmp dir.
+    hash, re-export is skipped. Two concurrent exporters don't corrupt each other — each
+    writes into its own ``mkdtemp``-allocated staging directory alongside ``out_dir``, then
+    atomically renames on success. If a concurrent winner already landed a matching
+    fingerprint by the time we're ready to rename, the loser discards its staging dir and
+    returns the existing export.
 
     **Concurrent reader caveat**: the atomic rename protects concurrent *writers*, but a
     reader already inside ``from_pretrained(out_dir)`` when a second writer renames a fresh
@@ -117,10 +124,12 @@ def export_lightning_to_hf_dir(module: MEICARModule, out_dir: Path | str) -> Pat
         logger.debug(f"Reusing existing HF export at {out_dir} (fingerprint match).")
         return out_dir
 
-    tmp_dir = out_dir.with_suffix(out_dir.suffix + ".tmp")
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True)
+    # Use ``mkdtemp`` next to ``out_dir`` (same filesystem → rename is atomic) with a unique
+    # per-invocation name. Two concurrent exporters now each get their own staging directory
+    # and neither can ``rmtree`` the other's in-progress write, matching the "concurrent writers
+    # don't corrupt each other" claim in the docstring. An earlier revision used a fixed
+    # ``{out_dir}.tmp`` which silently broke under concurrent calls.
+    tmp_dir = Path(tempfile.mkdtemp(dir=out_dir.parent, prefix=f"{out_dir.name}.tmp."))
 
     try:
         hf_model.save_pretrained(tmp_dir, safe_serialization=True)
@@ -134,7 +143,16 @@ def export_lightning_to_hf_dir(module: MEICARModule, out_dir: Path | str) -> Pat
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
 
-    # Atomic-ish swap: remove any stale destination then rename tmp → out_dir.
+    # Atomic-ish swap: remove any stale destination then rename tmp → out_dir. If a concurrent
+    # export already landed a fresh directory with matching fingerprint, skip our write entirely
+    # and clean up — the losing writer's staging dir goes away, the winner's final dir stands.
+    if out_dir.is_dir() and marker.is_file() and marker.read_text().strip() == fingerprint:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.debug(
+            f"Concurrent export already landed at {out_dir} with matching fingerprint; "
+            "discarding our staging dir."
+        )
+        return out_dir
     if out_dir.exists():
         shutil.rmtree(out_dir)
     tmp_dir.rename(out_dir)

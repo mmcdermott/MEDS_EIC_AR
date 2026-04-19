@@ -133,6 +133,24 @@ def test_engine_caller_can_override_other_engine_kwargs():
     assert fake.last_engine.engine_kwargs["skip_tokenizer_init"] is True
 
 
+def test_skip_tokenizer_init_cannot_be_overridden_by_caller():
+    """A caller passing ``skip_tokenizer_init=False`` in ``engine_kwargs`` must be ignored.
+
+    MEDS codes are already token ids. Turning tokenizer init back on would make SGLang try to
+    load a tokenizer from the exported HF directory (which ``export_lightning_to_hf_dir``
+    deliberately stubs, not populates), breaking the pipeline. The class docstring promises
+    this invariant is non-overridable; the test locks in that the implementation enforces it.
+    """
+    fake = _FakeSGLModule()
+    backend = SGLangBackend(
+        "/tmp/x",
+        engine_kwargs={"skip_tokenizer_init": False},
+        sgl_module=fake,
+    )
+    del backend
+    assert fake.last_engine.engine_kwargs["skip_tokenizer_init"] is True
+
+
 # ---------------------------------------------------------------------------
 # Padding / shape conversion
 # ---------------------------------------------------------------------------

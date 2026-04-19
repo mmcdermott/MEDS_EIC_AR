@@ -1,9 +1,12 @@
 """SGLang implementation of :class:`GenerationBackend` (issue #88).
 
 SGLang exposes an offline ``Engine`` (in-process, not an HTTP server) whose ``generate`` takes a
-batch of token-id prompts and returns, per request, a dict containing ``"token_ids"`` of newly
-generated tokens. We wrap it to match our protocol's tensor-in / tensor-out contract and to
-enforce the per-row post-EOS padding invariant the rolling loop relies on.
+batch of token-id prompts and returns, per request, a dict of newly generated tokens. The field
+name has moved across SGLang versions — current ``v0.5.x`` uses ``"output_ids"``, earlier
+releases used ``"token_ids"``. We probe both (``_SGLANG_OUTPUT_KEYS`` below) and raise a loud
+``KeyError`` if neither is present. The adapter wraps all of this to match our protocol's
+tensor-in / tensor-out contract and to enforce the per-row post-EOS padding invariant the
+rolling loop relies on.
 
 Why this file is non-trivial despite the thin public surface:
 
@@ -197,7 +200,10 @@ class SGLangBackend:
         # ``skip_tokenizer_init`` is load-bearing: MEDS code ids are already tokens, and
         # leaving tokenizer init on would make SGLang try to load a tokenizer from the HF dir
         # (which :func:`export_lightning_to_hf_dir` deliberately stubs rather than populates).
-        self._engine_kwargs.setdefault("skip_tokenizer_init", True)
+        # Overwrite unconditionally rather than ``setdefault`` — the class docstring promises
+        # this cannot be overridden, and a caller passing ``engine_kwargs={"skip_tokenizer_init":
+        # False}`` would otherwise silently break the pipeline.
+        self._engine_kwargs["skip_tokenizer_init"] = True
         self._engine = sgl_module.Engine(model_path=str(hf_model_dir), **self._engine_kwargs)
         self._is_shutdown = False
         atexit.register(self.shutdown)
