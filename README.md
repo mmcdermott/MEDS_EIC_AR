@@ -295,6 +295,7 @@ and take the following structure:
 │   ├── epoch=1-step=4.ckpt
 │   └── last.ckpt
 ├── config.yaml
+├── environment.txt
 ├── loggers
 │   └── csv
 │       └── version_0
