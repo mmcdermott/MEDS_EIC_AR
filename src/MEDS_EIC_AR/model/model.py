@@ -60,7 +60,16 @@ class Model(torch.nn.Module):
         ValueError: If the gpt_kwargs contains a key that is not supported.
 
     Examples:
+        Force torch's tensor-repr to abbreviate consistently for the rest of the examples —
+        otherwise the expected outputs below depend on whatever ``threshold`` and ``edgeitems``
+        the global state happens to have. ``MEDSTorchBatch.__repr__`` in ``meds_torchdata``
+        temporarily sets smaller values and restores to default right after, so ordering-
+        dependent collection in CI can leave us with torch's unabbreviated-by-default print
+        behavior for tensors smaller than 1000 elements. The parameters below were chosen to
+        reproduce the abbreviation pattern these doctests were originally generated against.
+
         >>> _ = torch.manual_seed(0)
+        >>> torch.set_printoptions(edgeitems=1, threshold=50)
         >>> model = Model({
         ...     "num_hidden_layers": 2,
         ...     "num_attention_heads": 2,
@@ -96,10 +105,13 @@ class Model(torch.nn.Module):
         >>> print(f"Logits shape: {outputs.logits.shape}")
         Logits shape: torch.Size([2, 9, 39])
         >>> print(outputs.logits)
-        tensor([[[ 2.5539e-03, ..., -3.0045e-02], ..., [-8.3694e-03, ...,  3.0487e-02]],
+        tensor([[[ 0.0026,  ..., -0.0300],
+                 ...,
+                 [-0.0084,  ...,  0.0305]],
         <BLANKLINE>
-                [[ 2.5539e-03, ..., -3.0045e-02], ..., [-9.0561e-03, ...,  3.5919e-02]]],
-               dtype=torch.float16,
+                [[ 0.0026,  ..., -0.0300],
+                 ...,
+                 [-0.0091,  ...,  0.0359]]], dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
 
     The model's parameters can be accessed in the normal way. The first named parameter is the token
@@ -108,9 +120,9 @@ class Model(torch.nn.Module):
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
         >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
         HF_model.model.embed_tokens.weight (torch.Size([39, 4])): Parameter containing:
-        tensor([[ 0.0069,  0.0068, -0.0367,  0.0099], ..., [-0.0085, -0.0223, -0.0185,  0.0032]],
-               dtype=torch.float16,
-               requires_grad=True)
+        tensor([[ 0.0069,  ...,  0.0099],
+                ...,
+                [-0.0085,  ...,  0.0032]], dtype=torch.float16, requires_grad=True)
 
     Let's validate that they have gradients that can be realized via `.backward()` as normal:
 
@@ -118,11 +130,10 @@ class Model(torch.nn.Module):
         Sample parameter grad?: None
         >>> loss.backward()
         >>> print(f"Sample parameter grad?: {sample_param.grad}")
-        Sample parameter grad?:
-        tensor([[ 0.0000,  0.0000,  0.0000,  0.0000],
+        Sample parameter grad?: tensor([[ 0.0000,  ...,  0.0000],
                 ...,
-                [-0.1140, -0.0175,  0.0645, -0.0845]],
-               dtype=torch.float16)
+                [-0.1140,  ..., -0.0845]], dtype=torch.float16)
+        >>> torch.set_printoptions(profile="default")  # restore global state
 
     With a single backward pass, we should not get any infinite gradients:
 
