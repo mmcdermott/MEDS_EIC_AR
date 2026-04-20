@@ -10,6 +10,7 @@ from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+import torch
 from meds_testing_helpers.dataset import MEDSDataset
 from meds_torchdata import MEDSPytorchDataset, MEDSTorchBatch, MEDSTorchDataConfig
 from torch.utils.data import DataLoader
@@ -280,6 +281,11 @@ def _setup_doctest_namespace(
     pytorch_dataset: MEDSPytorchDataset,
     pytorch_dataset_with_task: MEDSPytorchDataset,
 ):
+    # Pin torch's tensor-repr to a fixed abbreviation pattern so doctests that print tensors
+    # are stable regardless of prior global state. ``MEDSTorchBatch.__repr__`` in
+    # ``meds_torchdata`` temporarily lowers threshold/edgeitems and restores defaults, so
+    # collection-order-dependent state would otherwise leak between tests.
+    torch.set_printoptions(edgeitems=1, threshold=50)
     doctest_namespace.update(
         {
             "print_warnings": partial(print_warnings, caplog),

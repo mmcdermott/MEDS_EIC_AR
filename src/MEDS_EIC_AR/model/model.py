@@ -60,16 +60,7 @@ class Model(torch.nn.Module):
         ValueError: If the gpt_kwargs contains a key that is not supported.
 
     Examples:
-        Force torch's tensor-repr to abbreviate consistently for the rest of the examples —
-        otherwise the expected outputs below depend on whatever ``threshold`` and ``edgeitems``
-        the global state happens to have. ``MEDSTorchBatch.__repr__`` in ``meds_torchdata``
-        temporarily sets smaller values and restores to default right after, so ordering-
-        dependent collection in CI can leave us with torch's unabbreviated-by-default print
-        behavior for tensors smaller than 1000 elements. The parameters below were chosen to
-        reproduce the abbreviation pattern these doctests were originally generated against.
-
         >>> _ = torch.manual_seed(0)
-        >>> torch.set_printoptions(edgeitems=1, threshold=50)
         >>> model = Model({
         ...     "num_hidden_layers": 2,
         ...     "num_attention_heads": 2,
@@ -133,7 +124,6 @@ class Model(torch.nn.Module):
         Sample parameter grad?: tensor([[ 0.0000,  ...,  0.0000],
                 ...,
                 [-0.1140,  ..., -0.0845]], dtype=torch.float16)
-        >>> torch.set_printoptions(profile="default")  # restore global state
 
     With a single backward pass, we should not get any infinite gradients:
 
