@@ -42,12 +42,12 @@ class TopKMulticlassAccuracy(Metric):
         >>> TopKMulticlassAccuracy(top_k=2, ignore_index=0)(logits, code)
         tensor(1.)
         >>> TopKMulticlassAccuracy(top_k=1, ignore_index=0)(logits, code)
-        tensor(0.6667)
+        tensor(0.667)
         >>> code = torch.LongTensor([[1, 1], [1, 0]])
         >>> TopKMulticlassAccuracy(top_k=1, ignore_index=0)(logits, code)
-        tensor(0.3333)
+        tensor(0.333)
         >>> TopKMulticlassAccuracy(top_k=2, ignore_index=0)(logits, code)
-        tensor(0.6667)
+        tensor(0.667)
         >>> TopKMulticlassAccuracy(top_k=3, ignore_index=0)(logits, code)
         tensor(1.)
         >>> code = torch.LongTensor([[1, 0], [0, 0]])
@@ -149,8 +149,8 @@ class NextCodeMetrics(Metric):
     Then, we can update and compute the metric values:
 
         >>> M(logits, batch)
-        {'Accuracy/top_1': tensor(0.6667), 'Accuracy/top_2': tensor(1.), 'Accuracy/top_3': tensor(1.),
-         'perplexity': tensor(3.1896)}
+        {'Accuracy/top_1': tensor(0.667), 'Accuracy/top_2': tensor(1.), 'Accuracy/top_3': tensor(1.),
+         'perplexity': tensor(3.190)}
 
     You can also run on a single `top_k`:
 

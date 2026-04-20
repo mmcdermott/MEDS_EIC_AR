@@ -90,19 +90,19 @@ class Model(torch.nn.Module):
 
         >>> loss, outputs = model(sample_batch)
         >>> print(loss)
-        tensor(3.6543, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
+        tensor(3.654, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
         >>> print(f"Outputs have keys: {', '.join(outputs.keys())}")
         Outputs have keys: logits, past_key_values
         >>> print(f"Logits shape: {outputs.logits.shape}")
         Logits shape: torch.Size([2, 9, 39])
         >>> print(outputs.logits)
-        tensor([[[ 0.0026,  ..., -0.0300],
+        tensor([[[ 0.003,  ..., -0.030],
                  ...,
-                 [-0.0084,  ...,  0.0305]],
+                 [-0.008,  ...,  0.030]],
         <BLANKLINE>
-                [[ 0.0026,  ..., -0.0300],
+                [[ 0.003,  ..., -0.030],
                  ...,
-                 [-0.0091,  ...,  0.0359]]], dtype=torch.float16,
+                 [-0.009,  ...,  0.036]]], dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
 
     The model's parameters can be accessed in the normal way. The first named parameter is the token
@@ -111,9 +111,9 @@ class Model(torch.nn.Module):
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
         >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
         HF_model.model.embed_tokens.weight (torch.Size([39, 4])): Parameter containing:
-        tensor([[ 0.0069,  ...,  0.0099],
+        tensor([[ 0.007,  ...,  0.010],
                 ...,
-                [-0.0085,  ...,  0.0032]], dtype=torch.float16, requires_grad=True)
+                [-0.008,  ...,  0.003]], dtype=torch.float16, requires_grad=True)
 
     Let's validate that they have gradients that can be realized via `.backward()` as normal:
 
@@ -121,9 +121,9 @@ class Model(torch.nn.Module):
         Sample parameter grad?: None
         >>> loss.backward()
         >>> print(f"Sample parameter grad?: {sample_param.grad}")
-        Sample parameter grad?: tensor([[ 0.0000,  ...,  0.0000],
+        Sample parameter grad?: tensor([[ 0.000,  ...,  0.000],
                 ...,
-                [-0.1140,  ..., -0.0845]], dtype=torch.float16)
+                [-0.114,  ..., -0.084]], dtype=torch.float16)
 
     With a single backward pass, we should not get any infinite gradients:
 
