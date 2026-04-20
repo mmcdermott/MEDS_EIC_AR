@@ -390,6 +390,90 @@ def save_resolved_config(cfg: DictConfig, fp: Path) -> bool:
         return False
 
 
+def save_environment_snapshot(fp: Path) -> bool:
+    """Save a snapshot of the Python environment a run is using.
+
+    Writes a ``pip freeze``-style listing of installed packages plus a header with the
+    Python version and platform string. Lets anyone returning to a run output directory
+    later localize the exact codebase + dependency set that produced the result — useful
+    for reproducing or debugging trajectories from a model trained weeks or months ago,
+    when the underlying wheels on PyPI have moved on.
+
+    Format:
+
+    .. code-block:: text
+
+        # MEDS_EIC_AR run environment snapshot
+        # python: 3.12.3 (main, Jun  7 2024, 00:00:00) ...
+        # platform: Linux-6.8.0-generic-x86_64-with-glibc2.39
+        MEDS-EIC-AR==0.X.Y
+        lightning==2.5.1
+        ...
+
+    Never raises — any failure (permission denied, disk full, etc.) logs a warning and
+    returns ``False`` so the calling entry point can keep going. The snapshot is a
+    nice-to-have, not a correctness invariant.
+
+    Args:
+        fp: The path where the snapshot should be written. The parent directory is
+            created if it doesn't already exist.
+
+    Returns:
+        ``True`` if the snapshot was written successfully, ``False`` otherwise.
+
+    Example:
+        Case-insensitive alphabetical sort lets us anchor the doctest on a few
+        known-always-present top-level deps (``lightning``, ``polars``, ``torch``)
+        with ellipsis on their versions so CI doesn't flake on routine upstream
+        version bumps. The ordering of the three is stable: ``l < p < t``.
+
+        >>> with tempfile.NamedTemporaryFile(suffix=".txt") as tmp_file:
+        ...     _ = save_environment_snapshot(Path(tmp_file.name))
+        ...     print(Path(tmp_file.name).read_text())  # doctest: +ELLIPSIS
+        # MEDS_EIC_AR run environment snapshot
+        # python: ...
+        # platform: ...
+        ...
+        lightning==...
+        ...
+        polars==...
+        ...
+        torch==...
+        ...
+
+    Per-invariant assertions (header format, pip-freeze line shape, sort order,
+    missing-parent-dir handling, etc.) live in
+    ``tests/test_environment_snapshot.py`` as readable pytest cases rather than
+    cluttering the docstring.
+    """
+    import importlib.metadata
+    import platform
+    import sys
+
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# MEDS_EIC_AR run environment snapshot",
+            f"# python: {sys.version.splitlines()[0]}",
+            f"# platform: {platform.platform()}",
+        ]
+        packages = []
+        for dist in importlib.metadata.distributions():
+            name = dist.metadata["Name"]
+            if name is None:
+                continue
+            packages.append(f"{name}=={dist.version}")
+        # Case-insensitive sort so ``pip freeze`` -style orderings match across platforms
+        # (macOS distribution discovery returns mixed case; Linux usually canonicalizes).
+        packages.sort(key=str.lower)
+        lines.extend(packages)
+        fp.write_text("\n".join(lines) + "\n")
+        return True
+    except Exception as e:  # pragma: no cover — best-effort, swallows any disk/IO failure
+        logger.warning(f"Could not save environment snapshot: {e}")
+        return False
+
+
 def _read_saved_id(fp: Path) -> str | None:
     """Read a saved-id file defensively; return ``None`` if the file is missing, unreadable, or blank.
 
