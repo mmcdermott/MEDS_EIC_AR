@@ -307,3 +307,7 @@ def _setup_doctest_namespace(
             "pytorch_dataset_with_task": pytorch_dataset_with_task,
         }
     )
+    yield
+    # Restore torch's print options to defaults after each test so the pin does not leak
+    # beyond the pytest session.
+    torch.set_printoptions(profile="default")
