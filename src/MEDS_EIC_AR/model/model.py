@@ -96,10 +96,13 @@ class Model(torch.nn.Module):
         >>> print(f"Logits shape: {outputs.logits.shape}")
         Logits shape: torch.Size([2, 9, 39])
         >>> print(outputs.logits)
-        tensor([[[ 2.5539e-03, ..., -3.0045e-02], ..., [-8.3694e-03, ...,  3.0487e-02]],
+        tensor([[[ 0.0026,  ..., -0.0300],
+                 ...,
+                 [-0.0084,  ...,  0.0305]],
         <BLANKLINE>
-                [[ 2.5539e-03, ..., -3.0045e-02], ..., [-9.0561e-03, ...,  3.5919e-02]]],
-               dtype=torch.float16,
+                [[ 0.0026,  ..., -0.0300],
+                 ...,
+                 [-0.0091,  ...,  0.0359]]], dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
 
     The model's parameters can be accessed in the normal way. The first named parameter is the token
@@ -108,9 +111,9 @@ class Model(torch.nn.Module):
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
         >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
         HF_model.model.embed_tokens.weight (torch.Size([39, 4])): Parameter containing:
-        tensor([[ 0.0069,  0.0068, -0.0367,  0.0099], ..., [-0.0085, -0.0223, -0.0185,  0.0032]],
-               dtype=torch.float16,
-               requires_grad=True)
+        tensor([[ 0.0069,  ...,  0.0099],
+                ...,
+                [-0.0085,  ...,  0.0032]], dtype=torch.float16, requires_grad=True)
 
     Let's validate that they have gradients that can be realized via `.backward()` as normal:
 
@@ -118,11 +121,9 @@ class Model(torch.nn.Module):
         Sample parameter grad?: None
         >>> loss.backward()
         >>> print(f"Sample parameter grad?: {sample_param.grad}")
-        Sample parameter grad?:
-        tensor([[ 0.0000,  0.0000,  0.0000,  0.0000],
+        Sample parameter grad?: tensor([[ 0.0000,  ...,  0.0000],
                 ...,
-                [-0.1140, -0.0175,  0.0645, -0.0845]],
-               dtype=torch.float16)
+                [-0.1140,  ..., -0.0845]], dtype=torch.float16)
 
     With a single backward pass, we should not get any infinite gradients:
 
