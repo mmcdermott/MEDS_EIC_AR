@@ -1,3 +1,13 @@
+"""CLI entry points for training (``MEICAR_pretrain``) and generation (``MEICAR_generate_trajectories``).
+
+Both commands are thin Hydra wrappers that resolve the run's config, wire up the
+:class:`~MEDS_EIC_AR.training.MEICARModule`, and hand off to Lightning. Pre-training additionally writes a
+resume-time environment snapshot (``environment.txt``) and the resolved Hydra config to ``output_dir`` so
+re-runs and post-hoc debugging have a fingerprint of the invocation. Generation loads a checkpoint via
+``model_initialization_dir``, runs the rolling sliding-window predict path, and emits per-task-sample
+trajectory parquets under ``output_dir/<split>/<sample>.parquet``.
+"""
+
 import logging
 import os
 import shutil

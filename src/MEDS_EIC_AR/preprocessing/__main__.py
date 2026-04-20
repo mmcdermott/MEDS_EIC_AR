@@ -1,3 +1,17 @@
+"""CLI entry point for MEDS-EIC-AR preprocessing (``MEICAR_process_data``).
+
+Runs two upstream MEDS-Transforms stages back-to-back against a shared Hydra config:
+
+1. :mod:`MEDS_transforms.runner` — the general MEDS → MEDS pipeline transform pass (filtering, timeline
+   tokens, value quantization).
+2. ``MTD_preprocess`` — the :mod:`meds_torchdata` tensorization pass that produces the directory layout
+   consumed by :class:`meds_torchdata.MEDSPytorchDataset` and the downstream training loop.
+
+The ``do_reshard`` toggle controls whether the raw input is re-sharded by split before stage 1 —
+required for datasets that are not already sharded. ``do_demo`` lowers the rare-code / rare-subject
+filtering thresholds so the pipeline runs on small fixtures without filtering everything out.
+"""
+
 import logging
 import os
 import subprocess

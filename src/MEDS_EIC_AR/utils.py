@@ -1,3 +1,21 @@
+"""Shared utilities that don't fit the training / preprocessing / generation module split.
+
+Groups of helpers in this module:
+
+- **OmegaConf resolvers** (``gpus_available``, ``num_cores``, ``num_gpus``, ``oc_min``,
+  ``hash_based_seed``, ``int_prod``, ``resolve_generation_context_size``) — registered as Hydra/OmegaConf
+  resolvers so config interpolations can read hardware state and compute derived values.
+- **Logger restore/save** (``save_logger_run_ids``, ``apply_saved_logger_run_ids``) — lets training
+  resumes reuse the same MLflow / WandB run IDs so a paused-and-resumed run looks like a single run in
+  the tracking backend.
+- **Environment snapshotting** (``save_environment_snapshot``) — writes ``environment.txt`` to the run
+  ``output_dir`` on initial run creation (not on resume), capturing Python version, platform, and every
+  installed distribution and version. See issue #24 / PR #129.
+- **Resolved-config persistence** (``save_resolved_config``).
+- **Logger detection** (``is_mlflow_logger``) — mlflow-optional-import-safe predicate used by the
+  training hooks that need to know if they should do MLflow-specific things.
+"""
+
 import logging
 import multiprocessing
 from collections.abc import Sequence
