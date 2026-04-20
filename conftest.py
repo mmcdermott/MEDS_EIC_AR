@@ -284,8 +284,10 @@ def _setup_doctest_namespace(
     # Pin torch's tensor-repr to a fixed abbreviation pattern so doctests that print tensors
     # are stable regardless of prior global state. ``MEDSTorchBatch.__repr__`` in
     # ``meds_torchdata`` temporarily lowers threshold/edgeitems and restores defaults, so
-    # collection-order-dependent state would otherwise leak between tests.
-    torch.set_printoptions(edgeitems=1, threshold=50)
+    # collection-order-dependent state would otherwise leak between tests. ``precision=3``
+    # tracks FP16's ~3-decimal-digit mantissa so the last-digit numerical noise that FP16
+    # matmul kernels produce across CI runs does not surface as a diff in the expected repr.
+    torch.set_printoptions(edgeitems=1, threshold=50, precision=3)
     doctest_namespace.update(
         {
             "print_warnings": partial(print_warnings, caplog),
