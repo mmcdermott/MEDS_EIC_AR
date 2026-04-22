@@ -18,13 +18,11 @@ from importlib.resources import files
 from pathlib import Path
 
 import hydra
-import pyarrow.parquet as pq
 import torch
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch, MEDSTorchDataConfig
-from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
 from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -32,10 +30,10 @@ from torch.utils.data import DataLoader
 from .generation import (
     RepeatedPredictionDataset,
     collate_with_meta,
-    format_trajectories,
     get_timeline_end_token_idx,
     validate_rolling_cfg,
 )
+from .generation.runner import write_predictions
 from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
@@ -281,36 +279,13 @@ def generate_trajectories(cfg: DictConfig):
         seed_everything(seed, workers=True)
         predictions = trainer.predict(model=M, dataloaders=expanded_loader)
 
-        # Demux the flat predictions into per-trajectory, per-batch token lists. Within each batch
-        # the rows for trajectory ``t`` are in subject-index order (because the expanded dataset
-        # was built with subject-changes-slow ordering and ``shuffle=False``), and across batches
-        # the subject-index ranges are non-overlapping and increasing — so the concatenation per
-        # trajectory ``t`` is exactly the order that ``format_trajectories`` consumes from
-        # ``base_dataset.schema_df``.
-        #
-        # ``trajectory_idxs`` is a [B] long tensor recording, for each batch row, which of the N
-        # trajectories-per-subject that row corresponds to (0..N-1). It's distinct from
-        # ``subject_idxs`` which records the base-dataset index the row came from.
-        per_trajectory_batches: dict[int, list[torch.Tensor]] = {t: [] for t in range(n_trajectories)}
-        for pred in predictions:
-            tokens = pred["tokens"]
-            trajectory_idxs = pred["trajectory_idxs"]
-            # Iterate over the trajectories actually present in this batch rather than always
-            # doing N boolean compares. For batches that cover every trajectory (the common case
-            # when batch_size >= N), this is the same work; for tail batches or small batch sizes,
-            # it scales with the number of distinct trajectory_idxs in the batch instead.
-            for t in trajectory_idxs.unique().tolist():
-                mask = trajectory_idxs == t
-                per_trajectory_batches[t].append(tokens[mask])
-
-        for trajectory_idx, out_fp in trajectory_paths.items():
-            if out_fp.is_file() and not cfg.do_overwrite:
-                logger.info(f"Skipping {out_fp} as it already exists.")
-                continue
-            logger.info(f"Writing trajectory {trajectory_idx} for split {split} to {out_fp}.")
-            predictions_df = format_trajectories(base_dataset, per_trajectory_batches[trajectory_idx])
-            pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
-            pq.write_table(pa_table, out_fp)
+        write_predictions(
+            predictions,
+            n_trajectories=n_trajectories,
+            trajectory_paths=trajectory_paths,
+            base_dataset=base_dataset,
+            do_overwrite=cfg.do_overwrite,
+        )
 
     # Save the generation run's logger ids into the *generation* ``output_dir``, not the
     # training checkpoint's ``model_initialization_dir``. A caller using the escape hatch
