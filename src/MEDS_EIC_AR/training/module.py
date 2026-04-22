@@ -1,3 +1,11 @@
+"""PyTorch Lightning module for the MEDS-EIC-AR autoregressive model.
+
+:class:`MEICARModule` wraps :class:`~MEDS_EIC_AR.model.Model` and owns the optimizer / LR scheduler
+construction, the next-code metric collection, the resume-safe config fingerprinting, and the
+interleaved N-sample predict path that feeds :mod:`MEDS_EIC_AR.generation`. See
+:mod:`MEDS_EIC_AR.training` README for a higher-level overview.
+"""
+
 import copy
 import logging
 import re
