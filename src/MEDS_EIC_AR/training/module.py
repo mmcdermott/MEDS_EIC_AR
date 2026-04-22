@@ -480,7 +480,7 @@ class MEICARModule(L.LightningModule):
 
         Expects the :data:`PredictBatch` shape yielded by
         :func:`MEDS_EIC_AR.generation.collate_with_meta` — a three-tuple
-        ``(batch, subject_idxs, trajectory_idxs)`` — as produced by the expanded dataset that
+        ``(batch, dataset_row_idxs, trajectory_idxs)`` — as produced by the expanded dataset that
         ``MEICAR_generate_trajectories`` builds. The bare-``MEDSTorchBatch`` form supported by the
         prior iteration is no longer accepted; callers wanting a single trajectory per subject
         should set ``n_trajectories=1`` on :class:`RepeatedPredictionDataset`, which still yields
@@ -494,9 +494,13 @@ class MEICARModule(L.LightningModule):
 
         Returns a dict with:
             - ``tokens``: ``[B, L]`` generated-token tensor from the model.
-            - ``subject_idxs``: ``[B]`` long tensor, which base-dataset subject each row came from.
-            - ``trajectory_idxs``: ``[B]`` long tensor, which of the N trajectories-per-subject
-              each row corresponds to.
+            - ``dataset_row_idxs``: ``[B]`` long tensor, the integer index into the *base*
+              (un-expanded) dataset that each row was drawn from — i.e. the value such that
+              ``base[dataset_row_idxs[i]]`` recovers the original item. Note this is a row
+              index, not a ``subject_id``; a subject with multiple ``prediction_time`` rows
+              occupies multiple distinct ``dataset_row_idxs`` values.
+            - ``trajectory_idxs``: ``[B]`` long tensor, which of the N trajectories-per-
+              base-dataset-row each batch row corresponds to.
 
         All three tensors are detached and moved to CPU before returning. ``Trainer.predict``
         accumulates per-batch returns in a Python list across the entire predict run (scaled by
@@ -504,10 +508,10 @@ class MEICARModule(L.LightningModule):
         GPU allocations for the full pass and OOM on non-trivial cohorts. Downstream demux and
         ``format_trajectories`` run on CPU anyway.
         """
-        mdata_batch, subject_idxs, trajectory_idxs = batch
+        mdata_batch, dataset_row_idxs, trajectory_idxs = batch
         tokens = self.model.generate(mdata_batch, **self.generation_kwargs)
         return {
             "tokens": tokens.detach().cpu(),
-            "subject_idxs": subject_idxs.detach().cpu(),
+            "dataset_row_idxs": dataset_row_idxs.detach().cpu(),
             "trajectory_idxs": trajectory_idxs.detach().cpu(),
         }

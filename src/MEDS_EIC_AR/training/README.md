@@ -15,6 +15,6 @@ validation, and prediction. It owns:
     (`ALLOWED_DIFFERENCE_KEYS` in [`files.py`](files.py)) covers cadence params that are safe to adjust
     across a resume (`trainer.val_check_interval`, `trainer.check_val_every_n_epoch`,
     `trainer.log_every_n_steps`).
-- **Prediction** — `predict_step` takes a `PredictBatch` (`(mdata_batch, subject_idxs, trajectory_idxs)`
+- **Prediction** — `predict_step` takes a `PredictBatch` (`(mdata_batch, dataset_row_idxs, trajectory_idxs)`
     from the N-sample interleaving dataloader, see [`generation/`](../generation/)) and runs the rolling
     generator to produce N trajectories per subject in a single predict pass.
