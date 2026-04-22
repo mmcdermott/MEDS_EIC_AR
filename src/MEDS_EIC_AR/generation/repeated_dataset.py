@@ -52,8 +52,8 @@ class RepeatedPredictionDataset(Dataset):
     """Wraps a base dataset so each underlying item contributes ``n_trajectories`` consecutive rows.
 
     The ordering is **(dataset_row_idx changes slow, trajectory_idx changes fast)**, so a batch of
-    ``batch_size`` covers at most ``ceil(batch_size / n_trajectories)`` distinct subjects and at
-    least ``floor(batch_size / n_trajectories)`` full trajectory-groups.
+    ``batch_size`` covers at most ``ceil(batch_size / n_trajectories)`` distinct base-dataset rows
+    and at least ``floor(batch_size / n_trajectories)`` full trajectory-groups.
 
     Concretely, if ``n_trajectories=4`` and the base dataset is ``[A, B, C, ...]``, this dataset
     yields::
