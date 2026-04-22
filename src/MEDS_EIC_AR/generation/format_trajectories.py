@@ -26,7 +26,7 @@ def get_code_information(dataset: MEDSPytorchDataset) -> dict[int, CodeInformati
         A dictionary mapping code indices to their code strings and numeric value means.
 
     Examples:
-        >>> get_code_information(pytorch_dataset)
+        >>> dict(sorted(get_code_information(pytorch_dataset).items()))
         {1: CodeInformation(code='ADMISSION//CARDIAC', value_prob=0.0, value_mean=None),
          2: CodeInformation(code='ADMISSION//ORTHOPEDIC', value_prob=0.0, value_mean=None),
          3: CodeInformation(code='ADMISSION//PULMONARY', value_prob=0.0, value_mean=None),
@@ -69,9 +69,7 @@ def get_code_information(dataset: MEDSPytorchDataset) -> dict[int, CodeInformati
     code_information = {}
 
     columns = ["code", "code/vocab_index", "code/n_occurrences", "values/n_occurrences", "values/sum"]
-    code_metadata_df = pl.read_parquet(
-        dataset.config.code_metadata_fp, columns=columns, use_pyarrow=True
-    ).sort("code/vocab_index")
+    code_metadata_df = pl.read_parquet(dataset.config.code_metadata_fp, columns=columns, use_pyarrow=True)
 
     for row in code_metadata_df.to_dicts():
         has_value_prob = row["values/n_occurrences"] / row["code/n_occurrences"]
