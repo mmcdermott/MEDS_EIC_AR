@@ -1,15 +1,28 @@
-"""Public entry point for finalizing ``Trainer.predict`` output into per-trajectory parquets.
+"""Rank-aware shard-then-merge pipeline for finalizing generation output.
 
-``write_predictions`` is the single function ``__main__`` calls. Internally it composes three
-module-private helpers (``_demux_predictions_per_trajectory``,
-``_sort_per_trajectory_by_dataset_row_index``, ``_write_per_trajectory_parquets``) that each carry
-focused doctests for the invariants they enforce. Outside this module, only ``write_predictions``
-is considered stable.
+The generation CLI calls two functions from this module, one before and one after a barrier:
+
+- ``write_predictions_shards`` — runs on *every* rank (single-device or DDP). Takes that rank's
+  ``trainer.predict`` output and writes one parquet shard per trajectory under a shared
+  ``shard_dir`` (name: ``trajectory_{t}.rank_{rank}.parquet``). Shards carry the raw per-row
+  generated tokens alongside the base-dataset row index.
+- ``finalize_predictions`` — runs on **rank 0 only**, after an inter-rank barrier. Reads all
+  rank shards for each trajectory, concatenates + sorts by ``dataset_row_idx``, validates the
+  index set is the complete permutation ``{0, ..., n_dataset_rows - 1}``, feeds the merged
+  per-row tokens to ``format_trajectories``, and writes the final per-trajectory parquet via
+  ``GeneratedTrajectorySchema``. Shards are deleted after the final parquets land.
+
+The filesystem is the coordination mechanism: no ``BasePredictionWriter`` callback, no
+``torch.distributed.all_gather``. This works for any ``world_size`` including 1 (rank 0 writes
+one shard, rank 0 merges one shard — same code path). The shard format (``dataset_row_idx``
+column + ``tokens`` list column) makes the merge a single ``pl.concat(...).sort(...)`` call.
 """
 
+import contextlib
 import logging
 from pathlib import Path
 
+import polars as pl
 import pyarrow.parquet as pq
 import torch
 from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
@@ -17,6 +30,11 @@ from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
 from .format_trajectories import format_trajectories
 
 logger = logging.getLogger(__name__)
+
+#: Shard column names. Written by ``write_predictions_shards``, consumed by
+#: ``finalize_predictions``. Kept as module constants so the two stay in sync.
+SHARD_ROW_IDX_COL = "dataset_row_idx"
+SHARD_TOKENS_COL = "tokens"
 
 
 def _demux_predictions_per_trajectory(
@@ -64,20 +82,6 @@ def _demux_predictions_per_trajectory(
         [[0, 1]]
         >>> [b.tolist() for b in sidx[1]]
         []
-
-        Across multiple batches, per-trajectory batches are preserved in arrival order:
-
-        >>> preds = [
-        ...     {"tokens": torch.tensor([[1, 2]]),
-        ...      "dataset_row_idxs": torch.tensor([0]),
-        ...      "trajectory_idxs": torch.tensor([0])},
-        ...     {"tokens": torch.tensor([[3, 4]]),
-        ...      "dataset_row_idxs": torch.tensor([1]),
-        ...      "trajectory_idxs": torch.tensor([0])},
-        ... ]
-        >>> _, sidx = _demux_predictions_per_trajectory(preds, n_trajectories=1)
-        >>> [b.tolist() for b in sidx[0]]
-        [[0], [1]]
     """
     per_trajectory_batches: dict[int, list[torch.Tensor]] = {t: [] for t in range(n_trajectories)}
     per_trajectory_dataset_row_idxs: dict[int, list[torch.Tensor]] = {t: [] for t in range(n_trajectories)}
@@ -92,231 +96,139 @@ def _demux_predictions_per_trajectory(
     return per_trajectory_batches, per_trajectory_dataset_row_idxs
 
 
-def _sort_per_trajectory_by_dataset_row_index(
-    per_trajectory_batches: dict[int, list[torch.Tensor]],
-    per_trajectory_dataset_row_idxs: dict[int, list[torch.Tensor]],
-    n_dataset_rows: int,
-) -> dict[int, list[torch.Tensor]]:
-    """Reassemble each trajectory's rows into dataset-row-index order, one row per output element.
-
-    ``format_trajectories`` downstream walks ``base_dataset.schema_df`` via a running
-    ``slice(st_i, B_i)``, which requires the per-row stream for each trajectory to be in ascending
-    dataset-row-index order. On the default single-device predict path that holds trivially, but
-    any reshuffle — an accidental ``shuffle=True`` on the expanded loader, a manual cross-rank
-    gather in a DDP-enabled successor (see #146; Lightning's ``Trainer.predict`` does *not*
-    auto-gather across ranks, so any DDP story has to wire one explicitly), or a future change to
-    ``RepeatedPredictionDataset``'s expansion order — would otherwise silently misalign the
-    ``(subject_id, prediction_time)`` metadata. This helper closes that gap by using the
-    already-tracked ``dataset_row_idxs`` to reassemble.
-
-    Because different batches carry different ``L`` (``model.generate`` stops at per-batch
-    conditions), we avoid padding entirely: each row is emitted as a ``[1, L_i]`` single-row
-    tensor, preserving its native length. ``format_trajectories`` already iterates a list of
-    per-batch tensors with its own ``L``, so 1-row batches are a no-op change to it.
-
-    Raises ``RuntimeError`` if the set of dataset_row_idxs for any trajectory is not exactly
-    ``{0, 1, ..., n_dataset_rows - 1}``. This catches missing rows, duplicates, or bookkeeping errors
-    in the reassembly itself — it is a post-condition on the sorted output, not a pre-condition
-    on arrival order.
-
-    Examples:
-        In-order single-batch input — output is just the rows split into 1-row tensors:
-
-        >>> batches = {0: [torch.tensor([[10, 11], [20, 21], [30, 31]])]}
-        >>> sidxs = {0: [torch.tensor([0, 1, 2])]}
-        >>> out = _sort_per_trajectory_by_dataset_row_index(batches, sidxs, n_dataset_rows=3)
-        >>> [b.tolist() for b in out[0]]
-        [[[10, 11]], [[20, 21]], [[30, 31]]]
-
-        Shuffled input (simulating DDP gather) — rows come out in dataset-row-index order,
-        carrying the right token rows:
-
-        >>> batches = {0: [torch.tensor([[20, 21], [0, 1], [10, 11]])]}
-        >>> sidxs = {0: [torch.tensor([2, 0, 1])]}
-        >>> out = _sort_per_trajectory_by_dataset_row_index(batches, sidxs, n_dataset_rows=3)
-        >>> [b.tolist() for b in out[0]]
-        [[[0, 1]], [[10, 11]], [[20, 21]]]
-
-        Mixed-``L`` across batches (this is what lets us avoid padding). Batch 1 has ``L=2``,
-        batch 2 has ``L=3``; output keeps the native lengths:
-
-        >>> batches = {
-        ...     0: [torch.tensor([[10, 11], [30, 31]]),
-        ...         torch.tensor([[0, 1, 2], [20, 21, 22]])],
-        ... }
-        >>> sidxs = {0: [torch.tensor([1, 3]), torch.tensor([0, 2])]}
-        >>> out = _sort_per_trajectory_by_dataset_row_index(batches, sidxs, n_dataset_rows=4)
-        >>> [b.tolist() for b in out[0]]
-        [[[0, 1, 2]], [[10, 11]], [[20, 21, 22]], [[30, 31]]]
-
-        Multiple trajectories are sorted independently:
-
-        >>> batches = {
-        ...     0: [torch.tensor([[1, 1], [0, 0]])],
-        ...     1: [torch.tensor([[2, 2], [3, 3]])],
-        ... }
-        >>> sidxs = {0: [torch.tensor([1, 0])], 1: [torch.tensor([0, 1])]}
-        >>> out = _sort_per_trajectory_by_dataset_row_index(batches, sidxs, n_dataset_rows=2)
-        >>> [b.tolist() for b in out[0]]
-        [[[0, 0]], [[1, 1]]]
-        >>> [b.tolist() for b in out[1]]
-        [[[2, 2]], [[3, 3]]]
-
-        Missing rows raises:
-
-        >>> _sort_per_trajectory_by_dataset_row_index(
-        ...     {0: [torch.tensor([[10, 11], [20, 21]])]},
-        ...     {0: [torch.tensor([0, 1])]},
-        ...     n_dataset_rows=3,
-        ... )
-        Traceback (most recent call last):
-          ...
-        RuntimeError: Trajectory 0 dataset-row-index set is not {0, 1, ..., 2}: got [0, 1]...
-
-        Duplicate dataset_row_idxs raises:
-
-        >>> _sort_per_trajectory_by_dataset_row_index(
-        ...     {0: [torch.tensor([[10, 11], [10, 11], [20, 21]])]},
-        ...     {0: [torch.tensor([0, 0, 1])]},
-        ...     n_dataset_rows=2,
-        ... )
-        Traceback (most recent call last):
-          ...
-        RuntimeError: Trajectory 0 dataset-row-index set is not {0, 1, ..., 1}: got [0, 0, 1]...
-
-        Out-of-range dataset_row_idx raises:
-
-        >>> _sort_per_trajectory_by_dataset_row_index(
-        ...     {0: [torch.tensor([[10, 11], [20, 21], [30, 31]])]},
-        ...     {0: [torch.tensor([0, 1, 5])]},
-        ...     n_dataset_rows=3,
-        ... )
-        Traceback (most recent call last):
-          ...
-        RuntimeError: Trajectory 0 dataset-row-index set is not {0, 1, ..., 2}: got [0, 1, 5]...
-
-        Empty input when rows are expected raises:
-
-        >>> _sort_per_trajectory_by_dataset_row_index({0: []}, {0: []}, n_dataset_rows=3)
-        Traceback (most recent call last):
-          ...
-        RuntimeError: Trajectory 0 dataset-row-index set is not {0, 1, ..., 2}: got []...
-    """
-    sorted_per_trajectory: dict[int, list[torch.Tensor]] = {}
-    for t, token_batches in per_trajectory_batches.items():
-        dataset_row_idx_batches = per_trajectory_dataset_row_idxs[t]
-
-        if token_batches:
-            all_tokens_per_row = [row for batch in token_batches for row in batch]
-            all_dataset_row_idxs = torch.cat(dataset_row_idx_batches)
-        else:
-            all_tokens_per_row = []
-            all_dataset_row_idxs = torch.empty(0, dtype=torch.long)
-
-        # 1:1 correspondence between token rows and dataset_row_idxs. Should always hold —
-        # both come from the same predict_step output dict and are built by the same demux
-        # mask above — but guard explicitly so any upstream bookkeeping drift fails here
-        # with a clear diagnostic instead of silently mis-pairing rows or raising IndexError
-        # inside the sort loop below.
-        if len(all_tokens_per_row) != all_dataset_row_idxs.numel():
-            raise RuntimeError(
-                f"Trajectory {t} token-row / dataset_row_idx length mismatch: "
-                f"{len(all_tokens_per_row)} tokens vs {all_dataset_row_idxs.numel()} indices. "
-                "This should be impossible — both are demuxed from the same predict_step "
-                "output dict. Check for upstream masking / metadata-plumbing drift."
-            )
-
-        # Validate and sort in a single tensor pass. Argsort + compare against ``arange`` is
-        # the set-equality test for "indices form a complete permutation of ``range(n)``" and
-        # avoids materializing a Python ``set(range(n))`` (which costs 40+ bytes per int for
-        # tens of millions of rows). ``expected`` is built on the same device as
-        # ``sorted_idxs`` so a caller that ever forgets to ``.cpu()`` predict outputs still
-        # hits the real diagnostic instead of a confusing device-mismatch error.
-        order = torch.argsort(all_dataset_row_idxs, stable=True)
-        sorted_idxs = all_dataset_row_idxs[order]
-        expected = torch.arange(n_dataset_rows, dtype=sorted_idxs.dtype, device=sorted_idxs.device)
-        if sorted_idxs.shape != expected.shape or not torch.equal(sorted_idxs, expected):
-            # Slice the index tensor before ``tolist`` so we don't materialize N Python ints
-            # just to show the first 10 in a diagnostic. Matters at cohort scale (``tolist()``
-            # on a 10M-row tensor allocates ~280 MB of Python ints).
-            preview = all_dataset_row_idxs[:10].tolist()
-            raise RuntimeError(
-                f"Trajectory {t} dataset-row-index set is not {{0, 1, ..., {n_dataset_rows - 1}}}: "
-                f"got {preview}... (len {all_dataset_row_idxs.numel()}). "
-                "Every base-dataset row index must appear exactly once per trajectory. A "
-                "missing or duplicate index indicates a sampler bug, an accidental dataloader "
-                "shuffle, or — for a hypothetical DDP path — an incomplete cross-rank gather "
-                "(Lightning's ``Trainer.predict`` does not auto-gather; see issue #146)."
-            )
-
-        # Iterate ``order`` directly rather than calling ``order.tolist()`` up front. The
-        # latter would materialize a Python list of N ints (~28 bytes each on CPython); the
-        # former yields 0-d tensors whose ``.item()`` is a cheap per-element sync and keeps
-        # peak memory bounded by what's already in the permutation tensor.
-        sorted_per_trajectory[t] = [all_tokens_per_row[i.item()].unsqueeze(0) for i in order]
-    return sorted_per_trajectory
-
-
-def _write_per_trajectory_parquets(
-    per_trajectory_batches: dict[int, list[torch.Tensor]],
-    trajectory_paths: dict[int, Path],
-    base_dataset,
-    do_overwrite: bool,
-) -> None:
-    """Format each trajectory's demuxed batches via ``format_trajectories`` and write them out.
-
-    Idempotent per-file: if ``do_overwrite`` is ``False`` and a trajectory's parquet is already on
-    disk, that trajectory is skipped and no ``format_trajectories`` work is done for it. The
-    split-level all-parquets-exist short-circuit in the caller handles the zero-work case.
-    """
-    for trajectory_idx, out_fp in trajectory_paths.items():
-        if out_fp.is_file() and not do_overwrite:
-            logger.info(f"Skipping {out_fp} as it already exists.")
-            continue
-        logger.info(f"Writing trajectory {trajectory_idx} to {out_fp}.")
-        predictions_df = format_trajectories(base_dataset, per_trajectory_batches[trajectory_idx])
-        pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
-        pq.write_table(pa_table, out_fp)
-
-
-def write_predictions(
+def write_predictions_shards(
     predictions: list[dict[str, torch.Tensor]],
     *,
     n_trajectories: int,
+    shard_dir: Path,
+    rank: int,
+) -> None:
+    """Write this rank's predictions as per-trajectory parquet shards under ``shard_dir``.
+
+    Called by every rank (single-device = rank 0 with ``world_size=1``, or each rank in DDP).
+    Writes one shard per trajectory with filename ``trajectory_{t}.rank_{rank}.parquet``, carrying
+    columns ``dataset_row_idx`` (Int64) and ``tokens`` (``List[Int64]``). Under DDP each rank
+    sees only its local slice of predictions — the shards for a single trajectory together span
+    ``{0, ..., n_dataset_rows - 1}`` across all rank files. Rows within a rank's shard are NOT
+    sorted; the final sort happens in ``finalize_predictions`` after concatenating all ranks.
+
+    Empty shards (a rank that received no rows for a trajectory) are still written so
+    ``finalize_predictions``'s glob-and-concat loop doesn't have to special-case missing files.
+
+    Examples:
+        >>> import tempfile
+        >>> preds = [{
+        ...     "tokens": torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.long),
+        ...     "dataset_row_idxs": torch.tensor([0, 1, 2]),
+        ...     "trajectory_idxs": torch.tensor([0, 1, 0]),
+        ... }]
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     shard_dir = Path(d)
+        ...     write_predictions_shards(preds, n_trajectories=2, shard_dir=shard_dir, rank=0)
+        ...     names = sorted(p.name for p in shard_dir.glob("*.parquet"))
+        ...     df = pl.read_parquet(shard_dir / "trajectory_0.rank_0.parquet")
+        >>> names
+        ['trajectory_0.rank_0.parquet', 'trajectory_1.rank_0.parquet']
+        >>> df.to_dict(as_series=False)
+        {'dataset_row_idx': [0, 2], 'tokens': [[1, 2], [5, 6]]}
+    """
+    per_t_batches, per_t_idxs = _demux_predictions_per_trajectory(predictions, n_trajectories)
+    for t in range(n_trajectories):
+        token_batches = per_t_batches[t]
+        idx_batches = per_t_idxs[t]
+        if token_batches:
+            all_tokens = [row.tolist() for batch in token_batches for row in batch]
+            all_idxs = torch.cat(idx_batches).tolist()
+        else:
+            all_tokens = []
+            all_idxs = []
+        shard_df = pl.DataFrame(
+            {SHARD_ROW_IDX_COL: all_idxs, SHARD_TOKENS_COL: all_tokens},
+            schema={SHARD_ROW_IDX_COL: pl.Int64, SHARD_TOKENS_COL: pl.List(pl.Int64)},
+        )
+        shard_path = shard_dir / f"trajectory_{t}.rank_{rank}.parquet"
+        shard_df.write_parquet(shard_path)
+
+
+def finalize_predictions(
+    *,
+    n_dataset_rows: int,
+    shard_dir: Path,
     trajectory_paths: dict[int, Path],
     base_dataset,
     do_overwrite: bool,
+    cleanup_shards: bool = True,
 ) -> None:
-    """Format a flat list of ``Trainer.predict`` per-batch outputs into per-trajectory parquets.
+    """Merge rank shards per trajectory into the final parquets. Call on rank 0 only.
 
-    Given:
+    For each trajectory in ``trajectory_paths``:
 
-    - ``predictions``: what ``Trainer.predict(model=MEICARModule, dataloaders=...)`` returns when
-      the Lightning module's ``predict_step`` emits the three-key dict this module expects
-      (``tokens``, ``dataset_row_idxs``, ``trajectory_idxs``).
-    - ``n_trajectories``: the ``N`` used to expand the base dataset via
-      :class:`~MEDS_EIC_AR.generation.RepeatedPredictionDataset`.
-    - ``trajectory_paths``: the mapping ``trajectory_idx → output parquet path`` for the split
-      being written.
-    - ``base_dataset``: the un-expanded ``MEDSPytorchDataset`` whose ``schema_df`` supplies
-      ``(subject_id, prediction_time, last_time)`` metadata per row, in order.
-    - ``do_overwrite``: if ``False``, per-trajectory parquets that already exist are left alone.
+    1. ``pl.read_parquet`` + ``pl.concat`` + ``.sort("dataset_row_idx")`` across all
+       ``trajectory_{t}.rank_*.parquet`` shards under ``shard_dir``.
+    2. Validate the concatenated, sorted ``dataset_row_idx`` column is exactly
+       ``[0, 1, ..., n_dataset_rows - 1]`` — catches missing rows, duplicates, and
+       out-of-range values as a loud error instead of silently misaligning output.
+    3. Reconstitute per-row generated-token tensors from the shard's ``tokens`` list column,
+       emit as a list of ``[1, L_i]`` single-row tensors (variable ``L`` per row is preserved
+       — ``format_trajectories`` already iterates per-batch), and hand off to
+       ``format_trajectories`` + ``GeneratedTrajectorySchema.align`` + ``pq.write_table``.
 
-    Writes one parquet per trajectory in ``trajectory_paths``.
-
-    Internally: (1) demux predictions into per-trajectory streams, (2) reassemble each
-    trajectory's rows into dataset-row-index order using the already-tracked ``dataset_row_idxs`` (robust
-    to DDP gather order, shuffled loaders, or future sampler changes), (3) format + write each
-    trajectory's parquet. The reassembly step makes arrival order irrelevant for correctness; the
-    validation inside it catches missing / duplicate / out-of-range dataset_row_idxs as a loud error
-    rather than silent parquet corruption.
+    Per-file idempotent: if a trajectory's final parquet already exists and ``do_overwrite`` is
+    ``False``, that trajectory is skipped (its shards are still cleaned up at the end unless
+    ``cleanup_shards=False``). After all trajectories finish, shard files are removed and the
+    shard directory itself is removed if empty.
     """
-    per_trajectory_batches, per_trajectory_dataset_row_idxs = _demux_predictions_per_trajectory(
-        predictions, n_trajectories
-    )
-    sorted_per_trajectory = _sort_per_trajectory_by_dataset_row_index(
-        per_trajectory_batches, per_trajectory_dataset_row_idxs, n_dataset_rows=len(base_dataset)
-    )
-    _write_per_trajectory_parquets(
-        sorted_per_trajectory, trajectory_paths, base_dataset, do_overwrite=do_overwrite
-    )
+    expected_first = 0
+    expected_last = n_dataset_rows - 1
+    for t, out_fp in trajectory_paths.items():
+        if out_fp.is_file() and not do_overwrite:
+            logger.info(f"Skipping {out_fp} as it already exists.")
+            continue
+
+        shard_paths = sorted(shard_dir.glob(f"trajectory_{t}.rank_*.parquet"))
+        if not shard_paths:
+            raise RuntimeError(
+                f"Trajectory {t}: no rank shards at {shard_dir}/trajectory_{t}.rank_*.parquet. "
+                "write_predictions_shards must run on every rank before finalize_predictions."
+            )
+
+        merged = pl.concat([pl.read_parquet(p) for p in shard_paths]).sort(SHARD_ROW_IDX_COL)
+
+        # Validate the concatenated, sorted idx column is the full permutation ``[0, ..., n-1]``.
+        # After ``.sort``, completeness checks reduce to: right length, first == 0, last == n-1,
+        # and every consecutive diff is 1 (no duplicates, no gaps). Done in polars-native ops so
+        # we never materialize a Python list of N indices.
+        idxs = merged[SHARD_ROW_IDX_COL]
+        if len(idxs) != n_dataset_rows:
+            raise RuntimeError(
+                f"Trajectory {t} merged row count {len(idxs)} != n_dataset_rows {n_dataset_rows}. "
+                "Check that every rank wrote its shard and that no rows were dropped upstream."
+            )
+        diffs = idxs.diff().drop_nulls()
+        if idxs[0] != expected_first or idxs[-1] != expected_last or (diffs.len() > 0 and (diffs != 1).any()):
+            preview = idxs.head(10).to_list()
+            raise RuntimeError(
+                f"Trajectory {t} dataset-row-index set is not "
+                f"{{0, 1, ..., {expected_last}}}: got {preview}... (len {len(idxs)}). "
+                "Every base-dataset row index must appear exactly once across all rank shards. "
+                "A missing or duplicate index indicates a sampler bug, an accidental dataloader "
+                "shuffle, or a missing / misnamed rank shard."
+            )
+
+        # Reconstitute per-row token tensors; emit as 1-row batches so ``format_trajectories``
+        # can preserve each row's native ``L`` (no cross-row padding).
+        token_rows = [torch.tensor(row, dtype=torch.long) for row in merged[SHARD_TOKENS_COL].to_list()]
+        one_row_batches = [r.unsqueeze(0) for r in token_rows]
+
+        logger.info(f"Writing trajectory {t} to {out_fp}.")
+        predictions_df = format_trajectories(base_dataset, one_row_batches)
+        pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
+        pq.write_table(pa_table, out_fp)
+
+    if cleanup_shards:
+        for p in shard_dir.glob("trajectory_*.rank_*.parquet"):
+            p.unlink()
+        # ``rmdir`` fails loudly if the dir has other contents or doesn't exist — that's the
+        # safe default, we just don't care in either case.
+        with contextlib.suppress(OSError):
+            shard_dir.rmdir()

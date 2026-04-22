@@ -33,7 +33,7 @@ from .generation import (
     get_timeline_end_token_idx,
     validate_rolling_cfg,
 )
-from .generation.runner import write_predictions
+from .generation.runner import finalize_predictions, write_predictions_shards
 from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
@@ -279,13 +279,34 @@ def generate_trajectories(cfg: DictConfig):
         seed_everything(seed, workers=True)
         predictions = trainer.predict(model=M, dataloaders=expanded_loader)
 
-        write_predictions(
+        # Shard-then-merge finalize: every rank writes its per-trajectory shards to a shared
+        # ``_shards`` directory under the split output, then a barrier, then rank 0 merges the
+        # shards into the final per-trajectory parquets. Works uniformly for single-device
+        # (``world_size=1``: one shard per trajectory, rank-0 merge is a one-file passthrough)
+        # and DDP (one shard per ``(trajectory, rank)``; rank 0's polars ``concat + sort`` by
+        # ``dataset_row_idx`` stitches them together). No cross-rank gather or
+        # ``BasePredictionWriter`` — the filesystem is the coordination primitive.
+        shard_dir = Path(cfg.output_dir) / split / "_shards"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        write_predictions_shards(
             predictions,
             n_trajectories=n_trajectories,
-            trajectory_paths=trajectory_paths,
-            base_dataset=base_dataset,
-            do_overwrite=cfg.do_overwrite,
+            shard_dir=shard_dir,
+            rank=trainer.global_rank,
         )
+        trainer.strategy.barrier()
+        if trainer.is_global_zero:
+            finalize_predictions(
+                n_dataset_rows=len(base_dataset),
+                shard_dir=shard_dir,
+                trajectory_paths=trajectory_paths,
+                base_dataset=base_dataset,
+                do_overwrite=cfg.do_overwrite,
+            )
+        # Second barrier so non-zero ranks don't move past this split before rank 0's
+        # finalize + shard-cleanup has finished (avoids a race where the next split's
+        # ``shard_dir.mkdir`` collides with rank 0 still cleaning up the previous one).
+        trainer.strategy.barrier()
 
     # Save the generation run's logger ids into the *generation* ``output_dir``, not the
     # training checkpoint's ``model_initialization_dir``. A caller using the escape hatch
