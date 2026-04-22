@@ -22,7 +22,9 @@ import contextlib
 import logging
 from pathlib import Path
 
+import numpy as np
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
@@ -136,18 +138,59 @@ def write_predictions_shards(
     for t in range(n_trajectories):
         token_batches = per_t_batches[t]
         idx_batches = per_t_idxs[t]
+
+        # Build the shard's columns tensor-side so we never materialize ``total_tokens``
+        # Python ints just to hand them to polars. For each ``[B_i, L_i]`` batch, every row
+        # has length ``L_i``, so row lengths are a single ``torch.full(B_i, L_i)`` per batch;
+        # the flat token stream is ``batch.reshape(-1)`` concatenated across batches in row-
+        # major order. pyarrow ``ListArray.from_arrays`` then wraps offsets + flat values
+        # into the nested-list column polars/parquet expects, zero-copy from ``.numpy()`` on
+        # CPU tensors.
         if token_batches:
-            all_tokens = [row.tolist() for batch in token_batches for row in batch]
-            all_idxs = torch.cat(idx_batches).tolist()
+            row_lens = torch.cat(
+                [torch.full((batch.shape[0],), batch.shape[1], dtype=torch.int64) for batch in token_batches]
+            )
+            flat_tokens = torch.cat([batch.reshape(-1) for batch in token_batches]).to(torch.int64)
+            all_idxs = torch.cat(idx_batches).to(torch.int64)
         else:
-            all_tokens = []
-            all_idxs = []
-        shard_df = pl.DataFrame(
-            {SHARD_ROW_IDX_COL: all_idxs, SHARD_TOKENS_COL: all_tokens},
-            schema={SHARD_ROW_IDX_COL: pl.Int64, SHARD_TOKENS_COL: pl.List(pl.Int64)},
+            row_lens = torch.empty(0, dtype=torch.int64)
+            flat_tokens = torch.empty(0, dtype=torch.int64)
+            all_idxs = torch.empty(0, dtype=torch.int64)
+
+        # 1:1 correspondence between token rows and dataset_row_idxs. Both are demuxed from
+        # the same predict_step output dict by the same mask in
+        # ``_demux_predictions_per_trajectory``, so this should always hold. Guarding
+        # explicitly surfaces any upstream plumbing drift as a loud ``RuntimeError`` here
+        # instead of a silently corrupt shard on disk.
+        if row_lens.numel() != all_idxs.numel():
+            raise RuntimeError(
+                f"Trajectory {t} (rank {rank}): token-row count {row_lens.numel()} != "
+                f"dataset_row_idx count {all_idxs.numel()}. Demux invariant violated — "
+                "check for upstream masking / metadata drift in predict_step."
+            )
+
+        # pyarrow ``ListArray`` uses int32 offsets. For realistic cohort scale (e.g. 100k
+        # rows of 1000 tokens each = 1e8 total, well under 2^31 - 1 ~= 2.1e9) this is plenty;
+        # guard loudly against the theoretical overflow so an unexpectedly huge run doesn't
+        # silently corrupt offset arithmetic.
+        total_tokens = int(flat_tokens.numel())
+        if total_tokens > 2**31 - 1:
+            raise RuntimeError(
+                f"Trajectory {t} (rank {rank}): total token count {total_tokens} exceeds "
+                "int32 ListArray offset limit. Upgrade to LargeListArray if this scale is "
+                "real; currently this path assumes int32 offsets are sufficient."
+            )
+        offsets_i32 = (
+            torch.cat([torch.zeros(1, dtype=torch.int64), row_lens.cumsum(0)]).to(torch.int32).numpy()
         )
+        tokens_arr = pa.ListArray.from_arrays(
+            pa.array(offsets_i32, type=pa.int32()),
+            pa.array(flat_tokens.numpy(), type=pa.int64()),
+        )
+        idxs_arr = pa.array(all_idxs.numpy(), type=pa.int64())
+        table = pa.table({SHARD_ROW_IDX_COL: idxs_arr, SHARD_TOKENS_COL: tokens_arr})
         shard_path = shard_dir / f"trajectory_{t}.rank_{rank}.parquet"
-        shard_df.write_parquet(shard_path)
+        pq.write_table(table, shard_path)
 
 
 def finalize_predictions(
@@ -215,10 +258,21 @@ def finalize_predictions(
                 "shuffle, or a missing / misnamed rank shard."
             )
 
-        # Reconstitute per-row token tensors; emit as 1-row batches so ``format_trajectories``
-        # can preserve each row's native ``L`` (no cross-row padding).
-        token_rows = [torch.tensor(row, dtype=torch.long) for row in merged[SHARD_TOKENS_COL].to_list()]
-        one_row_batches = [r.unsqueeze(0) for r in token_rows]
+        # Reconstitute per-row token tensors as zero-copy views into the shard's Arrow flat
+        # values buffer rather than going through ``Series.to_list`` (which would materialize
+        # ``total_tokens`` Python ints on rank 0). ``torch.from_numpy`` is zero-copy for CPU
+        # arrays, and slicing ``values_np[offsets[i]:offsets[i+1]]`` is a view, so each per-
+        # row tensor shares the one underlying buffer. Emit as 1-row batches so
+        # ``format_trajectories`` preserves each row's native ``L`` (no cross-row padding).
+        tokens_arrow = merged[SHARD_TOKENS_COL].to_arrow()
+        if isinstance(tokens_arrow, pa.ChunkedArray):
+            tokens_arrow = tokens_arrow.combine_chunks()
+        offsets_np = np.asarray(tokens_arrow.offsets)
+        values_np = np.asarray(tokens_arrow.values)
+        one_row_batches = [
+            torch.from_numpy(values_np[offsets_np[i] : offsets_np[i + 1]]).unsqueeze(0)
+            for i in range(len(offsets_np) - 1)
+        ]
 
         logger.info(f"Writing trajectory {t} to {out_fp}.")
         predictions_df = format_trajectories(base_dataset, one_row_batches)
