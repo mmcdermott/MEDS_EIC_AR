@@ -229,21 +229,31 @@ def _sort_per_trajectory_by_dataset_row_index(
         # Validate and sort in a single tensor pass. Argsort + compare against ``arange`` is
         # the set-equality test for "indices form a complete permutation of ``range(n)``" and
         # avoids materializing a Python ``set(range(n))`` (which costs 40+ bytes per int for
-        # tens of millions of rows).
+        # tens of millions of rows). ``expected`` is built on the same device as
+        # ``sorted_idxs`` so a caller that ever forgets to ``.cpu()`` predict outputs still
+        # hits the real diagnostic instead of a confusing device-mismatch error.
         order = torch.argsort(all_dataset_row_idxs, stable=True)
         sorted_idxs = all_dataset_row_idxs[order]
-        expected = torch.arange(n_dataset_rows, dtype=sorted_idxs.dtype)
+        expected = torch.arange(n_dataset_rows, dtype=sorted_idxs.dtype, device=sorted_idxs.device)
         if sorted_idxs.shape != expected.shape or not torch.equal(sorted_idxs, expected):
+            # Slice the index tensor before ``tolist`` so we don't materialize N Python ints
+            # just to show the first 10 in a diagnostic. Matters at cohort scale (``tolist()``
+            # on a 10M-row tensor allocates ~280 MB of Python ints).
+            preview = all_dataset_row_idxs[:10].tolist()
             raise RuntimeError(
                 f"Trajectory {t} dataset-row-index set is not {{0, 1, ..., {n_dataset_rows - 1}}}: "
-                f"got {all_dataset_row_idxs.tolist()[:10]}... (len {all_dataset_row_idxs.numel()}). "
+                f"got {preview}... (len {all_dataset_row_idxs.numel()}). "
                 "Every base-dataset row index must appear exactly once per trajectory. A "
                 "missing or duplicate index indicates a sampler bug, an accidental dataloader "
                 "shuffle, or — for a hypothetical DDP path — an incomplete cross-rank gather "
                 "(Lightning's ``Trainer.predict`` does not auto-gather; see issue #146)."
             )
 
-        sorted_per_trajectory[t] = [all_tokens_per_row[i].unsqueeze(0) for i in order.tolist()]
+        # Iterate ``order`` directly rather than calling ``order.tolist()`` up front. The
+        # latter would materialize a Python list of N ints (~28 bytes each on CPython); the
+        # former yields 0-d tensors whose ``.item()`` is a cheap per-element sync and keeps
+        # peak memory bounded by what's already in the permutation tensor.
+        sorted_per_trajectory[t] = [all_tokens_per_row[i.item()].unsqueeze(0) for i in order]
     return sorted_per_trajectory
 
 
