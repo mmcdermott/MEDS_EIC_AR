@@ -33,11 +33,7 @@ from .generation import (
     get_timeline_end_token_idx,
     validate_rolling_cfg,
 )
-from .generation.runner import (
-    assert_expected_subject_index_order,
-    demux_predictions_per_trajectory,
-    write_per_trajectory_parquets,
-)
+from .generation.runner import write_predictions
 from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
@@ -283,12 +279,12 @@ def generate_trajectories(cfg: DictConfig):
         seed_everything(seed, workers=True)
         predictions = trainer.predict(model=M, dataloaders=expanded_loader)
 
-        per_trajectory_batches, per_trajectory_subject_idxs = demux_predictions_per_trajectory(
-            predictions, n_trajectories
-        )
-        assert_expected_subject_index_order(per_trajectory_subject_idxs, n_subjects=len(base_dataset))
-        write_per_trajectory_parquets(
-            per_trajectory_batches, trajectory_paths, base_dataset, do_overwrite=cfg.do_overwrite
+        write_predictions(
+            predictions,
+            n_trajectories=n_trajectories,
+            trajectory_paths=trajectory_paths,
+            base_dataset=base_dataset,
+            do_overwrite=cfg.do_overwrite,
         )
 
     # Save the generation run's logger ids into the *generation* ``output_dir``, not the

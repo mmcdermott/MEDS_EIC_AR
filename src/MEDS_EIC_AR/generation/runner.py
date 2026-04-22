@@ -1,8 +1,9 @@
-"""Internal helpers for ``MEICAR_generate_trajectories``'s predict → demux → write pipeline.
+"""Public entry point for finalizing ``Trainer.predict`` output into per-trajectory parquets.
 
-These live in a sibling module (not in ``__main__.py``) so their doctests are collected by
-``pytest --doctest-modules src/`` and the logic is testable without invoking the Hydra CLI.
-``__main__.py`` imports and composes them directly; there is no stable public API here.
+``write_predictions`` is the single function ``__main__`` calls. Internally it composes three
+module-private helpers (``_demux_predictions_per_trajectory``, ``_assert_expected_subject_index_order``,
+``_write_per_trajectory_parquets``) that each carry focused doctests for the silent-failure modes
+they guard against. Outside this module, only ``write_predictions`` is considered stable.
 """
 
 import logging
@@ -17,7 +18,7 @@ from .format_trajectories import format_trajectories
 logger = logging.getLogger(__name__)
 
 
-def demux_predictions_per_trajectory(
+def _demux_predictions_per_trajectory(
     predictions: list[dict[str, torch.Tensor]],
     n_trajectories: int,
 ) -> tuple[dict[int, list[torch.Tensor]], dict[int, list[torch.Tensor]]]:
@@ -39,7 +40,7 @@ def demux_predictions_per_trajectory(
         ...      "subject_idxs": torch.tensor([0, 0, 1, 1]),
         ...      "trajectory_idxs": torch.tensor([0, 1, 0, 1])},
         ... ]
-        >>> tok, sidx = demux_predictions_per_trajectory(preds, n_trajectories=2)
+        >>> tok, sidx = _demux_predictions_per_trajectory(preds, n_trajectories=2)
         >>> [b.tolist() for b in tok[0]]
         [[[1, 2], [5, 6]]]
         >>> [b.tolist() for b in tok[1]]
@@ -56,7 +57,7 @@ def demux_predictions_per_trajectory(
         ...      "subject_idxs": torch.tensor([0, 1]),
         ...      "trajectory_idxs": torch.tensor([0, 0])},
         ... ]
-        >>> _, sidx = demux_predictions_per_trajectory(preds, n_trajectories=2)
+        >>> _, sidx = _demux_predictions_per_trajectory(preds, n_trajectories=2)
         >>> [b.tolist() for b in sidx[0]]
         [[0, 1]]
         >>> [b.tolist() for b in sidx[1]]
@@ -72,7 +73,7 @@ def demux_predictions_per_trajectory(
         ...      "subject_idxs": torch.tensor([1]),
         ...      "trajectory_idxs": torch.tensor([0])},
         ... ]
-        >>> _, sidx = demux_predictions_per_trajectory(preds, n_trajectories=1)
+        >>> _, sidx = _demux_predictions_per_trajectory(preds, n_trajectories=1)
         >>> [b.tolist() for b in sidx[0]]
         [[0], [1]]
     """
@@ -89,7 +90,7 @@ def demux_predictions_per_trajectory(
     return per_trajectory_batches, per_trajectory_subject_idxs
 
 
-def assert_expected_subject_index_order(
+def _assert_expected_subject_index_order(
     per_trajectory_subject_idxs: dict[int, list[torch.Tensor]],
     n_subjects: int,
 ) -> None:
@@ -107,13 +108,13 @@ def assert_expected_subject_index_order(
     Examples:
         In-order predictions across multiple batches pass:
 
-        >>> assert_expected_subject_index_order(
+        >>> _assert_expected_subject_index_order(
         ...     {0: [torch.tensor([0, 1, 2]), torch.tensor([3, 4])]}, n_subjects=5,
         ... )
 
         Out-of-order (shuffle, DDP gather) raises:
 
-        >>> assert_expected_subject_index_order(
+        >>> _assert_expected_subject_index_order(
         ...     {0: [torch.tensor([2, 0, 1])]}, n_subjects=3,
         ... )
         Traceback (most recent call last):
@@ -122,7 +123,7 @@ def assert_expected_subject_index_order(
 
         Short (missing rows) raises:
 
-        >>> assert_expected_subject_index_order(
+        >>> _assert_expected_subject_index_order(
         ...     {0: [torch.tensor([0, 1, 2])]}, n_subjects=5,
         ... )
         Traceback (most recent call last):
@@ -131,7 +132,7 @@ def assert_expected_subject_index_order(
 
         Long (duplicate / oversample) raises:
 
-        >>> assert_expected_subject_index_order(
+        >>> _assert_expected_subject_index_order(
         ...     {0: [torch.tensor([0, 1, 2, 0])]}, n_subjects=3,
         ... )
         Traceback (most recent call last):
@@ -140,14 +141,14 @@ def assert_expected_subject_index_order(
 
         Empty per-trajectory list raises if any rows were expected:
 
-        >>> assert_expected_subject_index_order({0: []}, n_subjects=3)
+        >>> _assert_expected_subject_index_order({0: []}, n_subjects=3)
         Traceback (most recent call last):
           ...
         RuntimeError: Trajectory 0 predictions arrived out of expected subject-index order...
 
         The second trajectory's failure is reported (not only the first):
 
-        >>> assert_expected_subject_index_order(
+        >>> _assert_expected_subject_index_order(
         ...     {0: [torch.tensor([0, 1])], 1: [torch.tensor([1, 0])]}, n_subjects=2,
         ... )
         Traceback (most recent call last):
@@ -168,7 +169,7 @@ def assert_expected_subject_index_order(
             )
 
 
-def write_per_trajectory_parquets(
+def _write_per_trajectory_parquets(
     per_trajectory_batches: dict[int, list[torch.Tensor]],
     trajectory_paths: dict[int, Path],
     base_dataset,
@@ -179,9 +180,6 @@ def write_per_trajectory_parquets(
     Idempotent per-file: if ``do_overwrite`` is ``False`` and a trajectory's parquet is already on
     disk, that trajectory is skipped and no ``format_trajectories`` work is done for it. The
     split-level all-parquets-exist short-circuit in the caller handles the zero-work case.
-
-    This helper is the thin "format + write" tail of the generation pipeline; it exists as a
-    separate function so the demux + order-assertion above can be unit-tested in isolation.
     """
     for trajectory_idx, out_fp in trajectory_paths.items():
         if out_fp.is_file() and not do_overwrite:
@@ -191,3 +189,43 @@ def write_per_trajectory_parquets(
         predictions_df = format_trajectories(base_dataset, per_trajectory_batches[trajectory_idx])
         pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
         pq.write_table(pa_table, out_fp)
+
+
+def write_predictions(
+    predictions: list[dict[str, torch.Tensor]],
+    *,
+    n_trajectories: int,
+    trajectory_paths: dict[int, Path],
+    base_dataset,
+    do_overwrite: bool,
+) -> None:
+    """Format a flat list of ``Trainer.predict`` per-batch outputs into per-trajectory parquets.
+
+    Given:
+
+    - ``predictions``: what ``Trainer.predict(model=MEICARModule, dataloaders=...)`` returns when
+      the Lightning module's ``predict_step`` emits the three-key dict this module expects
+      (``tokens``, ``subject_idxs``, ``trajectory_idxs``).
+    - ``n_trajectories``: the ``N`` used to expand the base dataset via
+      :class:`~MEDS_EIC_AR.generation.RepeatedPredictionDataset`.
+    - ``trajectory_paths``: the mapping ``trajectory_idx → output parquet path`` for the split
+      being written.
+    - ``base_dataset``: the un-expanded ``MEDSPytorchDataset`` whose ``schema_df`` supplies
+      ``(subject_id, prediction_time, last_time)`` metadata per row, in order.
+    - ``do_overwrite``: if ``False``, per-trajectory parquets that already exist are left alone.
+
+    Writes one parquet per trajectory in ``trajectory_paths``.
+
+    Internally three steps: (1) demux predictions into per-trajectory streams, (2) assert the
+    arrival order is subject-index-sorted so ``format_trajectories``'s ``slice(st_i, B)`` walk is
+    valid, (3) format + write each trajectory's parquet. The assert-step is the safety net that
+    turns any future DDP / shuffle / sampler regression into a loud error rather than silent
+    parquet corruption.
+    """
+    per_trajectory_batches, per_trajectory_subject_idxs = _demux_predictions_per_trajectory(
+        predictions, n_trajectories
+    )
+    _assert_expected_subject_index_order(per_trajectory_subject_idxs, n_subjects=len(base_dataset))
+    _write_per_trajectory_parquets(
+        per_trajectory_batches, trajectory_paths, base_dataset, do_overwrite=do_overwrite
+    )
