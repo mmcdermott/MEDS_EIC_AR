@@ -497,7 +497,17 @@ class MEICARModule(L.LightningModule):
             - ``subject_idxs``: ``[B]`` long tensor, which base-dataset subject each row came from.
             - ``trajectory_idxs``: ``[B]`` long tensor, which of the N trajectories-per-subject
               each row corresponds to.
+
+        All three tensors are detached and moved to CPU before returning. ``Trainer.predict``
+        accumulates per-batch returns in a Python list across the entire predict run (scaled by
+        ``n_trajectories`` via the expanded dataset), so leaving them on-device would pin per-batch
+        GPU allocations for the full pass and OOM on non-trivial cohorts. Downstream demux and
+        ``format_trajectories`` run on CPU anyway.
         """
         mdata_batch, subject_idxs, trajectory_idxs = batch
         tokens = self.model.generate(mdata_batch, **self.generation_kwargs)
-        return {"tokens": tokens, "subject_idxs": subject_idxs, "trajectory_idxs": trajectory_idxs}
+        return {
+            "tokens": tokens.detach().cpu(),
+            "subject_idxs": subject_idxs.detach().cpu(),
+            "trajectory_idxs": trajectory_idxs.detach().cpu(),
+        }
