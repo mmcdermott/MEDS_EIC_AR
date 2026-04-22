@@ -17,4 +17,6 @@ validation, and prediction. It owns:
     `trainer.log_every_n_steps`).
 - **Prediction** — `predict_step` takes a `PredictBatch` (`(mdata_batch, dataset_row_idxs, trajectory_idxs)`
     from the N-sample interleaving dataloader, see [`generation/`](../generation/)) and runs the rolling
-    generator to produce N trajectories per subject in a single predict pass.
+    generator to produce N trajectories per base-dataset row in a single predict pass. For a
+    task-labeled `MEDSPytorchDataset` that is one row per `(subject_id, prediction_time)` pair — a
+    subject with multiple prediction times contributes N trajectories at each of them.

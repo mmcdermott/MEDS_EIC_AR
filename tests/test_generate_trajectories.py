@@ -321,7 +321,7 @@ def test_collate_with_meta_round_trip_through_dataloader():
         all_trajectory_idxs.extend(trajectory_idxs.tolist())
         all_first_codes.extend(batch.code[:, 0].tolist())
 
-    # 3 subjects * 4 trajectories = 12 rows total, in subject-changes-slow order.
+    # 3 base-dataset rows * 4 trajectories = 12 rows total, in dataset-row-changes-slow order.
     expected_dataset_row_idxs = [s for s in range(3) for _ in range(n_trajectories)]
     expected_trajectory_idxs = [k for _ in range(3) for k in range(n_trajectories)]
     # The fake dataset returns code[0] = dataset_row_idx for whichever base item is being rendered,

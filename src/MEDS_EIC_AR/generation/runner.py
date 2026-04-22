@@ -99,11 +99,15 @@ def _sort_per_trajectory_by_dataset_row_index(
 ) -> dict[int, list[torch.Tensor]]:
     """Reassemble each trajectory's rows into dataset-row-index order, one row per output element.
 
-    Under multi-device predict (DDP), ``Trainer.predict`` gathers per-rank outputs into a list
-    whose order is rank-major, not dataset-row-index-major. ``format_trajectories`` downstream walks
-    ``base_dataset.schema_df`` via a running ``slice(st_i, B_i)``, which requires the per-row
-    stream for each trajectory to be in ascending dataset-row-index order. This helper closes that
-    gap by using the already-tracked ``dataset_row_idxs`` to reassemble.
+    ``format_trajectories`` downstream walks ``base_dataset.schema_df`` via a running
+    ``slice(st_i, B_i)``, which requires the per-row stream for each trajectory to be in ascending
+    dataset-row-index order. On the default single-device predict path that holds trivially, but
+    any reshuffle — an accidental ``shuffle=True`` on the expanded loader, a manual cross-rank
+    gather in a DDP-enabled successor (see #146; Lightning's ``Trainer.predict`` does *not*
+    auto-gather across ranks, so any DDP story has to wire one explicitly), or a future change to
+    ``RepeatedPredictionDataset``'s expansion order — would otherwise silently misalign the
+    ``(subject_id, prediction_time)`` metadata. This helper closes that gap by using the
+    already-tracked ``dataset_row_idxs`` to reassemble.
 
     Because different batches carry different ``L`` (``model.generate`` stops at per-batch
     conditions), we avoid padding entirely: each row is emitted as a ``[1, L_i]`` single-row
@@ -198,43 +202,48 @@ def _sort_per_trajectory_by_dataset_row_index(
           ...
         RuntimeError: Trajectory 0 dataset-row-index set is not {0, 1, ..., 2}: got []...
     """
-    expected_set = set(range(n_dataset_rows))
     sorted_per_trajectory: dict[int, list[torch.Tensor]] = {}
     for t, token_batches in per_trajectory_batches.items():
         dataset_row_idx_batches = per_trajectory_dataset_row_idxs[t]
 
         if token_batches:
             all_tokens_per_row = [row for batch in token_batches for row in batch]
-            all_dataset_row_idxs = torch.cat(dataset_row_idx_batches).tolist()
+            all_dataset_row_idxs = torch.cat(dataset_row_idx_batches)
         else:
             all_tokens_per_row = []
-            all_dataset_row_idxs = []
+            all_dataset_row_idxs = torch.empty(0, dtype=torch.long)
 
         # 1:1 correspondence between token rows and dataset_row_idxs. Should always hold —
         # both come from the same predict_step output dict and are built by the same demux
         # mask above — but guard explicitly so any upstream bookkeeping drift fails here
         # with a clear diagnostic instead of silently mis-pairing rows or raising IndexError
         # inside the sort loop below.
-        if len(all_tokens_per_row) != len(all_dataset_row_idxs):
+        if len(all_tokens_per_row) != all_dataset_row_idxs.numel():
             raise RuntimeError(
                 f"Trajectory {t} token-row / dataset_row_idx length mismatch: "
-                f"{len(all_tokens_per_row)} tokens vs {len(all_dataset_row_idxs)} indices. "
+                f"{len(all_tokens_per_row)} tokens vs {all_dataset_row_idxs.numel()} indices. "
                 "This should be impossible — both are demuxed from the same predict_step "
                 "output dict. Check for upstream masking / metadata-plumbing drift."
             )
 
-        got_set = set(all_dataset_row_idxs)
-        if got_set != expected_set or len(all_dataset_row_idxs) != n_dataset_rows:
+        # Validate and sort in a single tensor pass. Argsort + compare against ``arange`` is
+        # the set-equality test for "indices form a complete permutation of ``range(n)``" and
+        # avoids materializing a Python ``set(range(n))`` (which costs 40+ bytes per int for
+        # tens of millions of rows).
+        order = torch.argsort(all_dataset_row_idxs, stable=True)
+        sorted_idxs = all_dataset_row_idxs[order]
+        expected = torch.arange(n_dataset_rows, dtype=sorted_idxs.dtype)
+        if sorted_idxs.shape != expected.shape or not torch.equal(sorted_idxs, expected):
             raise RuntimeError(
                 f"Trajectory {t} dataset-row-index set is not {{0, 1, ..., {n_dataset_rows - 1}}}: "
-                f"got {all_dataset_row_idxs[:10]}... (len {len(all_dataset_row_idxs)}). Under "
-                "multi-device predict, every base-dataset row index must appear exactly once "
-                "across all ranks per trajectory. A missing index indicates a rank-gather "
-                "dropped rows; a duplicate indicates a sampler or reassembly bug."
+                f"got {all_dataset_row_idxs.tolist()[:10]}... (len {all_dataset_row_idxs.numel()}). "
+                "Every base-dataset row index must appear exactly once per trajectory. A "
+                "missing or duplicate index indicates a sampler bug, an accidental dataloader "
+                "shuffle, or — for a hypothetical DDP path — an incomplete cross-rank gather "
+                "(Lightning's ``Trainer.predict`` does not auto-gather; see issue #146)."
             )
 
-        order = sorted(range(len(all_dataset_row_idxs)), key=lambda i: all_dataset_row_idxs[i])
-        sorted_per_trajectory[t] = [all_tokens_per_row[i].unsqueeze(0) for i in order]
+        sorted_per_trajectory[t] = [all_tokens_per_row[i].unsqueeze(0) for i in order.tolist()]
     return sorted_per_trajectory
 
 
