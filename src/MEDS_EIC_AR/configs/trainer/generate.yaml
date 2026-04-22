@@ -2,3 +2,13 @@ defaults:
   - default
   - override callbacks: generation
   - _self_
+
+# Generation requires single-process predict. The demux in ``MEICAR_generate_trajectories``
+# relies on ``Trainer.predict`` returning per-batch outputs in the same global subject-index
+# order as ``base_dataset.schema_df`` (because ``format_trajectories`` walks the schema df via
+# a running ``slice(st_i, batch_size)``). Under DDP ``devices: auto``, Lightning stripes rows
+# across ranks and collects per-rank outputs — rows arrive out of that sequential order, which
+# silently misaligns the (subject_id, prediction_time) metadata in the written parquets. Pin
+# to a single device here. DDP-parallel generation is tracked at #142 (it requires using the
+# returned ``subject_idxs`` to reassemble outputs before formatting).
+devices: 1

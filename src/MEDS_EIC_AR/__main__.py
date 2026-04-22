@@ -292,9 +292,11 @@ def generate_trajectories(cfg: DictConfig):
         # trajectories-per-subject that row corresponds to (0..N-1). It's distinct from
         # ``subject_idxs`` which records the base-dataset index the row came from.
         per_trajectory_batches: dict[int, list[torch.Tensor]] = {t: [] for t in range(n_trajectories)}
+        per_trajectory_subject_idxs: dict[int, list[torch.Tensor]] = {t: [] for t in range(n_trajectories)}
         for pred in predictions:
             tokens = pred["tokens"]
             trajectory_idxs = pred["trajectory_idxs"]
+            subject_idxs = pred["subject_idxs"]
             # Iterate over the trajectories actually present in this batch rather than always
             # doing N boolean compares. For batches that cover every trajectory (the common case
             # when batch_size >= N), this is the same work; for tail batches or small batch sizes,
@@ -302,6 +304,30 @@ def generate_trajectories(cfg: DictConfig):
             for t in trajectory_idxs.unique().tolist():
                 mask = trajectory_idxs == t
                 per_trajectory_batches[t].append(tokens[mask])
+                per_trajectory_subject_idxs[t].append(subject_idxs[mask])
+
+        # Defense against silent misalignment. ``format_trajectories`` walks
+        # ``base_dataset.schema_df`` via a running ``slice(st_i, batch_size)``, assuming the
+        # concatenated predictions for trajectory ``t`` arrive in subject-index order
+        # ``0..len(base_dataset)-1``. That assumption holds for the configured
+        # single-device predict path (``configs/trainer/generate.yaml`` pins ``devices: 1``),
+        # but any future move to DDP-parallel predict, any accidental shuffle, or any change
+        # to the expanded-dataset ordering would silently misalign the written (subject_id,
+        # prediction_time) metadata. Fail loud here instead. DDP-parallel generation is
+        # tracked at #142 and would replace this check with an explicit reassembly step.
+        n_subjects = len(base_dataset)
+        expected_order = torch.arange(n_subjects)
+        for t, subj_idxs_batches in per_trajectory_subject_idxs.items():
+            got = torch.cat(subj_idxs_batches) if subj_idxs_batches else torch.empty(0, dtype=torch.long)
+            if got.shape != expected_order.shape or not torch.equal(got, expected_order):
+                raise RuntimeError(
+                    f"Trajectory {t} predictions arrived out of expected subject-index order: "
+                    f"got {got.tolist()[:10]}... (len {got.shape[0]}); "
+                    f"expected [0, 1, ..., {n_subjects - 1}]. This can happen under multi-device "
+                    "predict (DDP stripes rows across ranks) or if the expanded dataloader is "
+                    "shuffled. Pin `trainer.devices=1` for generation; see issue #142 for the "
+                    "streaming-reassembly follow-up."
+                )
 
         for trajectory_idx, out_fp in trajectory_paths.items():
             if out_fp.is_file() and not cfg.do_overwrite:
