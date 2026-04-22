@@ -1,52 +1,64 @@
 #!/usr/bin/env python
-"""DGX Spark local smoke test + HF-vs-SGLang runtime baseline for the SGLang backend.
+"""Real-engine smoke runner for the SGLang backend (no mocking of SGLang internals).
 
-This script is **not** part of the pytest suite — it's a reproducible, single-command
-integration test against a real SGLang ``Engine`` on the DGX Spark (aarch64 + NVIDIA GB10,
-SM 12.1). It mirrors the setup of ``tests/grammar/test_cli_sglang.py`` (same synthetic
-grammar data, same ``MEICAR_generate_trajectories`` CLI) and additionally does a matched
-HF-vs-SGLang runtime comparison on the same pretrained checkpoint so we can report a
-baseline speedup number on this hardware.
+This script is **not** part of the pytest suite. It's a single-command integration runner
+that drives ``MEICAR_process_data`` → ``MEICAR_pretrain`` → ``MEICAR_generate_trajectories``
+on the synthetic grammar fixture under one or more backends, then applies the strict
+FSM-validity gate from ``tests/grammar/test_cli.py`` to each backend's output. It invokes
+the real CLIs via subprocess — no SGLang internals are stubbed — so running it validates
+exactly what a production run would do.
+
+Named for the DGX Spark because that's where it was first written, but nothing in it is
+Spark-specific; the script works on any host where the chosen backends' engines actually
+execute.
 
 Run::
 
-    PATH=$(pwd)/.venv/bin:$PATH .venv/bin/python scripts/dgx_spark_sglang_smoke.py
+    PATH=$(pwd)/.venv/bin:$PATH .venv/bin/python scripts/dgx_spark_sglang_smoke.py \\
+        --backends hf sglang_demo
 
 What it does
 ------------
 
 1. Materializes a synthetic grammar MEDS dataset in a fresh temp directory (via
    ``tests.grammar._meds.build_grammar_meds_dataset`` — identical to the fixture the gated
-   grammar test uses).
+   grammar CLI tests use).
 2. Runs ``MEICAR_process_data`` to tensorize it.
 3. Runs ``MEICAR_pretrain`` on a slightly-bigger-than-demo model (matching the grammar
    fixture config) so greedy decoding has a realistic chance of staying grammar-valid.
-4. Runs ``MEICAR_generate_trajectories`` twice on the same held-out prompts — once with
-   ``backend=hf`` and once with ``backend=sglang_demo`` (CUDA graph capture disabled for
-   fast cold-start). Both runs use greedy decoding so output is fully deterministic up to
-   floating-point drift.
-5. Validates that every generated grammar token in every held-out sample is a valid FSM
-   continuation from the prompt's end-state (strict 100%-validity gate, same as the CLI
-   grammar test).
-6. Reports wall-clock numbers for each backend plus total generated tokens, so you can eyeball
-   the SGLang speedup on the DGX Spark.
+4. For each backend listed, runs ``MEICAR_generate_trajectories`` greedy on the held-out
+   prompts and walks the resulting trajectories through a ``GrammarFSM`` pre-advanced by
+   each prompt. A backend that produces any invalid FSM transition fails the strict gate.
+5. Prints per-backend sample counts + FSM pass/fail + wall-clock of the generate step.
 
-Known DGX-Spark-specific environment notes (these are **not** fixed in-repo because they'd
-regress other hardware — flag to the reviewer and handle at install time):
+A non-zero exit code means at least one backend that was asked to run either (a) crashed
+before producing output, or (b) produced output that violated the strict grammar gate.
+The script does not make cross-backend claims about throughput or speed; it only reports
+per-backend wall-clock of whatever ran.
 
-- The default ``uv sync --extra sglang`` resolution brings CPU-only torch on aarch64. Install
-  a CUDA-enabled torch wheel matching ``sgl_kernel``'s ABI::
+Status / caveats
+----------------
 
-      uv pip install --torch-backend=cu129 --reinstall torch==2.9.1 torchaudio==2.9.1 \\
-          torchvision==0.24.1
+The SGLang path is not known to complete successfully on any hardware through this PR's
+code — see the PR #117 description for the current blocking issue (``sgl_kernel==0.3.21``
+lacks SM 12.1 kernel images; the failure is inside SGLang's first RMSNorm call, below
+anything this repo owns). Running this script with ``--backends sglang_demo`` on a host
+where SGLang actually executes is the missing validation step; the script's output is the
+evidence that step would produce.
 
-  torch 2.11 + cu130 (what ``UV_TORCH_BACKEND=auto`` selects on this box) has an ABI
-  mismatch with ``sgl_kernel==0.3.21`` — ``c10::cuda::c10_cuda_check_implementation``
-  symbol differs. Cu129 + torch 2.9.1 is the combo sgl_kernel 0.3.21 was built against.
+DGX Spark environment notes (install-time workarounds, **not** baked into pyproject.toml
+because they'd regress other hardware):
 
-- torch 2.9.1 warns that GB10 (SM 12.1) exceeds its max compiled capability (SM 12.0). The
-  warning is harmless for the kernels exercised here (matmul falls back to PTX JIT), and
-  sgl_kernel ships an SM 10.0 variant that loads cleanly on SM 12.1 via the same fallback.
+- ``uv sync --extra sglang --prerelease=allow`` resolves CPU-only torch on aarch64. For
+  CUDA torch: ``uv pip install --torch-backend=cu129 --reinstall torch==2.9.1
+  torchvision==0.24.1 torchaudio==2.9.1``. ``torch==2.11+cu130`` ABI-mismatches
+  ``sgl_kernel==0.3.21``. Invoke CLIs via ``.venv/bin/python`` directly; ``uv run``
+  re-syncs to the CPU lockfile pin.
+- ``TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`` to override torch 2.9.1's bundled
+  CUDA 12.8 ptxas, which doesn't know ``sm_121a``.
+- Uninstall ``flash-attn-4`` from the venv — it provides the ``flash_attn`` module
+  namespace but no dist metadata, and ``MEICAR_pretrain``'s ``importlib.metadata.version
+  ("flash_attn")`` path trips on that. The repo cleanly falls back to SDPA without it.
 """
 
 from __future__ import annotations
@@ -301,14 +313,11 @@ def print_summary(results: list[ValidationResult]) -> None:
             f"rolling={r.rolling_samples:3d}  grammar_gate={status}"
         )
 
-    if len(results) == 2:
-        hf_r, sgl_r = results[0], results[1]
-        if sgl_r.wall_clock_seconds > 0:
-            ratio = hf_r.wall_clock_seconds / sgl_r.wall_clock_seconds
-            print(
-                f"\n  wall-clock(hf) / wall-clock(sglang) = {ratio:.2f}x  "
-                f"(> 1 means SGLang faster end-to-end; < 1 means engine startup dominates)"
-            )
+    # Deliberately no cross-backend speedup printout. Each per-backend wall-clock here is a
+    # single CLI invocation that folds engine startup + (for SGLang) weight-export + generate
+    # together, and one run is not a noise-controlled throughput number. The table above is
+    # what the script claims: did this backend produce grammar-valid output on this fixture,
+    # and in how long.
 
     for r in results:
         if r.failing_samples:
