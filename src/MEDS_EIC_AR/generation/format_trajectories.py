@@ -26,7 +26,7 @@ def get_code_information(dataset: MEDSPytorchDataset) -> dict[int, CodeInformati
         A dictionary mapping code indices to their code strings and numeric value means.
 
     Examples:
-        >>> get_code_information(pytorch_dataset)
+        >>> dict(sorted(get_code_information(pytorch_dataset).items()))
         {1: CodeInformation(code='ADMISSION//CARDIAC', value_prob=0.0, value_mean=None),
          2: CodeInformation(code='ADMISSION//ORTHOPEDIC', value_prob=0.0, value_mean=None),
          3: CodeInformation(code='ADMISSION//PULMONARY', value_prob=0.0, value_mean=None),
