@@ -18,13 +18,3 @@ validation, and prediction. It owns:
 - **Prediction** — `predict_step` takes a `PredictBatch` (`(mdata_batch, subject_idxs, trajectory_idxs)`
     from the N-sample interleaving dataloader, see [`generation/`](../generation/)) and runs the rolling
     generator to produce N trajectories per subject in a single predict pass.
-
-## Differences from `meds-torch` base
-
-1. Metrics track perplexity and top-$k$ accuracy; AUC is not tracked (the model is autoregressive over a
-    code vocabulary, not a binary classifier).
-2. Optimizer/scheduler construction goes through Hydra partials, so configs live in
-    [`configs/lightning_module/optimizer/`](../configs/lightning_module/optimizer/) and
-    [`configs/lightning_module/LR_scheduler/`](../configs/lightning_module/LR_scheduler/).
-3. Prediction is interleaved (one batch → N trajectories per subject, demuxed downstream by
-    `generate_trajectories`) rather than run N separate passes — see issues #89 / #103.

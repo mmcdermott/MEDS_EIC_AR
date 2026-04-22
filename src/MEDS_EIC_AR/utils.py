@@ -2,9 +2,10 @@
 
 Groups of helpers in this module:
 
-- **OmegaConf resolvers** (``gpus_available``, ``num_cores``, ``num_gpus``, ``oc_min``,
-  ``hash_based_seed``, ``int_prod``, ``resolve_generation_context_size``) — registered as Hydra/OmegaConf
-  resolvers so config interpolations can read hardware state and compute derived values.
+- **OmegaConf resolvers** (``gpus_available``, ``num_cores``, ``num_gpus``, ``oc_min``, ``int_prod``,
+  ``resolve_generation_context_size``) — registered as Hydra/OmegaConf resolvers so config
+  interpolations can read hardware state and compute derived values. ``hash_based_seed`` lives alongside
+  them as a regular Python helper (called from ``__main__`` at per-split seed time), not as a resolver.
 - **Logger restore/save** (``save_logger_run_ids``, ``apply_saved_logger_run_ids``) — lets training
   resumes reuse the same MLflow / WandB run IDs so a paused-and-resumed run looks like a single run in
   the tracking backend.

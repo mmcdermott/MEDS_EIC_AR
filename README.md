@@ -12,11 +12,6 @@
 
 A MEDS, "Everything-is-code" style Autoregressive Generative Model, capable of zero-shot inference.
 
-This is based on the [MEDS-Torch](https://github.com/Oufattole/meds-torch) model of the same name. The
-current base architecture is Llama-style (RMSNorm + SwiGLU + full-dim RoPE); see
-[`src/MEDS_EIC_AR/model/README.md`](src/MEDS_EIC_AR/model/README.md) for details and issue #108 for the
-rationale behind the NeoX → Llama swap.
-
 ## Installation
 
 ```bash
@@ -286,7 +281,7 @@ This results in the tags `[model_size, "experiment-1"]` being sent to wandb.
 
 ### Inference Backend
 
-Generation runs through a pluggable backend abstraction (`Backend` protocol in
+Generation runs through a pluggable backend abstraction (`GenerationBackend` protocol in
 [`src/MEDS_EIC_AR/model/backends/`](src/MEDS_EIC_AR/model/backends/)). The default is `HFBackend`, which
 wraps `LlamaForCausalLM.generate` in-process. A non-HF backend (e.g. SGLang, in-flight at #117) can drop
 in behind the same interface without touching the rolling-generation loop or the trajectory-format
@@ -334,6 +329,7 @@ The files worth calling out:
     [`save_environment_snapshot`](src/MEDS_EIC_AR/utils.py). Only written on initial run creation, not
     on resume. Useful for reproducing a run and for tracking down environment drift between training
     and inference.
-- `best_model.ckpt` — symlink to the best checkpoint according to the model-checkpoint callback.
+- `best_model.ckpt` — a copy of the best checkpoint according to the model-checkpoint callback (written
+    via `shutil.copyfile`, not a symlink, so the run directory is self-contained for rsync / archive).
 - `checkpoints/` — Lightning's per-step / per-epoch checkpoints plus `last.ckpt`.
 - `.logs/.hydra/` — Hydra's run metadata.
