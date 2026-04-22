@@ -71,13 +71,11 @@ from meds import held_out_split  # noqa: E402
 
 from tests.grammar._grammar import GrammarFSM  # noqa: E402
 from tests.grammar._meds import (  # noqa: E402
-    CODE_TO_TOKEN,
     GRAMMAR_TASK_NAME,
     build_grammar_meds_dataset,
     grammar_tokens_from_output_df,
     prompt_grammar_tokens_by_subject,
 )
-
 
 # ----------------------------------------------------------------------------
 # Pipeline-stage helpers
@@ -264,7 +262,7 @@ def validate_and_summarize(
         # Sort rows by time so we can measure per-subject total length against max_seq_len to
         # identify samples that exercised the rolling-generation path.
         sorted_df = df.sort(["subject_id", "time"])
-        for subject_id_tup, subject_df in sorted_df.group_by("subject_id", maintain_order=True):
+        for _subject_id_tup, subject_df in sorted_df.group_by("subject_id", maintain_order=True):
             if len(subject_df) > max_seq_len:
                 rolling_samples += 1
         tokens_by_subject = grammar_tokens_from_output_df(df)
@@ -352,7 +350,9 @@ def main() -> int:
         help="Backends to run (in order). Default runs both so you get a runtime comparison.",
     )
     ap.add_argument("--skip-pretrain", type=Path, default=None, help="Reuse a prior pretrain output dir.")
-    ap.add_argument("--summary-json", type=Path, default=None, help="Write summary numbers to this JSON file.")
+    ap.add_argument(
+        "--summary-json", type=Path, default=None, help="Write summary numbers to this JSON file."
+    )
     args = ap.parse_args()
 
     # Fresh tempdir unless the caller provided one. Persisting via ``--keep-work-dir`` keeps
