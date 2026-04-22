@@ -1,9 +1,10 @@
 """Public entry point for finalizing ``Trainer.predict`` output into per-trajectory parquets.
 
 ``write_predictions`` is the single function ``__main__`` calls. Internally it composes three
-module-private helpers (``_demux_predictions_per_trajectory``, ``_assert_expected_subject_index_order``,
-``_write_per_trajectory_parquets``) that each carry focused doctests for the silent-failure modes
-they guard against. Outside this module, only ``write_predictions`` is considered stable.
+module-private helpers (``_demux_predictions_per_trajectory``,
+``_sort_per_trajectory_by_subject_index``, ``_write_per_trajectory_parquets``) that each carry
+focused doctests for the invariants they enforce. Outside this module, only ``write_predictions``
+is considered stable.
 """
 
 import logging
@@ -28,7 +29,8 @@ def _demux_predictions_per_trajectory(
     (``[B]``), and ``trajectory_idxs`` (``[B]``, values in ``0..n_trajectories-1``). We demux by
     trajectory so that downstream formatting can process each trajectory's rows as one stream. The
     per-batch grouping is preserved (rather than flattened) because each batch has its own ``L``
-    from the generator.
+    from the generator — ``model.generate`` stops at the batch-local stopping condition (all rows
+    EOS or ``max_new_tokens``), which varies batch-to-batch.
 
     Iterates over ``trajectory_idxs.unique()`` per batch rather than doing ``n_trajectories``
     boolean compares unconditionally, so tail batches with fewer than ``n_trajectories`` rows
@@ -90,83 +92,137 @@ def _demux_predictions_per_trajectory(
     return per_trajectory_batches, per_trajectory_subject_idxs
 
 
-def _assert_expected_subject_index_order(
+def _sort_per_trajectory_by_subject_index(
+    per_trajectory_batches: dict[int, list[torch.Tensor]],
     per_trajectory_subject_idxs: dict[int, list[torch.Tensor]],
     n_subjects: int,
-) -> None:
-    """Fail loud if per-trajectory subject_idxs are not ``[0, 1, ..., n_subjects - 1]``.
+) -> dict[int, list[torch.Tensor]]:
+    """Reassemble each trajectory's rows into subject-index order, one row per output element.
 
-    ``format_trajectories`` walks ``base_dataset.schema_df`` via a running ``slice(st_i, B_i)``,
-    assuming the concatenated predictions for each trajectory arrive in subject-index order. That
-    assumption holds for the configured single-device predict path
-    (``configs/trainer/generate.yaml`` pins ``devices: 1``), but any future move to DDP-parallel
-    predict, any accidental shuffle, or any change to ``RepeatedPredictionDataset`` ordering would
-    silently misalign the written ``(subject_id, prediction_time)`` metadata. This assert fails
-    fast with a clear diagnostic instead. DDP-parallel generation is tracked at #142 and would
-    replace this check with an explicit reassembly step.
+    Under multi-device predict (DDP), ``Trainer.predict`` gathers per-rank outputs into a list
+    whose order is rank-major, not subject-index-major. ``format_trajectories`` downstream walks
+    ``base_dataset.schema_df`` via a running ``slice(st_i, B_i)``, which requires the per-row
+    stream for each trajectory to be in ascending subject-index order. This helper closes that
+    gap by using the already-tracked ``subject_idxs`` to reassemble.
+
+    Because different batches carry different ``L`` (``model.generate`` stops at per-batch
+    conditions), we avoid padding entirely: each row is emitted as a ``[1, L_i]`` single-row
+    tensor, preserving its native length. ``format_trajectories`` already iterates a list of
+    per-batch tensors with its own ``L``, so 1-row batches are a no-op change to it.
+
+    Raises ``RuntimeError`` if the set of subject_idxs for any trajectory is not exactly
+    ``{0, 1, ..., n_subjects - 1}``. This catches missing rows, duplicates, or bookkeeping errors
+    in the reassembly itself — it is a post-condition on the sorted output, not a pre-condition
+    on arrival order.
 
     Examples:
-        In-order predictions across multiple batches pass:
+        In-order single-batch input — output is just the rows split into 1-row tensors:
 
-        >>> _assert_expected_subject_index_order(
-        ...     {0: [torch.tensor([0, 1, 2]), torch.tensor([3, 4])]}, n_subjects=5,
-        ... )
+        >>> batches = {0: [torch.tensor([[10, 11], [20, 21], [30, 31]])]}
+        >>> sidxs = {0: [torch.tensor([0, 1, 2])]}
+        >>> out = _sort_per_trajectory_by_subject_index(batches, sidxs, n_subjects=3)
+        >>> [b.tolist() for b in out[0]]
+        [[[10, 11]], [[20, 21]], [[30, 31]]]
 
-        Out-of-order (shuffle, DDP gather) raises:
+        Shuffled input (simulating DDP gather) — rows come out in subject-index order,
+        carrying the right token rows:
 
-        >>> _assert_expected_subject_index_order(
-        ...     {0: [torch.tensor([2, 0, 1])]}, n_subjects=3,
+        >>> batches = {0: [torch.tensor([[20, 21], [0, 1], [10, 11]])]}
+        >>> sidxs = {0: [torch.tensor([2, 0, 1])]}
+        >>> out = _sort_per_trajectory_by_subject_index(batches, sidxs, n_subjects=3)
+        >>> [b.tolist() for b in out[0]]
+        [[[0, 1]], [[10, 11]], [[20, 21]]]
+
+        Mixed-``L`` across batches (this is what lets us avoid padding). Batch 1 has ``L=2``,
+        batch 2 has ``L=3``; output keeps the native lengths:
+
+        >>> batches = {
+        ...     0: [torch.tensor([[10, 11], [30, 31]]),
+        ...         torch.tensor([[0, 1, 2], [20, 21, 22]])],
+        ... }
+        >>> sidxs = {0: [torch.tensor([1, 3]), torch.tensor([0, 2])]}
+        >>> out = _sort_per_trajectory_by_subject_index(batches, sidxs, n_subjects=4)
+        >>> [b.tolist() for b in out[0]]
+        [[[0, 1, 2]], [[10, 11]], [[20, 21, 22]], [[30, 31]]]
+
+        Multiple trajectories are sorted independently:
+
+        >>> batches = {
+        ...     0: [torch.tensor([[1, 1], [0, 0]])],
+        ...     1: [torch.tensor([[2, 2], [3, 3]])],
+        ... }
+        >>> sidxs = {0: [torch.tensor([1, 0])], 1: [torch.tensor([0, 1])]}
+        >>> out = _sort_per_trajectory_by_subject_index(batches, sidxs, n_subjects=2)
+        >>> [b.tolist() for b in out[0]]
+        [[[0, 0]], [[1, 1]]]
+        >>> [b.tolist() for b in out[1]]
+        [[[2, 2]], [[3, 3]]]
+
+        Missing rows raises:
+
+        >>> _sort_per_trajectory_by_subject_index(
+        ...     {0: [torch.tensor([[10, 11], [20, 21]])]},
+        ...     {0: [torch.tensor([0, 1])]},
+        ...     n_subjects=3,
         ... )
         Traceback (most recent call last):
           ...
-        RuntimeError: Trajectory 0 predictions arrived out of expected subject-index order...
+        RuntimeError: Trajectory 0 subject-index set is not {0, 1, ..., 2}: got [0, 1]...
 
-        Short (missing rows) raises:
+        Duplicate subject_idxs raises:
 
-        >>> _assert_expected_subject_index_order(
-        ...     {0: [torch.tensor([0, 1, 2])]}, n_subjects=5,
+        >>> _sort_per_trajectory_by_subject_index(
+        ...     {0: [torch.tensor([[10, 11], [10, 11], [20, 21]])]},
+        ...     {0: [torch.tensor([0, 0, 1])]},
+        ...     n_subjects=2,
         ... )
         Traceback (most recent call last):
           ...
-        RuntimeError: Trajectory 0 predictions arrived out of expected subject-index order...
+        RuntimeError: Trajectory 0 subject-index set is not {0, 1, ..., 1}: got [0, 0, 1]...
 
-        Long (duplicate / oversample) raises:
+        Out-of-range subject_idx raises:
 
-        >>> _assert_expected_subject_index_order(
-        ...     {0: [torch.tensor([0, 1, 2, 0])]}, n_subjects=3,
+        >>> _sort_per_trajectory_by_subject_index(
+        ...     {0: [torch.tensor([[10, 11], [20, 21], [30, 31]])]},
+        ...     {0: [torch.tensor([0, 1, 5])]},
+        ...     n_subjects=3,
         ... )
         Traceback (most recent call last):
           ...
-        RuntimeError: Trajectory 0 predictions arrived out of expected subject-index order...
+        RuntimeError: Trajectory 0 subject-index set is not {0, 1, ..., 2}: got [0, 1, 5]...
 
-        Empty per-trajectory list raises if any rows were expected:
+        Empty input when rows are expected raises:
 
-        >>> _assert_expected_subject_index_order({0: []}, n_subjects=3)
+        >>> _sort_per_trajectory_by_subject_index({0: []}, {0: []}, n_subjects=3)
         Traceback (most recent call last):
           ...
-        RuntimeError: Trajectory 0 predictions arrived out of expected subject-index order...
-
-        The second trajectory's failure is reported (not only the first):
-
-        >>> _assert_expected_subject_index_order(
-        ...     {0: [torch.tensor([0, 1])], 1: [torch.tensor([1, 0])]}, n_subjects=2,
-        ... )
-        Traceback (most recent call last):
-          ...
-        RuntimeError: Trajectory 1 predictions arrived out of expected subject-index order...
+        RuntimeError: Trajectory 0 subject-index set is not {0, 1, ..., 2}: got []...
     """
-    expected_order = torch.arange(n_subjects)
-    for t, subj_idxs_batches in per_trajectory_subject_idxs.items():
-        got = torch.cat(subj_idxs_batches) if subj_idxs_batches else torch.empty(0, dtype=torch.long)
-        if got.shape != expected_order.shape or not torch.equal(got, expected_order):
+    expected_set = set(range(n_subjects))
+    sorted_per_trajectory: dict[int, list[torch.Tensor]] = {}
+    for t, token_batches in per_trajectory_batches.items():
+        subj_idx_batches = per_trajectory_subject_idxs[t]
+
+        if token_batches:
+            all_tokens_per_row = [row for batch in token_batches for row in batch]
+            all_subj_idxs = torch.cat(subj_idx_batches).tolist()
+        else:
+            all_tokens_per_row = []
+            all_subj_idxs = []
+
+        got_set = set(all_subj_idxs)
+        if got_set != expected_set or len(all_subj_idxs) != n_subjects:
             raise RuntimeError(
-                f"Trajectory {t} predictions arrived out of expected subject-index order: "
-                f"got {got.tolist()[:10]}... (len {got.shape[0]}); "
-                f"expected [0, 1, ..., {n_subjects - 1}]. This can happen under multi-device "
-                "predict (DDP stripes rows across ranks) or if the expanded dataloader is "
-                "shuffled. Pin `trainer.devices=1` for generation; see issue #142 for the "
-                "streaming-reassembly follow-up."
+                f"Trajectory {t} subject-index set is not {{0, 1, ..., {n_subjects - 1}}}: "
+                f"got {all_subj_idxs[:10]}... (len {len(all_subj_idxs)}). Under multi-device "
+                "predict, all subjects across all ranks must appear exactly once per trajectory. "
+                "A missing subject indicates a rank-gather dropped rows; a duplicate indicates a "
+                "sampler or reassembly bug."
             )
+
+        order = sorted(range(len(all_subj_idxs)), key=lambda i: all_subj_idxs[i])
+        sorted_per_trajectory[t] = [all_tokens_per_row[i].unsqueeze(0) for i in order]
+    return sorted_per_trajectory
 
 
 def _write_per_trajectory_parquets(
@@ -216,16 +272,19 @@ def write_predictions(
 
     Writes one parquet per trajectory in ``trajectory_paths``.
 
-    Internally three steps: (1) demux predictions into per-trajectory streams, (2) assert the
-    arrival order is subject-index-sorted so ``format_trajectories``'s ``slice(st_i, B)`` walk is
-    valid, (3) format + write each trajectory's parquet. The assert-step is the safety net that
-    turns any future DDP / shuffle / sampler regression into a loud error rather than silent
-    parquet corruption.
+    Internally: (1) demux predictions into per-trajectory streams, (2) reassemble each
+    trajectory's rows into subject-index order using the already-tracked ``subject_idxs`` (robust
+    to DDP gather order, shuffled loaders, or future sampler changes), (3) format + write each
+    trajectory's parquet. The reassembly step makes arrival order irrelevant for correctness; the
+    validation inside it catches missing / duplicate / out-of-range subject_idxs as a loud error
+    rather than silent parquet corruption.
     """
     per_trajectory_batches, per_trajectory_subject_idxs = _demux_predictions_per_trajectory(
         predictions, n_trajectories
     )
-    _assert_expected_subject_index_order(per_trajectory_subject_idxs, n_subjects=len(base_dataset))
+    sorted_per_trajectory = _sort_per_trajectory_by_subject_index(
+        per_trajectory_batches, per_trajectory_subject_idxs, n_subjects=len(base_dataset)
+    )
     _write_per_trajectory_parquets(
-        per_trajectory_batches, trajectory_paths, base_dataset, do_overwrite=do_overwrite
+        sorted_per_trajectory, trajectory_paths, base_dataset, do_overwrite=do_overwrite
     )
