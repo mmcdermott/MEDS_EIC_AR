@@ -204,6 +204,17 @@ class SGLangBackend:
         # this cannot be overridden, and a caller passing ``engine_kwargs={"skip_tokenizer_init":
         # False}`` would otherwise silently break the pipeline.
         self._engine_kwargs["skip_tokenizer_init"] = True
+        # ``allow_auto_truncate`` is also load-bearing in this repo. The rolling loop in
+        # :meth:`MEDS_EIC_AR.model.Model._rolling_generate` sets
+        # ``chunk_budget = max_seq_len - prompt_len`` per call — total positions requested =
+        # ``max_context_length`` exactly. HF's ``generate`` accepts that boundary (positions
+        # ``0..max_pos-1`` inclusive); SGLang's tokenizer-manager validator rejects it
+        # (``input + max_new >= max_context`` is a hard failure unless ``allow_auto_truncate``
+        # is on). Setting it here matches HF's semantics by silently clamping — otherwise every
+        # first-chunk call in the rolling loop would raise ``ValueError("Requested token count
+        # exceeds...")`` at the boundary. Same non-overridable policy as ``skip_tokenizer_init``
+        # because disabling it would silently re-break cross-backend parity on boundary prompts.
+        self._engine_kwargs["allow_auto_truncate"] = True
         self._engine = sgl_module.Engine(model_path=str(hf_model_dir), **self._engine_kwargs)
         self._is_shutdown = False
         atexit.register(self.shutdown)
@@ -262,7 +273,7 @@ class SGLangBackend:
 
         prompts = _strip_padding_to_lists(input_ids, attention_mask)
 
-        # Map HF ``GenerationConfig`` → SGLang ``SamplingParams``. Intentional translations:
+        # Map HF ``GenerationConfig`` → SGLang sampling-params dict. Intentional translations:
         #   - ``do_sample=False`` → ``temperature=0.0`` regardless of the caller's configured
         #     temperature (SGLang uses ``temperature=0`` as its greedy signal; no separate
         #     boolean). When ``do_sample=True`` the caller's ``generation_config.temperature``
@@ -273,18 +284,25 @@ class SGLangBackend:
         # ``top_p``/``top_k`` are deliberately not translated yet — none of today's callers
         # set them (see ``Model._generate_chunk`` — the only call site), and translating them
         # is properly part of #82's logits-processor work.
+        #
+        # Pass a plain ``dict`` (rather than ``sglang.SamplingParams``) because the stable
+        # public shape of ``Engine.generate(sampling_params=...)`` is ``Dict | List[Dict]``
+        # (see ``sglang/srt/entrypoints/engine.py``). The ``SamplingParams`` class lives under
+        # ``sglang.srt.sampling.sampling_params`` and is not exported at the top level in
+        # v0.5.x — older revisions of this file referenced ``self._sgl.SamplingParams`` and
+        # crashed with ``AttributeError`` on every first call against a real engine.
         if generation_config.do_sample:
             configured_temp = getattr(generation_config, "temperature", None)
             temperature = float(configured_temp) if configured_temp is not None else 1.0
         else:
             temperature = 0.0
-        sampling_params = self._sgl.SamplingParams(
-            max_new_tokens=generation_config.max_new_tokens,
-            temperature=temperature,
-            stop_token_ids=[generation_config.eos_token_id]
-            if generation_config.eos_token_id is not None
-            else None,
-        )
+        sampling_params: dict[str, Any] = {
+            "max_new_tokens": generation_config.max_new_tokens,
+            "temperature": temperature,
+            "stop_token_ids": (
+                [generation_config.eos_token_id] if generation_config.eos_token_id is not None else None
+            ),
+        }
 
         outputs = self._engine.generate(input_ids=prompts, sampling_params=sampling_params, **forwarded)
         # SGLang returns a list of dicts, one per prompt. The new-tokens field has historically

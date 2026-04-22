@@ -27,13 +27,6 @@ from MEDS_EIC_AR.model.backends import GenerationBackend, SGLangBackend
 from MEDS_EIC_AR.model.backends.sglang import _pad_right_to_tensor, _strip_padding_to_lists
 
 
-class _FakeSamplingParams:
-    """Records everything passed to ``sgl.SamplingParams(...)`` so tests can assert on it."""
-
-    def __init__(self, **kwargs: Any):
-        self.kwargs = kwargs
-
-
 class _FakeEngine:
     """A fake ``sgl.Engine`` that returns pre-programmed per-prompt token lists.
 
@@ -52,11 +45,15 @@ class _FakeEngine:
     def set_next_outputs(self, outputs: list[dict]) -> None:
         self._next_outputs = outputs
 
-    def generate(self, *, input_ids: list[list[int]], sampling_params: _FakeSamplingParams, **kw):
+    def generate(self, *, input_ids: list[list[int]], sampling_params: dict, **kw):
+        # SGLang's real ``Engine.generate`` takes ``sampling_params: Union[Dict, List[Dict]]``;
+        # the backend passes a dict so the fake mirrors that stable public contract rather than
+        # instantiating a ``SamplingParams`` class (which is not exported at the top level of
+        # the ``sglang`` package in v0.5.x — see the backend docstring for the full rationale).
         self.generate_calls.append(
             {
                 "input_ids": [list(row) for row in input_ids],
-                "sampling_params": sampling_params.kwargs,
+                "sampling_params": dict(sampling_params),
                 "extra_kwargs": dict(kw),
             }
         )
@@ -78,8 +75,6 @@ class _FakeSGLModule:
         eng = _FakeEngine(model_path=model_path, **engine_kwargs)
         self.last_engine = eng
         return eng
-
-    SamplingParams = _FakeSamplingParams
 
 
 def _make_backend() -> tuple[SGLangBackend, _FakeSGLModule]:
@@ -131,6 +126,38 @@ def test_engine_caller_can_override_other_engine_kwargs():
     assert fake.last_engine.engine_kwargs["tp_size"] == 2
     # Default still applied:
     assert fake.last_engine.engine_kwargs["skip_tokenizer_init"] is True
+
+
+def test_engine_receives_allow_auto_truncate_by_default():
+    """``allow_auto_truncate=True`` must be set on every Engine construction.
+
+    The rolling loop in ``Model._rolling_generate`` sets ``chunk_budget = max_seq_len -
+    prompt_len`` on each chunk, so ``input_len + max_new_tokens == max_context_length`` on
+    boundary prompts. HF accepts this (positions are inclusive), SGLang rejects it by default
+    (``input + max_new >= max_context`` is a hard failure in the tokenizer-manager validator).
+    ``allow_auto_truncate=True`` silently clamps to match HF, which is what cross-backend
+    parity requires. Losing this would break the first chunk of every rolling run.
+    """
+    _, fake = _make_backend()
+    assert fake.last_engine is not None
+    assert fake.last_engine.engine_kwargs["allow_auto_truncate"] is True
+
+
+def test_allow_auto_truncate_cannot_be_overridden_by_caller():
+    """A caller passing ``allow_auto_truncate=False`` in ``engine_kwargs`` must be ignored.
+
+    Same reasoning as ``skip_tokenizer_init`` — disabling it silently re-breaks every rolling
+    run's first chunk at the HF/SGLang boundary-semantics mismatch. The class docstring
+    promises this invariant is non-overridable.
+    """
+    fake = _FakeSGLModule()
+    backend = SGLangBackend(
+        "/tmp/x",
+        engine_kwargs={"allow_auto_truncate": False},
+        sgl_module=fake,
+    )
+    del backend
+    assert fake.last_engine.engine_kwargs["allow_auto_truncate"] is True
 
 
 def test_skip_tokenizer_init_cannot_be_overridden_by_caller():
