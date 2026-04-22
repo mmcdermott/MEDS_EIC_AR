@@ -11,5 +11,6 @@ defaults:
 # file writes would have each rank fail the ``_sort_per_trajectory_by_dataset_row_index``
 # set-completeness check (each rank sees only its slice) and race to write the same parquet
 # paths. Proper DDP-parallel generation needs a ``BasePredictionWriter`` (or equivalent
-# gather-then-rank-zero-write wiring); tracked as a follow-up.
+# gather-then-rank-zero-write wiring); tracked in
+# https://github.com/mmcdermott/MEDS_EIC_AR/issues/146.
 devices: 1
