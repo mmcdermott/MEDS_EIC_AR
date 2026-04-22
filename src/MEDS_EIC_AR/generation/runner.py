@@ -16,6 +16,13 @@ The filesystem is the coordination mechanism: no ``BasePredictionWriter`` callba
 ``torch.distributed.all_gather``. This works for any ``world_size`` including 1 (rank 0 writes
 one shard, rank 0 merges one shard — same code path). The shard format (``dataset_row_idx``
 column + ``tokens`` list column) makes the merge a single ``pl.concat(...).sort(...)`` call.
+
+**Filesystem visibility requirement.** For multi-node DDP runs, ``shard_dir`` (i.e. the
+generation ``output_dir``) must live on a filesystem visible to every rank / every node —
+otherwise rank 0's ``finalize_predictions`` will only see its own node's shards and raise a
+"no rank shards" or set-completeness error. Node-local scratch is a classic pitfall here.
+Single-node runs (including multi-GPU on a single host) have no such requirement since all
+ranks share the same filesystem by construction.
 """
 
 import contextlib
@@ -116,6 +123,9 @@ def write_predictions_shards(
 
     Empty shards (a rank that received no rows for a trajectory) are still written so
     ``finalize_predictions``'s glob-and-concat loop doesn't have to special-case missing files.
+
+    For multi-node DDP, ``shard_dir`` must be on a filesystem visible to every rank (rank 0's
+    finalize glob must see every rank's shard). See the module docstring.
 
     Examples:
         >>> import tempfile
@@ -228,11 +238,25 @@ def finalize_predictions(
             logger.info(f"Skipping {out_fp} as it already exists.")
             continue
 
+        # Empty split (``n_dataset_rows == 0``). Nothing to validate, nothing to format, and
+        # ``format_trajectories`` would raise on an empty batch list anyway. Log + skip so
+        # downstream consumers see a missing parquet (same contract as "nothing to generate")
+        # rather than an ``IndexError`` from the completeness check below.
+        if n_dataset_rows == 0:
+            logger.info(
+                f"Trajectory {t}: split is empty (n_dataset_rows == 0); skipping finalize "
+                f"and not writing {out_fp}."
+            )
+            continue
+
         shard_paths = sorted(shard_dir.glob(f"trajectory_{t}.rank_*.parquet"))
         if not shard_paths:
             raise RuntimeError(
                 f"Trajectory {t}: no rank shards at {shard_dir}/trajectory_{t}.rank_*.parquet. "
-                "write_predictions_shards must run on every rank before finalize_predictions."
+                "Either (a) write_predictions_shards was not run on every rank before "
+                "finalize_predictions, or (b) under multi-node DDP, shard_dir is on a "
+                "filesystem not visible to all ranks (e.g. node-local scratch). Generation "
+                "requires shared storage across ranks; point output_dir at a shared filesystem."
             )
 
         merged = pl.concat([pl.read_parquet(p) for p in shard_paths]).sort(SHARD_ROW_IDX_COL)
@@ -240,12 +264,14 @@ def finalize_predictions(
         # Validate the concatenated, sorted idx column is the full permutation ``[0, ..., n-1]``.
         # After ``.sort``, completeness checks reduce to: right length, first == 0, last == n-1,
         # and every consecutive diff is 1 (no duplicates, no gaps). Done in polars-native ops so
-        # we never materialize a Python list of N indices.
+        # we never materialize a Python list of N indices. (The empty-split case has already
+        # been short-circuited above, so ``idxs[0]`` / ``idxs[-1]`` are safe here.)
         idxs = merged[SHARD_ROW_IDX_COL]
         if len(idxs) != n_dataset_rows:
             raise RuntimeError(
                 f"Trajectory {t} merged row count {len(idxs)} != n_dataset_rows {n_dataset_rows}. "
-                "Check that every rank wrote its shard and that no rows were dropped upstream."
+                "Check that every rank wrote its shard and that no rows were dropped upstream. "
+                "Under multi-node DDP, also verify shard_dir is on shared storage."
             )
         diffs = idxs.diff().drop_nulls()
         if idxs[0] != expected_first or idxs[-1] != expected_last or (diffs.len() > 0 and (diffs != 1).any()):
@@ -255,7 +281,8 @@ def finalize_predictions(
                 f"{{0, 1, ..., {expected_last}}}: got {preview}... (len {len(idxs)}). "
                 "Every base-dataset row index must appear exactly once across all rank shards. "
                 "A missing or duplicate index indicates a sampler bug, an accidental dataloader "
-                "shuffle, or a missing / misnamed rank shard."
+                "shuffle, a missing / misnamed rank shard, or — on multi-node DDP — a "
+                "shard_dir on node-local storage that rank 0 can't fully see."
             )
 
         # Reconstitute per-row token tensors as zero-copy views into the shard's Arrow flat
