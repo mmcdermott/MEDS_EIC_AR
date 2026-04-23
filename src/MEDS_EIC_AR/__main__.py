@@ -287,7 +287,17 @@ def generate_trajectories(cfg: DictConfig):
         # ``dataset_row_idx`` stitches them together). No cross-rank gather or
         # ``BasePredictionWriter`` — the filesystem is the coordination primitive.
         shard_dir = Path(cfg.output_dir) / split / "_shards"
-        shard_dir.mkdir(parents=True, exist_ok=True)
+        # Rank 0 cleans any stale ``trajectory_*.rank_*.parquet`` files left over from a
+        # prior failed run or a rerun with a different ``world_size`` — otherwise
+        # ``finalize_predictions``'s ``glob`` would pick them up alongside the current run's
+        # shards and raise a set-completeness error. Barrier below ensures all ranks wait
+        # for this cleanup + mkdir before any of them writes its shard.
+        if trainer.is_global_zero:
+            if shard_dir.exists():
+                for stale in shard_dir.glob("trajectory_*.rank_*.parquet"):
+                    stale.unlink()
+            shard_dir.mkdir(parents=True, exist_ok=True)
+        trainer.strategy.barrier()
         write_predictions_shards(
             predictions,
             n_trajectories=n_trajectories,
@@ -303,9 +313,9 @@ def generate_trajectories(cfg: DictConfig):
                 base_dataset=base_dataset,
                 do_overwrite=cfg.do_overwrite,
             )
-        # Second barrier so non-zero ranks don't move past this split before rank 0's
+        # Final barrier so non-zero ranks don't move past this split before rank 0's
         # finalize + shard-cleanup has finished (avoids a race where the next split's
-        # ``shard_dir.mkdir`` collides with rank 0 still cleaning up the previous one).
+        # shard pre-write cleanup collides with rank 0 still cleaning up the previous one).
         trainer.strategy.barrier()
 
     # Save the generation run's logger ids into the *generation* ``output_dir``, not the
