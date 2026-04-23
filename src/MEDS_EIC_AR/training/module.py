@@ -21,7 +21,7 @@ from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from ..generation.repeated_dataset import PredictBatch
+from ..generation.repeated_dataset import PredictBatch, PredictStepOutput
 from ..model import Model
 from .metrics import NextCodeMetrics
 
@@ -475,12 +475,12 @@ class MEICARModule(L.LightningModule):
 
         return {"optimizer": optimizer, "lr_scheduler": LR_config}
 
-    def predict_step(self, batch: PredictBatch) -> dict[str, torch.Tensor]:
-        """Produces generated trajectories for a given batch of data.
+    def predict_step(self, batch: PredictBatch) -> PredictStepOutput:
+        """Produce generated trajectories for one predict batch.
 
         Expects the :data:`PredictBatch` shape yielded by
         :func:`MEDS_EIC_AR.generation.collate_with_meta` — a three-tuple
-        ``(batch, subject_idxs, trajectory_idxs)`` — as produced by the expanded dataset that
+        ``(batch, dataset_row_idxs, trajectory_idxs)`` — as produced by the expanded dataset that
         ``MEICAR_generate_trajectories`` builds. The bare-``MEDSTorchBatch`` form supported by the
         prior iteration is no longer accepted; callers wanting a single trajectory per subject
         should set ``n_trajectories=1`` on :class:`RepeatedPredictionDataset`, which still yields
@@ -492,22 +492,17 @@ class MEICARModule(L.LightningModule):
         rolling-generation settings such as ``max_new_tokens`` and ``rolling_context_size`` reach
         the model at prediction time without going through the saved Lightning hparams.
 
-        Returns a dict with:
-            - ``tokens``: ``[B, L]`` generated-token tensor from the model.
-            - ``subject_idxs``: ``[B]`` long tensor, which base-dataset subject each row came from.
-            - ``trajectory_idxs``: ``[B]`` long tensor, which of the N trajectories-per-subject
-              each row corresponds to.
-
-        All three tensors are detached and moved to CPU before returning. ``Trainer.predict``
-        accumulates per-batch returns in a Python list across the entire predict run (scaled by
-        ``n_trajectories`` via the expanded dataset), so leaving them on-device would pin per-batch
-        GPU allocations for the full pass and OOM on non-trivial cohorts. Downstream demux and
-        ``format_trajectories`` run on CPU anyway.
+        Returns a :class:`~MEDS_EIC_AR.generation.PredictStepOutput` whose fields are documented on
+        the ``NamedTuple`` itself. All three tensors are detached and moved to CPU before returning —
+        ``Trainer.predict`` accumulates per-batch returns in a Python list across the entire
+        predict run (scaled by ``n_trajectories`` via the expanded dataset), so leaving them on-
+        device would pin per-batch GPU allocations for the full pass and OOM on non-trivial
+        cohorts. Downstream finalize runs on CPU anyway.
         """
-        mdata_batch, subject_idxs, trajectory_idxs = batch
+        mdata_batch, dataset_row_idxs, trajectory_idxs = batch
         tokens = self.model.generate(mdata_batch, **self.generation_kwargs)
-        return {
-            "tokens": tokens.detach().cpu(),
-            "subject_idxs": subject_idxs.detach().cpu(),
-            "trajectory_idxs": trajectory_idxs.detach().cpu(),
-        }
+        return PredictStepOutput(
+            tokens=tokens.detach().cpu(),
+            dataset_row_idxs=dataset_row_idxs.detach().cpu(),
+            trajectory_idxs=trajectory_idxs.detach().cpu(),
+        )

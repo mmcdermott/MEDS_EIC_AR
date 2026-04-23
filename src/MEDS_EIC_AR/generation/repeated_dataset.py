@@ -10,8 +10,8 @@ rows then end up in adjacent batch positions, which gives us:
 3. One ``trainer.predict`` pass instead of ``N`` (saves dataloader/worker spawn + Lightning init).
 
 The wrapper is a thin ``Dataset`` that multiplies the index space and carries per-row metadata
-(the ``(subject_idx, trajectory_idx)`` pair). The collate helper returns a **three-tuple**
-``(batch, subject_idxs, trajectory_idxs)`` rather than attaching metadata as a sidecar attribute
+(the ``(dataset_row_idx, trajectory_idx)`` pair). The collate helper returns a **three-tuple**
+``(batch, dataset_row_idxs, trajectory_idxs)`` rather than attaching metadata as a sidecar attribute
 on the batch itself — this keeps the base ``MEDSTorchBatch`` untouched and avoids any coupling to
 ``meds_torchdata``'s dataclass-mutation behavior.
 
@@ -20,11 +20,20 @@ generated outputs this row corresponds to for its subject" — matching the oute
 Hydra config key ``inference.N_trajectories_per_task_sample`` ("N trajectories per task sample").
 The prior iteration of this code used ``sample_idx`` for the same concept; renamed for clarity
 since "sample" collides with the generic ML sense of "batch row / datapoint".
+
+``dataset_row_idx`` is the integer index into the *base* (un-expanded) dataset backing each
+expanded row — i.e. the value that lets us do ``base[dataset_row_idx]`` to recover the original
+item. Importantly, **this is a row index, not a subject identifier**. For a task-labeled
+``MEDSPytorchDataset`` the base dataset has one row per ``(subject_id, prediction_time)`` pair,
+so a subject with two prediction times occupies two distinct ``dataset_row_idx`` values. The
+downstream sort-then-write path relies on ``(dataset_row_idx, trajectory_idx)`` being unique —
+that holds by construction here (``divmod`` is bijective), and renaming the field away from the
+misleading ``subject_idx`` label documents the invariant in the name itself.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from torch.utils.data import Dataset
@@ -35,24 +44,123 @@ if TYPE_CHECKING:
     from meds_torchdata import MEDSTorchBatch
 
 #: Type alias for what the generation dataloader yields (and what ``MEICARModule.predict_step``
-#: receives): the base MEDSTorchBatch plus per-row ``(subject_idxs, trajectory_idxs)`` tensors.
+#: receives): the base MEDSTorchBatch plus per-row ``(dataset_row_idxs, trajectory_idxs)`` tensors.
 PredictBatch = tuple["MEDSTorchBatch", torch.Tensor, torch.Tensor]
+
+
+class PredictStepOutput(NamedTuple):
+    """One batch's output from :meth:`MEICARModule.predict_step`.
+
+    All three tensors are CPU-side (``predict_step`` moves them before returning) and share the
+    batch dimension: ``tokens.shape[0] == dataset_row_idxs.shape[0] == trajectory_idxs.shape[0]``.
+
+    Fields:
+        tokens: ``[B, L]`` int64 generated-token tensor. ``L`` is the per-batch max-new-tokens
+            length the generator stopped at; positions after the first ``PAD_INDEX`` (0) in any
+            row are post-EOS padding and have no semantic meaning.
+        dataset_row_idxs: ``[B]`` int64 tensor. Each entry is the integer index into the *base*
+            (un-expanded) dataset that the row was drawn from — i.e.
+            ``base[dataset_row_idxs[i]]`` recovers the original item. For a task-labeled
+            ``MEDSPytorchDataset`` this corresponds to one ``(subject_id, prediction_time)``
+            row; a subject with multiple prediction times occupies multiple distinct
+            ``dataset_row_idxs`` values. Not to be confused with a subject identifier.
+        trajectory_idxs: ``[B]`` int64 tensor in ``0..n_trajectories-1``; which of the N
+            generated outputs per base-dataset row each batch row corresponds to.
+
+    ``NamedTuple`` rather than ``@dataclass(frozen=True)`` because Lightning's
+    ``move_data_to_device`` traverses ``predict_step`` outputs via ``apply_to_collection``,
+    which explicitly rejects frozen dataclasses but has built-in support for named tuples
+    (treats them as tuples, rebuilding with ``type(obj)(*new_fields)``).
+
+    Examples:
+        >>> out = PredictStepOutput(
+        ...     tokens=torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]]),
+        ...     dataset_row_idxs=torch.tensor([0, 0, 1, 1]),
+        ...     trajectory_idxs=torch.tensor([0, 1, 0, 1]),
+        ... )
+        >>> t0 = out.filter_to_trajectory(0)
+        >>> t0.tokens.tolist()
+        [[1, 2], [5, 6]]
+        >>> t0.dataset_row_idxs.tolist()
+        [0, 1]
+        >>> t0.trajectory_idxs.tolist()
+        [0, 0]
+    """
+
+    tokens: torch.Tensor
+    dataset_row_idxs: torch.Tensor
+    trajectory_idxs: torch.Tensor
+
+    def filter_to_trajectory(self, trajectory_idx: int) -> PredictStepOutput:
+        """Return a new :class:`PredictStepOutput` with only the rows for ``trajectory_idx``."""
+        mask = self.trajectory_idxs == trajectory_idx
+        return PredictStepOutput(
+            tokens=self.tokens[mask],
+            dataset_row_idxs=self.dataset_row_idxs[mask],
+            trajectory_idxs=self.trajectory_idxs[mask],
+        )
+
+    @classmethod
+    def split_by_trajectory(cls, outputs: list[PredictStepOutput]) -> dict[int, list[PredictStepOutput]]:
+        """Group per-batch outputs by trajectory index.
+
+        Iterates over ``trajectory_idxs.unique()`` per batch rather than doing
+        ``n_trajectories`` boolean compares unconditionally, so tail batches with fewer than
+        ``n_trajectories`` rows don't pay for empty buckets.
+
+        The number of trajectories is discovered from the data — no ``n_trajectories``
+        argument needed.
+
+        Examples:
+            >>> outs = [
+            ...     PredictStepOutput(
+            ...         tokens=torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]]),
+            ...         dataset_row_idxs=torch.tensor([0, 0, 1, 1]),
+            ...         trajectory_idxs=torch.tensor([0, 1, 0, 1]),
+            ...     ),
+            ... ]
+            >>> groups = PredictStepOutput.split_by_trajectory(outs)
+            >>> sorted(groups.keys())
+            [0, 1]
+            >>> [g.dataset_row_idxs.tolist() for g in groups[0]]
+            [[0, 1]]
+            >>> [g.tokens.tolist() for g in groups[0]]
+            [[[1, 2], [5, 6]]]
+
+            A trajectory absent from a batch gets no entry for that batch:
+
+            >>> outs = [
+            ...     PredictStepOutput(
+            ...         tokens=torch.tensor([[1, 2], [3, 4]]),
+            ...         dataset_row_idxs=torch.tensor([0, 1]),
+            ...         trajectory_idxs=torch.tensor([0, 0]),
+            ...     ),
+            ... ]
+            >>> groups = PredictStepOutput.split_by_trajectory(outs)
+            >>> sorted(groups.keys())
+            [0]
+        """
+        result: dict[int, list[PredictStepOutput]] = {}
+        for batch in outputs:
+            for t in batch.trajectory_idxs.unique().tolist():
+                result.setdefault(t, []).append(batch.filter_to_trajectory(t))
+        return result
 
 
 class RepeatedPredictionDataset(Dataset):
     """Wraps a base dataset so each underlying item contributes ``n_trajectories`` consecutive rows.
 
-    The ordering is **(subject_idx changes slow, trajectory_idx changes fast)**, so a batch of
-    ``batch_size`` covers at most ``ceil(batch_size / n_trajectories)`` distinct subjects and at
-    least ``floor(batch_size / n_trajectories)`` full trajectory-groups.
+    The ordering is **(dataset_row_idx changes slow, trajectory_idx changes fast)**, so a batch of
+    ``batch_size`` covers at most ``ceil(batch_size / n_trajectories)`` distinct base-dataset rows
+    and at least ``floor(batch_size / n_trajectories)`` full trajectory-groups.
 
     Concretely, if ``n_trajectories=4`` and the base dataset is ``[A, B, C, ...]``, this dataset
     yields::
 
         A#0 A#1 A#2 A#3 B#0 B#1 B#2 B#3 C#0 ...
 
-    with each ``A#k`` carrying metadata ``(subject_idx=0, trajectory_idx=k)``. Each call to
-    ``__getitem__`` returns a tuple ``(item, subject_idx, trajectory_idx)`` so the collate
+    with each ``A#k`` carrying metadata ``(dataset_row_idx=0, trajectory_idx=k)``. Each call to
+    ``__getitem__`` returns a tuple ``(item, dataset_row_idx, trajectory_idx)`` so the collate
     function downstream can repack the metadata alongside the base batch.
 
     Examples:
@@ -95,8 +203,8 @@ class RepeatedPredictionDataset(Dataset):
         return len(self.base) * self.n_trajectories
 
     def __getitem__(self, idx: int):
-        subject_idx, trajectory_idx = divmod(idx, self.n_trajectories)
-        return self.base[subject_idx], subject_idx, trajectory_idx
+        dataset_row_idx, trajectory_idx = divmod(idx, self.n_trajectories)
+        return self.base[dataset_row_idx], dataset_row_idx, trajectory_idx
 
 
 def collate_with_meta(
@@ -105,10 +213,10 @@ def collate_with_meta(
 ) -> PredictBatch:
     """Wrap a base ``MEDSTorchBatch`` collate to also return per-row metadata.
 
-    ``RepeatedPredictionDataset.__getitem__`` returns ``(item, subject_idx, trajectory_idx)``
+    ``RepeatedPredictionDataset.__getitem__`` returns ``(item, dataset_row_idx, trajectory_idx)``
     tuples, so the dataloader hands ``raw_items`` to this collate as a list of those tuples. We
     unzip the metadata, run the base collate over the items, and return a **three-tuple**
-    ``(batch, subject_idxs, trajectory_idxs)``.
+    ``(batch, dataset_row_idxs, trajectory_idxs)``.
 
     The three-tuple return (rather than attaching a sidecar attribute to ``batch``) keeps the base
     ``MEDSTorchBatch`` untouched: no ``object.__setattr__`` workaround, no reliance on whether
@@ -118,24 +226,30 @@ def collate_with_meta(
     simply destructure the tuple.
 
     Args:
-        raw_items: Sequence of ``(item, subject_idx, trajectory_idx)`` tuples from
+        raw_items: Sequence of ``(item, dataset_row_idx, trajectory_idx)`` tuples from
             :class:`RepeatedPredictionDataset`.
         base_collate: The base dataset's collate function (typically
             ``MEDSPytorchDataset.collate``). Receives just the items, not the metadata.
 
     Returns:
-        A :data:`PredictBatch` — ``(batch, subject_idxs, trajectory_idxs)`` — where ``batch`` is
-        whatever the base collate produced, ``subject_idxs`` is a ``[B]`` long tensor of subject
-        indices backing each row, and ``trajectory_idxs`` is a ``[B]`` long tensor identifying
-        which of the ``n_trajectories`` outputs per subject each row corresponds to.
+        A :data:`PredictBatch` — ``(batch, dataset_row_idxs, trajectory_idxs)`` — where ``batch`` is
+        whatever the base collate produced, ``dataset_row_idxs`` is a ``[B]`` long tensor of base-
+        dataset row indices backing each row (``base[dataset_row_idxs[i]]`` recovers the original
+        item), and ``trajectory_idxs`` is a ``[B]`` long tensor identifying which of the
+        ``n_trajectories`` outputs per base-dataset row each batch row corresponds to.
     """
-    items, subject_idxs, trajectory_idxs = zip(*raw_items, strict=True)
+    items, dataset_row_idxs, trajectory_idxs = zip(*raw_items, strict=True)
     batch = base_collate(list(items))
     return (
         batch,
-        torch.as_tensor(subject_idxs, dtype=torch.long),
+        torch.as_tensor(dataset_row_idxs, dtype=torch.long),
         torch.as_tensor(trajectory_idxs, dtype=torch.long),
     )
 
 
-__all__ = ["PredictBatch", "RepeatedPredictionDataset", "collate_with_meta"]
+__all__ = [
+    "PredictBatch",
+    "PredictStepOutput",
+    "RepeatedPredictionDataset",
+    "collate_with_meta",
+]
