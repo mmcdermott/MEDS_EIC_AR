@@ -46,6 +46,18 @@ dev = ["pre-commit<4", "ruff", "pytest-cov", "pretty_print_directory>=0.1.2", "y
 # Extensions
 wandb = ["wandb"]
 mlflow = ["mlflow", "psutil", "pynvml"]
+# Inference backend — lazy-imported inside ``MEDS_EIC_AR.model.backends.sglang``, only
+# needed for ``backend=sglang`` generation runs. See issues #88 and #109 for context.
+#
+# Installation note: SGLang's recent releases pull pre-release versions of
+# ``flash-attn-4``, so installing this extra with uv requires
+# ``uv sync --extra sglang --prerelease=allow`` (or the equivalent pip flag). We
+# intentionally keep a loose version bound here rather than pinning
+# ``0.5.10.post1`` — pinning in the core project forces the default resolve to
+# re-check the pin against the other extras' envelopes every time, which fails
+# without ``--prerelease=allow``. Pin in your deployment lockfile if you need
+# reproducibility; the ``GenerationBackend`` protocol isolates us from API churn.
+sglang = ["sglang>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_EIC_AR"

@@ -1,0 +1,26 @@
+# SGLang inference backend — issue #88. Production defaults aimed at batched inference over a
+# full dataset; the short-lived-CLI / test scenario lives in ``sglang_demo.yaml``.
+#
+# Requires the optional ``sglang`` extra (see ``pyproject.toml``). Install via
+# ``uv sync --extra sglang --prerelease=allow`` or ``pip install MEDS_EIC_AR[sglang]``.
+#
+# Activation: ``MEICAR_generate_trajectories backend=sglang ...``. The builder exports the
+# Lightning checkpoint to an HF directory on the first call (idempotent via a fingerprint
+# marker), then returns a fresh ``SGLangBackend`` pointing at it.
+_target_: MEDS_EIC_AR.model.backends.build_sglang_backend
+
+# Kwargs forwarded verbatim to ``sglang.Engine(...)``. Override from the CLI with
+# ``backend.engine_kwargs.<key>=<val>``.
+#  - ``mem_fraction_static``: fraction of GPU memory SGLang keeps for KV cache. 0.85 leaves
+#    ~15% free for the Lightning backbone copy and other GPU consumers.
+#  - ``max_running_requests``: cap on concurrent in-flight requests. 256 is plenty for
+#    typical batch-generation workloads; raise if you're saturating it.
+#  - ``tp_size``: tensor-parallel degree. 1 for single-GPU; set higher for multi-GPU
+#    deployments.
+#  - CUDA graph capture is *left on* (default) because production batched inference
+#    amortizes the 30–60s capture cost across many generation steps. Test/demo runs that
+#    exit quickly should use ``backend=sglang_demo`` which disables it.
+engine_kwargs:
+  mem_fraction_static: 0.85
+  max_running_requests: 256
+  tp_size: 1
