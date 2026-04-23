@@ -25,7 +25,6 @@ construction.
 """
 
 import logging
-from datetime import timedelta
 from pathlib import Path
 
 import polars as pl
@@ -177,95 +176,115 @@ def format_trajectories(
         >>> _ = pl.Config().set_tbl_rows(-1)
         >>> format_trajectories(pytorch_dataset_with_task, merged)
         shape: (16, 5)
-        ┌────────────┬───────────────────────┬─────────────────────┬───────────────────────┬───────────────┐
-        │ subject_id ┆ time                  ┆ prediction_time     ┆ code                  ┆ numeric_value │
-        │ ---        ┆ ---                   ┆ ---                 ┆ ---                   ┆ ---           │
-        │ i64        ┆ datetime[μs]          ┆ datetime[μs]        ┆ str                   ┆ f32           │
-        ╞════════════╪═══════════════════════╪═════════════════════╪═══════════════════════╪═══════════════╡
-        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//year ┆ 0.000003      │
-        │            ┆                       ┆                     ┆ s//value_…            ┆               │
-        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ DISCHARGE             ┆ null          │
-        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107. ┆ 105.099998    │
-        │            ┆                       ┆                     ┆ 5)                    ┆               │
-        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ DISCHARGE             ┆ null          │
-        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ ADMISSION//PULMONARY  ┆ null          │
-        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ DISCHARGE             ┆ null          │
-        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107. ┆ 105.099998    │
-        │            ┆                       ┆                     ┆ 5)                    ┆               │
-        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107. ┆ 105.099998    │
-        │            ┆                       ┆                     ┆ 5)                    ┆               │
-        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//year ┆ 0.00004       │
-        │            ┆ 18:11:40.400010       ┆                     ┆ s//value_…            ┆               │
-        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:00:00 ┆ HR//value_[107.5,107. ┆ 107.5         │
-        │            ┆ 18:11:40.400010       ┆                     ┆ 7)                    ┆               │
-        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//year ┆ 0.000015      │
-        │            ┆ 18:33:18.999983       ┆                     ┆ s//value_…            ┆               │
-        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.7,112. ┆ 108.349998    │
-        │            ┆ 18:33:18.999983       ┆                     ┆ 5)                    ┆               │
-        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//year ┆ 0.00004       │
-        │            ┆ 18:54:31.399993       ┆                     ┆ s//value_…            ┆               │
-        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.5,107. ┆ 107.5         │
-        │            ┆ 18:54:31.399993       ┆                     ┆ 7)                    ┆               │
-        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ ADMISSION//CARDIAC    ┆ null          │
-        │            ┆ 18:54:31.399993       ┆                     ┆                       ┆               │
-        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//END         ┆ null          │
-        │            ┆ 18:54:31.399993       ┆                     ┆                       ┆               │
-        └────────────┴───────────────────────┴─────────────────────┴───────────────────────┴───────────────┘
+        ┌────────────┬─────────────────┬─────────────────────┬─────────────────────────────┬───────────────┐
+        │ subject_id ┆ time            ┆ prediction_time     ┆ code                        ┆ numeric_value │
+        │ ---        ┆ ---             ┆ ---                 ┆ ---                         ┆ ---           │
+        │ i64        ┆ datetime[μs]    ┆ datetime[μs]        ┆ str                         ┆ f32           │
+        ╞════════════╪═════════════════╪═════════════════════╪═════════════════════════════╪═══════════════╡
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//years//val ┆ 0.000003      │
+        │            ┆ 17:50:27.999999 ┆                     ┆ ue_…                        ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ DISCHARGE                   ┆ null          │
+        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
+        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ DISCHARGE                   ┆ null          │
+        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ ADMISSION//PULMONARY        ┆ null          │
+        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ DISCHARGE                   ┆ null          │
+        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
+        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
+        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//years//val ┆ 0.00004       │
+        │            ┆ 18:11:40.400032 ┆                     ┆ ue_…                        ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ HR//value_[107.5,107.7)     ┆ 107.5         │
+        │            ┆ 18:11:40.400032 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//years//val ┆ 0.000015      │
+        │            ┆ 18:33:18.999982 ┆                     ┆ ue_…                        ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.7,112.5)     ┆ 108.349998    │
+        │            ┆ 18:33:18.999982 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//years//val ┆ 0.00004       │
+        │            ┆ 18:54:31.400015 ┆                     ┆ ue_…                        ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.5,107.7)     ┆ 107.5         │
+        │            ┆ 18:54:31.400015 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ ADMISSION//CARDIAC          ┆ null          │
+        │            ┆ 18:54:31.400015 ┆                     ┆                             ┆               │
+        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ TIMELINE//END               ┆ null          │
+        │            ┆ 18:54:31.400015 ┆                     ┆                             ┆               │
+        └────────────┴─────────────────┴─────────────────────┴─────────────────────────────┴───────────────┘
     """
-    code_information = get_code_information(base_dataset)
-
-    # Join against the base-dataset schema to attach (subject_id, prediction_time, last-time)
-    # to each merged row in one vectorized polars op, instead of doing a per-row
-    # ``schema_df.row(...)`` lookup. ``with_row_index`` materializes ``dataset_row_idx`` as a
-    # column — its values are ``0..n_dataset_rows - 1`` in schema-df row order, which is
-    # exactly the integer index ``merged["dataset_row_idx"]`` carries.
-    schema_with_idx = base_dataset.schema_df.select(
+    # Flatten the nested ``tokens`` column to one row per generated code, then join against
+    # schema (for subject_id / prediction_time / last-time per base-dataset row) and against
+    # the code-metadata DataFrame (for code string + value_mean per vocab index). Everything
+    # after is vectorized polars ops — no Python iter_rows loop.
+    schema_df = base_dataset.schema_df.select(
         DataSchema.subject_id_name,
         LabelSchema.prediction_time_name,
         MEDSPytorchDataset.LAST_TIME,
     ).with_row_index("dataset_row_idx")
-    # polars ``with_row_index`` produces a UInt32 column; cast to match the Int64 column
-    # ``merged`` carries so the join's key types align.
-    schema_with_idx = schema_with_idx.with_columns(pl.col("dataset_row_idx").cast(pl.Int64))
-    joined = merged.join(schema_with_idx, on="dataset_row_idx", how="left")
+    # ``with_row_index`` materializes a UInt32 column; cast to Int64 to match ``merged``.
+    schema_df = schema_df.with_columns(pl.col("dataset_row_idx").cast(pl.Int64))
+    code_metadata = get_code_information(base_dataset)
 
-    rows: list[dict] = []
-    for record in joined.iter_rows(named=True):
-        subject_id = record[DataSchema.subject_id_name]
-        prediction_time = record[LabelSchema.prediction_time_name]
-        time = record[MEDSPytorchDataset.LAST_TIME]
+    long = (
+        merged.explode("tokens")
+        .rename({"tokens": "code_idx"})
+        # ``_trim_post_pad`` strips post-EOS padding at shard-write time, so in normal operation
+        # there should be no PAD_INDEX rows here. Filter belt-and-suspenders in case a
+        # hypothetical left-padded generator ever inserts them.
+        .filter(pl.col("code_idx") != MEDSTorchBatch.PAD_INDEX)
+        .join(code_metadata, on="code_idx", how="left")
+        .join(schema_df, on="dataset_row_idx", how="left")
+    )
 
-        for code_idx in record["tokens"]:
-            if code_idx == MEDSTorchBatch.PAD_INDEX:
-                continue
-            code_info = code_information[code_idx]
-            code = code_info.code
-            value_mean = code_info.value_mean
+    # ``TIMELINE//DELTA`` tokens increment each row's running time by
+    # ``value_mean * seconds_per_unit``. The unit is the second-to-last segment of the code
+    # string (e.g. ``TIMELINE//DELTA//years//value_[...]`` → ``years``). Extract the unit,
+    # look up seconds-per-unit via a small mapping DataFrame built from the units actually
+    # present in the data (calling ``normalize_time_unit`` once per unique unit — typically
+    # a handful), and compute the per-row delta. Non-delta rows contribute zero seconds.
+    long = long.with_columns(
+        # ``null_on_oob`` is needed because polars evaluates both branches of
+        # ``when-then-otherwise``; non-delta codes can have fewer than 2 ``//``-separated
+        # segments and would otherwise raise ``ComputeError`` on the ``.list.get(-2)``.
+        pl.when(pl.col("code").str.starts_with(TIMELINE_DELTA_TOKEN))
+        .then(pl.col("code").str.split("//").list.get(-2, null_on_oob=True))
+        .otherwise(None)
+        .alias("unit"),
+    )
+    unique_units = long["unit"].drop_nulls().unique().to_list()
+    unit_to_seconds = {u: normalize_time_unit(u)[1] for u in unique_units}
+    unit_mapping = pl.DataFrame(
+        {"unit": list(unit_to_seconds.keys()), "seconds_per_unit": list(unit_to_seconds.values())},
+        schema={"unit": pl.Utf8, "seconds_per_unit": pl.Float64},
+    )
+    long = long.join(unit_mapping, on="unit", how="left").with_columns(
+        # Per-row microsecond delta. Casting per-step BEFORE the cumsum matches the precision
+        # of Python's ``timedelta(seconds=float)`` addition, which truncates each ``seconds``
+        # float to integer microseconds individually before summing.
+        delta_us=(pl.col("value_mean") * pl.col("seconds_per_unit").fill_null(0.0) * 1_000_000)
+        .cast(pl.Int64)
+        .fill_null(0),
+    )
 
-            if code.startswith(TIMELINE_DELTA_TOKEN):
-                unit = code.split("//")[-2]
-                _, seconds_in_unit = normalize_time_unit(unit)
-                time += timedelta(seconds=value_mean * seconds_in_unit)
+    # Cumulative per-row: time = last_time + sum of all prior (and current) delta_us within
+    # this dataset_row_idx. ``explode`` preserves source order within each list, and
+    # ``merged`` within a single ``dataset_row_idx`` has its tokens in generation order, so
+    # ``cum_sum().over("dataset_row_idx")`` walks them in the right order.
+    long = long.with_columns(
+        cum_delta_us=pl.col("delta_us").cum_sum().over("dataset_row_idx"),
+    )
 
-            rows.append(
-                {
-                    DataSchema.subject_id_name: subject_id,
-                    DataSchema.time_name: time,
-                    LabelSchema.prediction_time_name: prediction_time,
-                    DataSchema.code_name: code,
-                    DataSchema.numeric_value_name: value_mean,
-                }
-            )
-
-    return pl.DataFrame(
-        rows,
-        schema={
-            DataSchema.subject_id_name: pl.Int64,
-            DataSchema.time_name: pl.Datetime,
-            LabelSchema.prediction_time_name: pl.Datetime,
-            DataSchema.code_name: pl.Utf8,
-            DataSchema.numeric_value_name: pl.Float32,
-        },
+    return long.select(
+        pl.col(DataSchema.subject_id_name).cast(pl.Int64),
+        (pl.col(MEDSPytorchDataset.LAST_TIME) + pl.duration(microseconds=pl.col("cum_delta_us")))
+        .cast(pl.Datetime)
+        .alias(DataSchema.time_name),
+        pl.col(LabelSchema.prediction_time_name).cast(pl.Datetime),
+        pl.col("code").alias(DataSchema.code_name),
+        pl.col("value_mean").cast(pl.Float32).alias(DataSchema.numeric_value_name),
     )
 
 
@@ -301,6 +320,35 @@ def finalize_predictions(
       by a ``trainer.strategy.barrier()`` between those two calls in the CLI).
     - The empty-split case (``n_dataset_rows == 0``) is handled at the CLI entry — we're never
       called with an empty split.
+
+    Examples:
+        Build a single-rank predict output for two base-dataset rows, merge it, and finalize
+        to a per-trajectory parquet:
+
+        >>> preds = [
+        ...     PredictStepOutput(
+        ...         tokens=torch.tensor([[31, 4, 14], [32, 16, 33]], dtype=torch.long),
+        ...         dataset_row_idxs=torch.tensor([0, 1]),
+        ...         trajectory_idxs=torch.tensor([0, 0]),
+        ...     ),
+        ... ]
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     rod = Path(d) / "_rank_outputs"
+        ...     rod.mkdir()
+        ...     write_rank_output(preds, rank=0, rank_outputs_dir=rod)
+        ...     out_fp = Path(d) / "trajectory_0.parquet"
+        ...     finalize_predictions(
+        ...         rank_outputs_dir=rod,
+        ...         trajectory_paths={0: out_fp},
+        ...         base_dataset=pytorch_dataset_with_task,
+        ...         n_dataset_rows=2,
+        ...         do_overwrite=True,
+        ...     )
+        ...     df = pl.read_parquet(out_fp)
+        >>> df.shape
+        (6, 5)
+        >>> df.columns
+        ['subject_id', 'time', 'code', 'numeric_value', 'prediction_time']
     """
     for t, out_fp in trajectory_paths.items():
         if out_fp.is_file() and not do_overwrite:

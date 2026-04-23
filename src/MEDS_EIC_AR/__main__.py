@@ -257,28 +257,27 @@ def generate_trajectories(cfg: DictConfig):
             )
             continue
 
-        # Rank-0 stale-output guard + cleanup, BEFORE the predict pass. Rank outputs from a
-        # prior failed run (or a rerun with a different ``world_size`` whose old
-        # ``rank_{r}`` files no longer map to any current rank) would otherwise be picked up
-        # by ``finalize_predictions``'s glob alongside the current run's outputs. With
-        # ``do_overwrite`` false, we error loudly so the user knows; otherwise we clean.
-        # No explicit post-cleanup barrier: ``trainer.predict``'s internal strategy setup
-        # synchronizes ranks before any rank starts writing, and the shared filesystem sees
-        # rank 0's cleanup by that point.
+        # Stale-output guard + cleanup, BEFORE the predict pass. Rank outputs from a prior
+        # failed run (or a rerun with a different ``world_size`` whose old ``rank_{r}`` files
+        # no longer map to any current rank) would otherwise be picked up by
+        # ``finalize_predictions``'s glob alongside the current run's outputs. With
+        # ``do_overwrite=False``, every rank sees the shared filesystem state and raises
+        # ``FileExistsError`` together — this avoids a rank-0-only raise where non-zero ranks
+        # would then hang in a subsequent collective. Rank 0 does the actual cleanup +
+        # ``mkdir``; other ranks just proceed to ``trainer.predict`` where the strategy setup
+        # barrier synchronizes all ranks before any of them tries to write its rank output.
         rank_outputs_dir = Path(cfg.output_dir) / split / "_rank_outputs"
-        if trainer.is_global_zero:
-            stale = (
-                sorted(rank_outputs_dir.glob("trajectory_*.rank_*.parquet"))
-                if rank_outputs_dir.exists()
-                else []
+        stale = (
+            sorted(rank_outputs_dir.glob("trajectory_*.rank_*.parquet")) if rank_outputs_dir.exists() else []
+        )
+        if stale and not cfg.do_overwrite:
+            raise FileExistsError(
+                f"Found {len(stale)} stale rank-output file(s) under {rank_outputs_dir}. "
+                "A prior generation run did not finalize cleanly. Re-run with "
+                "do_overwrite=True to discard them and retry, or investigate and remove "
+                "them manually."
             )
-            if stale and not cfg.do_overwrite:
-                raise FileExistsError(
-                    f"Found {len(stale)} stale rank-output file(s) under {rank_outputs_dir}. "
-                    "A prior generation run did not finalize cleanly. Re-run with "
-                    "do_overwrite=True to discard them and retry, or investigate and remove "
-                    "them manually."
-                )
+        if trainer.is_global_zero:
             for p in stale:
                 p.unlink()
             rank_outputs_dir.mkdir(parents=True, exist_ok=True)
