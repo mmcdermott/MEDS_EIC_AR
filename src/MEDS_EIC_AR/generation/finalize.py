@@ -39,6 +39,13 @@ from .repeated_dataset import PredictStepOutput
 
 logger = logging.getLogger(__name__)
 
+# Must match the ``add_time_derived_measurements.timeline_tokens.time_delta_code`` default used
+# by the preprocessing pipeline in ``preprocessing/configs/_data.yaml`` and
+# ``preprocessing/configs/_reshard_data.yaml``. MEDS-transforms' ``timeline_tokens`` stage lets
+# that prefix be overridden, but finalize has no way to recover a renamed prefix from the code
+# metadata — so a non-default ``time_delta_code`` would silently skip all delta tokens here.
+# See https://github.com/mmcdermott/MEDS_EIC_AR/issues for the upstream follow-up to surface
+# delta-code identity + unit via code metadata instead of this out-of-band coupling.
 TIMELINE_DELTA_TOKEN = "TIMELINE//DELTA"
 
 
@@ -139,13 +146,21 @@ def _timeline_delta_seconds_per_unit(code_metadata: pl.DataFrame) -> float:
     the vocabulary, asserts uniqueness (catches any future pipeline change that would
     introduce mixed units), and returns its seconds-per-unit scalar.
 
-    Returns ``0.0`` when no ``TIMELINE//DELTA`` codes exist in the vocabulary (e.g. an empty
-    or degenerate fixture) — the caller's downstream multiplication short-circuits to zero
-    deltas in that case.
+    Raises ``ValueError`` when no ``TIMELINE//DELTA`` codes exist in the vocabulary: without
+    them, generation cannot advance per-row time, so the output would be degenerate. The most
+    likely cause is a non-default ``add_time_derived_measurements.timeline_tokens.time_delta_code``
+    in the preprocessing pipeline — :data:`TIMELINE_DELTA_TOKEN` hardcodes the default prefix
+    and a renamed prefix is not supported at present.
     """
     delta_codes = code_metadata.filter(pl.col("code").str.starts_with(TIMELINE_DELTA_TOKEN))
     if delta_codes.height == 0:
-        return 0.0
+        raise ValueError(
+            f"No codes starting with {TIMELINE_DELTA_TOKEN!r} were found in the vocabulary. "
+            "Generation needs delta codes to advance per-row time. This likely means the "
+            "preprocessing pipeline's ``add_time_derived_measurements.timeline_tokens.time_delta_code`` "
+            "was changed from the default; overriding that prefix is not supported at present "
+            "because finalize has no way to recover the renamed prefix from the code metadata."
+        )
     units = {c.split("//")[-2] for c in delta_codes["code"].to_list()}
     if len(units) != 1:
         raise ValueError(

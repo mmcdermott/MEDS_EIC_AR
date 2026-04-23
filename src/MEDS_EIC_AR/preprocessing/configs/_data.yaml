@@ -5,6 +5,12 @@ stages:
   - add_time_derived_measurements:
       age: null
       time_of_day: null
+      # ``time_unit`` and the default ``time_delta_code`` prefix (``TIMELINE//DELTA``) are
+      # load-bearing for generation: ``src/MEDS_EIC_AR/generation/finalize.py`` parses the unit
+      # out of ``TIMELINE//DELTA//<unit>//...`` codes at finalize time via
+      # ``TIMELINE_DELTA_TOKEN`` and ``_timeline_delta_seconds_per_unit``. Overriding
+      # ``time_delta_code`` is not supported; changing ``time_unit`` must stay consistent across
+      # the whole vocabulary.
       timeline_tokens:
         time_unit: years
   - count_codes:
