@@ -38,7 +38,11 @@ from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
 from MEDS_transforms.stages.add_time_derived_measurements.utils import normalize_time_unit
 
 from .repeated_dataset import PredictStepOutput
-from .utils import get_code_information
+
+# ``CodeInformation`` is referenced only in the ``format_trajectories`` doctest — ruff
+# otherwise auto-prunes it as unused. Keep it accessible in the module namespace so doctests
+# can construct fake code-information dicts without a separate import line.
+from .utils import CodeInformation, get_code_information  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
