@@ -12,9 +12,13 @@ class CodeInformation(NamedTuple):
     """Per-vocab-index metadata consumed by the trajectory formatter.
 
     - ``code``: the MEDS code string (e.g. ``TIMELINE//END``, ``HR//value_[102.6,105.1)``).
-    - ``value_prob``: fraction of occurrences of this code that carry a numeric value. For this
-      model we require this to be exactly ``0.0`` (never has a value) or ``1.0`` (always has a
-      value); the formatter raises on anything else.
+    - ``value_prob``: fraction of occurrences of this code that carry a numeric value. In
+      practice this is always ``0.0`` (never has a value) or ``1.0`` (always has a value) by
+      construction of the preprocessing pipeline — the ``quantile_binning`` +
+      ``bin_numeric_values`` stages produce either always-value-carrying codes
+      (``X//value_[lo,hi)`` bins) or sentinel never-value-carrying codes (``DISCHARGE``,
+      ``TIMELINE//END``, etc.). The trajectory formatter assumes this invariant without
+      validating it at runtime.
     - ``value_mean``: the mean numeric value across observed occurrences (``None`` when
       ``value_prob == 0``).
     """

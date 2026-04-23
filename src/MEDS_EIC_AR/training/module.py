@@ -493,7 +493,7 @@ class MEICARModule(L.LightningModule):
         the model at prediction time without going through the saved Lightning hparams.
 
         Returns a :class:`~MEDS_EIC_AR.generation.PredictStepOutput` whose fields are documented on
-        the dataclass itself. All three tensors are detached and moved to CPU before returning —
+        the ``NamedTuple`` itself. All three tensors are detached and moved to CPU before returning —
         ``Trainer.predict`` accumulates per-batch returns in a Python list across the entire
         predict run (scaled by ``n_trajectories`` via the expanded dataset), so leaving them on-
         device would pin per-batch GPU allocations for the full pass and OOM on non-trivial

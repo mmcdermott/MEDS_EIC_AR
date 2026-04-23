@@ -24,7 +24,6 @@ single host) have no such requirement since all ranks share the same filesystem 
 construction.
 """
 
-import contextlib
 import logging
 from datetime import timedelta
 from pathlib import Path
@@ -95,7 +94,7 @@ def write_rank_output(
     Examples:
         >>> outs = [
         ...     PredictStepOutput(
-        ...         tokens=torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0], [6, 7, 8, 9]], dtype=torch.long),
+        ...         tokens=torch.tensor([[1, 2, 0], [3, 4, 5], [6, 7, 8]], dtype=torch.long),
         ...         dataset_row_idxs=torch.tensor([0, 1, 2]),
         ...         trajectory_idxs=torch.tensor([0, 1, 0]),
         ...     ),
@@ -108,10 +107,25 @@ def write_rank_output(
         ...     df1 = pl.read_parquet(rod / "trajectory_1.rank_0.parquet")
         >>> names
         ['trajectory_0.rank_0.parquet', 'trajectory_1.rank_0.parquet']
-        >>> df0.to_dict(as_series=False)
-        {'dataset_row_idx': [0, 2], 'tokens': [[1, 2], [6, 7, 8, 9]]}
-        >>> df1.to_dict(as_series=False)
-        {'dataset_row_idx': [1], 'tokens': [[3, 4, 5]]}
+        >>> df0
+        shape: (2, 2)
+        ┌─────────────────┬───────────┐
+        │ dataset_row_idx ┆ tokens    │
+        │ ---             ┆ ---       │
+        │ i64             ┆ list[i64] │
+        ╞═════════════════╪═══════════╡
+        │ 0               ┆ [1, 2]    │
+        │ 2               ┆ [6, 7, 8] │
+        └─────────────────┴───────────┘
+        >>> df1
+        shape: (1, 2)
+        ┌─────────────────┬───────────┐
+        │ dataset_row_idx ┆ tokens    │
+        │ ---             ┆ ---       │
+        │ i64             ┆ list[i64] │
+        ╞═════════════════╪═══════════╡
+        │ 1               ┆ [3, 4, 5] │
+        └─────────────────┴───────────┘
     """
     per_trajectory = PredictStepOutput.split_by_trajectory(outputs)
     for t, t_outputs in per_trajectory.items():
@@ -199,18 +213,27 @@ def format_trajectories(
         └────────────┴───────────────────────┴─────────────────────┴───────────────────────┴───────────────┘
     """
     code_information = get_code_information(base_dataset)
-    schema_df = base_dataset.schema_df.select(
+
+    # Join against the base-dataset schema to attach (subject_id, prediction_time, last-time)
+    # to each merged row in one vectorized polars op, instead of doing a per-row
+    # ``schema_df.row(...)`` lookup. ``with_row_index`` materializes ``dataset_row_idx`` as a
+    # column — its values are ``0..n_dataset_rows - 1`` in schema-df row order, which is
+    # exactly the integer index ``merged["dataset_row_idx"]`` carries.
+    schema_with_idx = base_dataset.schema_df.select(
         DataSchema.subject_id_name,
         LabelSchema.prediction_time_name,
         MEDSPytorchDataset.LAST_TIME,
-    )
+    ).with_row_index("dataset_row_idx")
+    # polars ``with_row_index`` produces a UInt32 column; cast to match the Int64 column
+    # ``merged`` carries so the join's key types align.
+    schema_with_idx = schema_with_idx.with_columns(pl.col("dataset_row_idx").cast(pl.Int64))
+    joined = merged.join(schema_with_idx, on="dataset_row_idx", how="left")
 
     rows: list[dict] = []
-    for record in merged.iter_rows(named=True):
-        schema_row = schema_df.row(record["dataset_row_idx"], named=True)
-        subject_id = schema_row[DataSchema.subject_id_name]
-        prediction_time = schema_row[LabelSchema.prediction_time_name]
-        time = schema_row[MEDSPytorchDataset.LAST_TIME]
+    for record in joined.iter_rows(named=True):
+        subject_id = record[DataSchema.subject_id_name]
+        prediction_time = record[LabelSchema.prediction_time_name]
+        time = record[MEDSPytorchDataset.LAST_TIME]
 
         for code_idx in record["tokens"]:
             if code_idx == MEDSTorchBatch.PAD_INDEX:
@@ -259,8 +282,10 @@ def finalize_predictions(
 
     For each trajectory in ``trajectory_paths``:
 
-    1. ``pl.read_parquet`` + ``pl.concat`` + ``.sort("dataset_row_idx")`` across all
-       ``trajectory_{t}.rank_*.parquet`` rank outputs under ``rank_outputs_dir``.
+    1. ``pl.read_parquet`` + ``pl.concat`` across all ``trajectory_{t}.rank_*.parquet``
+       rank outputs under ``rank_outputs_dir``. No sort needed — :func:`format_trajectories`
+       does a join against ``schema_df`` on ``dataset_row_idx``, so arrival order is
+       irrelevant.
     2. Sanity check: ``len(merged) == n_dataset_rows``.
     3. :func:`format_trajectories` on the merged DataFrame → final polars DataFrame.
     4. :class:`GeneratedTrajectorySchema.align` + ``pq.write_table`` to the trajectory's
@@ -292,7 +317,7 @@ def finalize_predictions(
                 "local scratch). Point output_dir at shared storage."
             )
 
-        merged = pl.concat([pl.read_parquet(p) for p in rank_paths]).sort("dataset_row_idx")
+        merged = pl.concat([pl.read_parquet(p) for p in rank_paths])
         if len(merged) != n_dataset_rows:
             raise RuntimeError(
                 f"Trajectory {t}: merged row count {len(merged)} != n_dataset_rows "
@@ -309,10 +334,14 @@ def finalize_predictions(
     if cleanup_rank_outputs:
         for p in rank_outputs_dir.glob("trajectory_*.rank_*.parquet"):
             p.unlink()
-        # ``rmdir`` fails loudly if the dir has other contents or doesn't exist — don't care in
-        # either case.
-        with contextlib.suppress(OSError):
+        # ``rmdir`` fails if the dir has other contents or doesn't exist. Neither is a
+        # problem — the rank-output files we wrote are already unlinked above — but log
+        # at debug so an unexpected failure (permission issue, racing process) leaves a
+        # breadcrumb instead of vanishing silently.
+        try:
             rank_outputs_dir.rmdir()
+        except OSError as exc:
+            logger.debug(f"rmdir({rank_outputs_dir}) did not succeed: {exc}")
 
 
 __all__ = ["finalize_predictions", "format_trajectories", "write_rank_output"]
