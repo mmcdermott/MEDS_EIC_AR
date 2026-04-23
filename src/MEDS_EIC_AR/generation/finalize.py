@@ -38,11 +38,7 @@ from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
 from MEDS_transforms.stages.add_time_derived_measurements.utils import normalize_time_unit
 
 from .repeated_dataset import PredictStepOutput
-
-# ``CodeInformation`` is referenced only in the ``format_trajectories`` doctest — ruff
-# otherwise auto-prunes it as unused. Keep it accessible in the module namespace so doctests
-# can construct fake code-information dicts without a separate import line.
-from .utils import CodeInformation, get_code_information  # noqa: F401
+from .utils import get_code_information
 
 logger = logging.getLogger(__name__)
 
@@ -153,10 +149,6 @@ def format_trajectories(
         ``prediction_time``, ``code``, ``numeric_value``) — one output row per generated code
         across all trajectories' rows.
 
-    Raises:
-        ValueError: If ``base_dataset``'s code metadata has any code with ``value_prob`` not in
-            ``{0.0, 1.0}`` (this model assumes each code either always or never carries a value).
-
     Examples:
         >>> merged = pl.DataFrame(
         ...     {
@@ -205,25 +197,8 @@ def format_trajectories(
         │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//END         ┆ null          │
         │            ┆ 18:54:31.399993       ┆                     ┆                       ┆               │
         └────────────┴───────────────────────┴─────────────────────┴───────────────────────┴───────────────┘
-
-        Invalid code metadata raises:
-
-        >>> with patch("MEDS_EIC_AR.generation.finalize.get_code_information") as mock:
-        ...     mock.return_value = {1: CodeInformation(code='HR', value_prob=0.5, value_mean=106.0)}
-        ...     format_trajectories("fake dataset", merged)
-        Traceback (most recent call last):
-          ...
-        ValueError: Code HR has a value probability of 0.5, which is not 0.0 or 1.0. This is not supported.
     """
     code_information = get_code_information(base_dataset)
-
-    for code_info in code_information.values():
-        if code_info.value_prob not in {0.0, 1.0}:
-            raise ValueError(
-                f"Code {code_info.code} has a value probability of {code_info.value_prob}, "
-                "which is not 0.0 or 1.0. This is not supported."
-            )
-
     schema_df = base_dataset.schema_df.select(
         DataSchema.subject_id_name,
         LabelSchema.prediction_time_name,
