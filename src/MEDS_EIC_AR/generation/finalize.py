@@ -44,8 +44,8 @@ logger = logging.getLogger(__name__)
 # ``preprocessing/configs/_reshard_data.yaml``. MEDS-transforms' ``timeline_tokens`` stage lets
 # that prefix be overridden, but finalize has no way to recover a renamed prefix from the code
 # metadata — so a non-default ``time_delta_code`` would silently skip all delta tokens here.
-# See https://github.com/mmcdermott/MEDS_EIC_AR/issues for the upstream follow-up to surface
-# delta-code identity + unit via code metadata instead of this out-of-band coupling.
+# See mmcdermott/MEDS_transforms#391 for the upstream follow-up to surface delta-code identity
+# and unit via code metadata instead of this out-of-band coupling.
 TIMELINE_DELTA_TOKEN = "TIMELINE//DELTA"
 
 
