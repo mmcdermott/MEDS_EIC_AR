@@ -33,7 +33,7 @@ from .generation import (
     get_timeline_end_token_idx,
     validate_rolling_cfg,
 )
-from .generation.runner import finalize_predictions, write_predictions_shards
+from .generation.finalize import finalize_predictions, write_rank_output
 from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
@@ -234,6 +234,11 @@ def generate_trajectories(cfg: DictConfig):
         else:
             raise ValueError(f"Unknown split {split}.")
 
+        base_dataset = base_loader.dataset
+        if len(base_dataset) == 0:
+            logger.info(f"Split {split} has zero base-dataset rows; skipping generation.")
+            continue
+
         # Skip work for trajectories whose output parquet already exists. If every requested
         # trajectory is already on disk and ``do_overwrite`` is false, skip the predict pass
         # entirely; otherwise we still run a single pass over the full ``N``-expanded dataset and
@@ -252,14 +257,38 @@ def generate_trajectories(cfg: DictConfig):
             )
             continue
 
-        # Expand the base dataset so each subject contributes ``n_trajectories`` consecutive rows.
-        # See issue #89 for the motivation: one predict pass instead of ``N``, tighter padding,
-        # and prefix-cache reuse on backends that have one (#88, #97). The ordering invariant —
-        # subject changes slow, trajectory_idx changes fast — means rows for trajectory ``t``
-        # extracted from each batch in order land in subject-index order overall, which is what
-        # ``format_trajectories`` needs so its sequential ``schema_df.slice(...)`` lines up with
-        # the right subject metadata.
-        base_dataset = base_loader.dataset
+        # Rank-0 stale-output guard + cleanup, BEFORE the predict pass. Rank outputs from a
+        # prior failed run (or a rerun with a different ``world_size`` whose old
+        # ``rank_{r}`` files no longer map to any current rank) would otherwise be picked up
+        # by ``finalize_predictions``'s glob alongside the current run's outputs. With
+        # ``do_overwrite`` false, we error loudly so the user knows; otherwise we clean.
+        # No explicit post-cleanup barrier: ``trainer.predict``'s internal strategy setup
+        # synchronizes ranks before any rank starts writing, and the shared filesystem sees
+        # rank 0's cleanup by that point.
+        rank_outputs_dir = Path(cfg.output_dir) / split / "_rank_outputs"
+        if trainer.is_global_zero:
+            stale = (
+                sorted(rank_outputs_dir.glob("trajectory_*.rank_*.parquet"))
+                if rank_outputs_dir.exists()
+                else []
+            )
+            if stale and not cfg.do_overwrite:
+                raise FileExistsError(
+                    f"Found {len(stale)} stale rank-output file(s) under {rank_outputs_dir}. "
+                    "A prior generation run did not finalize cleanly. Re-run with "
+                    "do_overwrite=True to discard them and retry, or investigate and remove "
+                    "them manually."
+                )
+            for p in stale:
+                p.unlink()
+            rank_outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Expand the base dataset so each base-dataset row contributes ``n_trajectories``
+        # consecutive rows. See issue #89 for the motivation: one predict pass instead of
+        # ``N``, tighter padding, and prefix-cache reuse on backends that have one (#88, #97).
+        # The ordering invariant — ``dataset_row_idx`` changes slow, ``trajectory_idx``
+        # changes fast — means rows for trajectory ``t`` retain stable identifiers all the way
+        # through the shard-then-merge finalize step.
         expanded_dataset = RepeatedPredictionDataset(base_dataset, n_trajectories=n_trajectories)
         expanded_loader = DataLoader(
             expanded_dataset,
@@ -272,50 +301,32 @@ def generate_trajectories(cfg: DictConfig):
 
         seed = hash_based_seed(cfg.get("seed", None), split)
         logger.info(
-            f"Generating {n_trajectories} trajectories for each of {len(base_dataset)} subjects "
-            f"in split {split} (one interleaved predict pass over {len(expanded_dataset)} "
-            f"expanded rows, seed={seed})."
+            f"Generating {n_trajectories} trajectories for each of {len(base_dataset)} "
+            f"base-dataset rows in split {split} (one interleaved predict pass over "
+            f"{len(expanded_dataset)} expanded rows, seed={seed})."
         )
         seed_everything(seed, workers=True)
         predictions = trainer.predict(model=M, dataloaders=expanded_loader)
 
-        # Shard-then-merge finalize: every rank writes its per-trajectory shards to a shared
-        # ``_shards`` directory under the split output, then a barrier, then rank 0 merges the
-        # shards into the final per-trajectory parquets. Works uniformly for single-device
-        # (``world_size=1``: one shard per trajectory, rank-0 merge is a one-file passthrough)
-        # and DDP (one shard per ``(trajectory, rank)``; rank 0's polars ``concat + sort`` by
-        # ``dataset_row_idx`` stitches them together). No cross-rank gather or
-        # ``BasePredictionWriter`` — the filesystem is the coordination primitive.
-        shard_dir = Path(cfg.output_dir) / split / "_shards"
-        # Rank 0 cleans any stale ``trajectory_*.rank_*.parquet`` files left over from a
-        # prior failed run or a rerun with a different ``world_size`` — otherwise
-        # ``finalize_predictions``'s ``glob`` would pick them up alongside the current run's
-        # shards and raise a set-completeness error. Barrier below ensures all ranks wait
-        # for this cleanup + mkdir before any of them writes its shard.
-        if trainer.is_global_zero:
-            if shard_dir.exists():
-                for stale in shard_dir.glob("trajectory_*.rank_*.parquet"):
-                    stale.unlink()
-            shard_dir.mkdir(parents=True, exist_ok=True)
-        trainer.strategy.barrier()
-        write_predictions_shards(
-            predictions,
-            n_trajectories=n_trajectories,
-            shard_dir=shard_dir,
-            rank=trainer.global_rank,
-        )
+        # Shard-then-merge finalize. Every rank writes a per-trajectory rank output under
+        # ``rank_outputs_dir``; a barrier; rank 0 merges the per-rank partials into the final
+        # per-trajectory parquets. Works uniformly for single-device (``world_size=1``: one
+        # file per trajectory, rank-0 merge is effectively a passthrough) and DDP (one file
+        # per ``(trajectory, rank)``; rank 0's ``pl.concat + sort`` by ``dataset_row_idx``
+        # stitches them together). No cross-rank gather, no ``BasePredictionWriter`` — the
+        # filesystem is the coordination primitive. Two explicit barriers:
+        # (1) post-write so rank 0 waits for every rank's output to land before reading,
+        # (2) post-finalize so non-zero ranks don't race into the next split.
+        write_rank_output(predictions, rank=trainer.global_rank, rank_outputs_dir=rank_outputs_dir)
         trainer.strategy.barrier()
         if trainer.is_global_zero:
             finalize_predictions(
-                n_dataset_rows=len(base_dataset),
-                shard_dir=shard_dir,
+                rank_outputs_dir=rank_outputs_dir,
                 trajectory_paths=trajectory_paths,
                 base_dataset=base_dataset,
+                n_dataset_rows=len(base_dataset),
                 do_overwrite=cfg.do_overwrite,
             )
-        # Final barrier so non-zero ranks don't move past this split before rank 0's
-        # finalize + shard-cleanup has finished (avoids a race where the next split's
-        # shard pre-write cleanup collides with rank 0 still cleaning up the previous one).
         trainer.strategy.barrier()
 
     # Save the generation run's logger ids into the *generation* ``output_dir``, not the

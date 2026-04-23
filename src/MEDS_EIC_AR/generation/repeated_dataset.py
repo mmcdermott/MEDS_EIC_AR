@@ -33,7 +33,7 @@ misleading ``subject_idx`` label documents the invariant in the name itself.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from torch.utils.data import Dataset
@@ -46,6 +46,105 @@ if TYPE_CHECKING:
 #: Type alias for what the generation dataloader yields (and what ``MEICARModule.predict_step``
 #: receives): the base MEDSTorchBatch plus per-row ``(dataset_row_idxs, trajectory_idxs)`` tensors.
 PredictBatch = tuple["MEDSTorchBatch", torch.Tensor, torch.Tensor]
+
+
+class PredictStepOutput(NamedTuple):
+    """One batch's output from :meth:`MEICARModule.predict_step`.
+
+    All three tensors are CPU-side (``predict_step`` moves them before returning) and share the
+    batch dimension: ``tokens.shape[0] == dataset_row_idxs.shape[0] == trajectory_idxs.shape[0]``.
+
+    Fields:
+        tokens: ``[B, L]`` int64 generated-token tensor. ``L`` is the per-batch max-new-tokens
+            length the generator stopped at; positions after the first ``PAD_INDEX`` (0) in any
+            row are post-EOS padding and have no semantic meaning.
+        dataset_row_idxs: ``[B]`` int64 tensor. Each entry is the integer index into the *base*
+            (un-expanded) dataset that the row was drawn from — i.e.
+            ``base[dataset_row_idxs[i]]`` recovers the original item. For a task-labeled
+            ``MEDSPytorchDataset`` this corresponds to one ``(subject_id, prediction_time)``
+            row; a subject with multiple prediction times occupies multiple distinct
+            ``dataset_row_idxs`` values. Not to be confused with a subject identifier.
+        trajectory_idxs: ``[B]`` int64 tensor in ``0..n_trajectories-1``; which of the N
+            generated outputs per base-dataset row each batch row corresponds to.
+
+    ``NamedTuple`` rather than ``@dataclass(frozen=True)`` because Lightning's
+    ``move_data_to_device`` traverses ``predict_step`` outputs via ``apply_to_collection``,
+    which explicitly rejects frozen dataclasses but has built-in support for named tuples
+    (treats them as tuples, rebuilding with ``type(obj)(*new_fields)``).
+
+    Examples:
+        >>> out = PredictStepOutput(
+        ...     tokens=torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]]),
+        ...     dataset_row_idxs=torch.tensor([0, 0, 1, 1]),
+        ...     trajectory_idxs=torch.tensor([0, 1, 0, 1]),
+        ... )
+        >>> t0 = out.filter_to_trajectory(0)
+        >>> t0.tokens.tolist()
+        [[1, 2], [5, 6]]
+        >>> t0.dataset_row_idxs.tolist()
+        [0, 1]
+        >>> t0.trajectory_idxs.tolist()
+        [0, 0]
+    """
+
+    tokens: torch.Tensor
+    dataset_row_idxs: torch.Tensor
+    trajectory_idxs: torch.Tensor
+
+    def filter_to_trajectory(self, trajectory_idx: int) -> PredictStepOutput:
+        """Return a new :class:`PredictStepOutput` with only the rows for ``trajectory_idx``."""
+        mask = self.trajectory_idxs == trajectory_idx
+        return PredictStepOutput(
+            tokens=self.tokens[mask],
+            dataset_row_idxs=self.dataset_row_idxs[mask],
+            trajectory_idxs=self.trajectory_idxs[mask],
+        )
+
+    @classmethod
+    def split_by_trajectory(cls, outputs: list[PredictStepOutput]) -> dict[int, list[PredictStepOutput]]:
+        """Group per-batch outputs by trajectory index.
+
+        Iterates over ``trajectory_idxs.unique()`` per batch rather than doing
+        ``n_trajectories`` boolean compares unconditionally, so tail batches with fewer than
+        ``n_trajectories`` rows don't pay for empty buckets.
+
+        The number of trajectories is discovered from the data — no ``n_trajectories``
+        argument needed.
+
+        Examples:
+            >>> outs = [
+            ...     PredictStepOutput(
+            ...         tokens=torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]]),
+            ...         dataset_row_idxs=torch.tensor([0, 0, 1, 1]),
+            ...         trajectory_idxs=torch.tensor([0, 1, 0, 1]),
+            ...     ),
+            ... ]
+            >>> groups = PredictStepOutput.split_by_trajectory(outs)
+            >>> sorted(groups.keys())
+            [0, 1]
+            >>> [g.dataset_row_idxs.tolist() for g in groups[0]]
+            [[0, 1]]
+            >>> [g.tokens.tolist() for g in groups[0]]
+            [[[1, 2], [5, 6]]]
+
+            A trajectory absent from a batch gets no entry for that batch:
+
+            >>> outs = [
+            ...     PredictStepOutput(
+            ...         tokens=torch.tensor([[1, 2], [3, 4]]),
+            ...         dataset_row_idxs=torch.tensor([0, 1]),
+            ...         trajectory_idxs=torch.tensor([0, 0]),
+            ...     ),
+            ... ]
+            >>> groups = PredictStepOutput.split_by_trajectory(outs)
+            >>> sorted(groups.keys())
+            [0]
+        """
+        result: dict[int, list[PredictStepOutput]] = {}
+        for batch in outputs:
+            for t in batch.trajectory_idxs.unique().tolist():
+                result.setdefault(t, []).append(batch.filter_to_trajectory(t))
+        return result
 
 
 class RepeatedPredictionDataset(Dataset):
@@ -148,4 +247,9 @@ def collate_with_meta(
     )
 
 
-__all__ = ["PredictBatch", "RepeatedPredictionDataset", "collate_with_meta"]
+__all__ = [
+    "PredictBatch",
+    "PredictStepOutput",
+    "RepeatedPredictionDataset",
+    "collate_with_meta",
+]
