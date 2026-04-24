@@ -219,8 +219,9 @@ def write_rank_output(
 
     Under DDP each rank sees only its local slice of predictions — the rank outputs for a
     trajectory together span ``{0, ..., n_dataset_rows - 1}`` across all rank files. Rows
-    within a rank's output are *not* sorted; the final sort happens in
-    :func:`finalize_predictions` after concatenating all ranks.
+    within a rank's output are *not* sorted, and :func:`finalize_predictions` doesn't sort
+    either after concatenating: final output order is driven by ``format_trajectories``'s
+    ``dataset_row_idx`` join, not by cross-rank arrival order.
 
     No ``n_trajectories`` argument: the set of trajectory indices is discovered from the
     ``trajectory_idxs`` field of the inputs.
@@ -290,10 +291,11 @@ def format_trajectories(
         base_dataset: The un-expanded dataset used for generation. ``schema_df`` supplies
             ``(subject_id, prediction_time, last-observed-time)`` per base-dataset row;
             ``config.code_metadata_fp`` supplies the vocabulary.
-        merged: A polars DataFrame sorted by ``dataset_row_idx``, with columns
-            ``dataset_row_idx`` (Int64) and ``tokens`` (List[Int64]) — one row per base-dataset
-            row covered by this trajectory. This is what
-            :func:`finalize_predictions`'s ``pl.concat([...rank outputs...]).sort(...)`` produces.
+        merged: A polars DataFrame with columns ``dataset_row_idx`` (Int64) and
+            ``tokens`` (List[Int64]) — one row per base-dataset row covered by this
+            trajectory. Row order is unspecified (this is what
+            :func:`finalize_predictions`'s ``pl.concat([...rank outputs...])`` yields — no
+            sort); final output ordering is driven by the ``dataset_row_idx`` join below.
 
     Returns:
         A polars DataFrame with the standard MEDS columns (``subject_id``, ``time``,
@@ -424,10 +426,16 @@ def format_trajectories(
     # that path.
     missing_rows = with_rows.filter(pl.col(DataSchema.subject_id_name).is_null())
     if missing_rows.height:
-        unknown = sorted(missing_rows["dataset_row_idx"].unique().to_list())[:20]
+        # ``with_rows`` is post-``explode`` so ``missing_rows.height`` counts *token* rows,
+        # not base-dataset rows — a single bad ``dataset_row_idx`` with many tokens would
+        # inflate the number. Report the unique-id count alongside the raw token-row count
+        # so both signals are visible.
+        unknown_ids = sorted(missing_rows["dataset_row_idx"].unique().to_list())[:20]
+        n_unknown_ids = missing_rows["dataset_row_idx"].n_unique()
         raise RuntimeError(
-            f"{missing_rows.height} merged row(s) have dataset_row_idx values not present "
-            f"in base_dataset.schema_df (first 20: {unknown}). Expected the caller "
+            f"{n_unknown_ids} unresolved dataset_row_idx value(s) across "
+            f"{missing_rows.height} token-row(s) (first 20 ids: {unknown_ids}). These are "
+            "not present in base_dataset.schema_df — expected the caller "
             "(finalize_predictions) to have already validated coverage over "
             "[0, len(base_dataset))."
         )
@@ -613,18 +621,35 @@ def finalize_predictions(
         # Under DDP each rank writes a disjoint slice of dataset_row_idx; a correct merge
         # covers ``{0, ..., n_dataset_rows - 1}`` exactly once per trajectory. A pure
         # ``len(merged) == n_dataset_rows`` check misses duplicate/missing pairs (e.g.
-        # ``[0, 1, 1, 3]`` vs ``[0, 1, 2, 3]`` — same length, wrong coverage), so validate
-        # the set explicitly. The observed-count vs unique-count mismatch signals duplicates.
-        observed = merged["dataset_row_idx"].to_list()
-        observed_set = set(observed)
-        expected_set = set(range(n_dataset_rows))
-        if len(observed) != n_dataset_rows or observed_set != expected_set:
-            missing = sorted(expected_set - observed_set)[:20]
-            out_of_range = sorted(observed_set - expected_set)[:20]
+        # ``[0, 1, 1, 3]`` vs ``[0, 1, 2, 3]`` — same length, wrong coverage). Validate
+        # using polars ops on the happy path (no Python-side ``set(range(n_dataset_rows))``
+        # — for 10M+ row cohorts that's hundreds of MB of transient overhead stacked on
+        # top of ``merged``). Only build the missing/out-of-range samples if we're about
+        # to raise.
+        observed = merged["dataset_row_idx"]
+        observed_count = observed.len()
+        observed_unique_count = observed.n_unique()
+        out_of_range_series = observed.filter((observed < 0) | (observed >= n_dataset_rows)).unique()
+        if (
+            observed_count != n_dataset_rows
+            or observed_unique_count != n_dataset_rows
+            or out_of_range_series.len() > 0
+        ):
+            # Failure path — building Python structures here is OK, the run is dying.
+            out_of_range = sorted(out_of_range_series.to_list())[:20]
+            in_range_observed = set(
+                observed.filter((observed >= 0) & (observed < n_dataset_rows)).unique().to_list()
+            )
+            missing: list[int] = []
+            for i in range(n_dataset_rows):
+                if i not in in_range_observed:
+                    missing.append(i)
+                    if len(missing) >= 20:
+                        break
             raise RuntimeError(
                 f"Trajectory {t}: rank outputs should cover dataset_row_idx exactly once "
-                f"each over {{0, ..., {n_dataset_rows - 1}}}; got {len(observed)} rows with "
-                f"{len(observed_set)} unique ids. First 20 missing: {missing}; first 20 "
+                f"each over {{0, ..., {n_dataset_rows - 1}}}; got {observed_count} rows with "
+                f"{observed_unique_count} unique ids. First 20 missing: {missing}; first 20 "
                 f"out-of-range: {out_of_range}. Possible causes: (a) write_rank_output was "
                 "not run on every rank before finalize_predictions; (b) under multi-node "
                 "DDP, rank_outputs_dir is on a filesystem not visible to all ranks (e.g. "

@@ -328,9 +328,10 @@ def generate_trajectories(cfg: DictConfig):
         # ``rank_outputs_dir``; a barrier; rank 0 merges the per-rank partials into the final
         # per-trajectory parquets. Works uniformly for single-device (``world_size=1``: one
         # file per trajectory, rank-0 merge is effectively a passthrough) and DDP (one file
-        # per ``(trajectory, rank)``; rank 0's ``pl.concat + sort`` by ``dataset_row_idx``
-        # stitches them together). No cross-rank gather, no ``BasePredictionWriter`` — the
-        # filesystem is the coordination primitive. Two explicit barriers:
+        # per ``(trajectory, rank)``; rank 0's ``pl.concat`` stitches them together, with a
+        # coverage check over ``{0, ..., n_dataset_rows - 1}`` catching duplicate/missing
+        # ``dataset_row_idx`` values). No cross-rank gather, no ``BasePredictionWriter`` —
+        # the filesystem is the coordination primitive. Two explicit barriers:
         # (1) post-write so rank 0 waits for every rank's output to land before reading,
         # (2) post-finalize so non-zero ranks don't race into the next split.
         write_rank_output(predictions, rank=trainer.global_rank, rank_outputs_dir=rank_outputs_dir)
