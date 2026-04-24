@@ -7,6 +7,17 @@ and the resolved Hydra config to ``output_dir`` so re-runs and post-hoc debuggin
 the invocation. Generation loads a checkpoint via ``model_initialization_dir``, runs the rolling
 sliding-window predict path, and emits per-task-sample trajectory parquets under
 ``output_dir/<split>/<sample>.parquet``.
+
+**Generation memory footprint.** The generate path currently runs ``trainer.predict(...)``,
+which fully materializes every rank's predict-step outputs in CPU memory (tokens are moved to
+CPU in ``predict_step`` before the accumulator sees them). With
+``RepeatedPredictionDataset`` that accumulation scales as
+``O(n_dataset_rows * n_trajectories_per_task_sample * generated_length)`` per rank. For large
+cohorts crossed with high trajectory counts this can become a practical ceiling before the
+shard-then-merge finalize even runs. Follow-up at mmcdermott/MEDS_EIC_AR#148 tracks a
+streaming ``BasePredictionWriter`` (or backend-native streaming) replacement; until then,
+tune ``N_trajectories_per_task_sample`` and ``inference.generate_for_splits`` to fit the
+available rank memory.
 """
 
 import logging
@@ -317,9 +328,10 @@ def generate_trajectories(cfg: DictConfig):
         # ``rank_outputs_dir``; a barrier; rank 0 merges the per-rank partials into the final
         # per-trajectory parquets. Works uniformly for single-device (``world_size=1``: one
         # file per trajectory, rank-0 merge is effectively a passthrough) and DDP (one file
-        # per ``(trajectory, rank)``; rank 0's ``pl.concat + sort`` by ``dataset_row_idx``
-        # stitches them together). No cross-rank gather, no ``BasePredictionWriter`` — the
-        # filesystem is the coordination primitive. Two explicit barriers:
+        # per ``(trajectory, rank)``; rank 0's ``pl.concat`` stitches them together, with a
+        # coverage check over ``{0, ..., n_dataset_rows - 1}`` catching duplicate/missing
+        # ``dataset_row_idx`` values). No cross-rank gather, no ``BasePredictionWriter`` —
+        # the filesystem is the coordination primitive. Two explicit barriers:
         # (1) post-write so rank 0 waits for every rank's output to land before reading,
         # (2) post-finalize so non-zero ranks don't race into the next split.
         write_rank_output(predictions, rank=trainer.global_rank, rank_outputs_dir=rank_outputs_dir)
