@@ -406,12 +406,14 @@ def format_trajectories(
     # When it does happen the most likely cause is a checkpoint/dataset mismatch: the
     # generation CLI was pointed at a preprocessing output whose vocabulary doesn't line up
     # with the one the model was trained on. Fail loudly instead of producing rows with null
-    # ``code`` that would silently pass through GeneratedTrajectorySchema.align.
-    missing_codes = with_codes.filter(pl.col("code").is_null())
-    if missing_codes.height:
+    # ``code`` that would silently pass through GeneratedTrajectorySchema.align. Gate on a
+    # scalar ``null_count()`` so the happy path avoids allocating a filtered frame.
+    missing_code_count = with_codes["code"].null_count()
+    if missing_code_count:
+        missing_codes = with_codes.filter(pl.col("code").is_null())
         unknown = sorted(missing_codes["code_idx"].unique().to_list())[:20]
         raise RuntimeError(
-            f"{missing_codes.height} generated token(s) have code_idx values not present in "
+            f"{missing_code_count} generated token(s) have code_idx values not present in "
             f"the code metadata (first 20: {unknown}). This usually indicates a checkpoint / "
             "code-metadata mismatch: the checkpoint passed to MEICAR_generate_trajectories "
             "was trained on a different preprocessing output than the one pointed at by "
@@ -423,19 +425,21 @@ def format_trajectories(
     # ``dataset_row_idx`` outside ``[0, len(base_dataset))``. ``finalize_predictions``'s
     # coverage check is supposed to catch this upstream — reaching it here means
     # ``format_trajectories`` was called directly on bad input, so the error is targeted at
-    # that path.
-    missing_rows = with_rows.filter(pl.col(DataSchema.subject_id_name).is_null())
-    if missing_rows.height:
-        # ``with_rows`` is post-``explode`` so ``missing_rows.height`` counts *token* rows,
-        # not base-dataset rows — a single bad ``dataset_row_idx`` with many tokens would
-        # inflate the number. Report the unique-id count alongside the raw token-row count
-        # so both signals are visible.
+    # that path. Same scalar-gate pattern — especially important here because ``with_rows``
+    # is post-``explode`` and can be very large.
+    missing_subject_id_count = with_rows[DataSchema.subject_id_name].null_count()
+    if missing_subject_id_count:
+        missing_rows = with_rows.filter(pl.col(DataSchema.subject_id_name).is_null())
+        # ``missing_subject_id_count`` counts *token* rows, not base-dataset rows —
+        # a single bad ``dataset_row_idx`` with many tokens would inflate the number.
+        # Report the unique-id count alongside the raw token-row count so both signals
+        # are visible.
         unknown_ids = sorted(missing_rows["dataset_row_idx"].unique().to_list())[:20]
         n_unknown_ids = missing_rows["dataset_row_idx"].n_unique()
         raise RuntimeError(
             f"{n_unknown_ids} unresolved dataset_row_idx value(s) across "
-            f"{missing_rows.height} token-row(s) (first 20 ids: {unknown_ids}). These are "
-            "not present in base_dataset.schema_df — expected the caller "
+            f"{missing_subject_id_count} token-row(s) (first 20 ids: {unknown_ids}). These "
+            "are not present in base_dataset.schema_df — expected the caller "
             "(finalize_predictions) to have already validated coverage over "
             "[0, len(base_dataset))."
         )
@@ -621,22 +625,24 @@ def finalize_predictions(
         # Under DDP each rank writes a disjoint slice of dataset_row_idx; a correct merge
         # covers ``{0, ..., n_dataset_rows - 1}`` exactly once per trajectory. A pure
         # ``len(merged) == n_dataset_rows`` check misses duplicate/missing pairs (e.g.
-        # ``[0, 1, 1, 3]`` vs ``[0, 1, 2, 3]`` — same length, wrong coverage). Validate
-        # using polars ops on the happy path (no Python-side ``set(range(n_dataset_rows))``
-        # — for 10M+ row cohorts that's hundreds of MB of transient overhead stacked on
-        # top of ``merged``). Only build the missing/out-of-range samples if we're about
-        # to raise.
+        # ``[0, 1, 1, 3]`` vs ``[0, 1, 2, 3]`` — same length, wrong coverage). Validate the
+        # three failure modes (wrong count / out-of-range / duplicate) using scalar
+        # aggregates only: ``min``/``max`` for range, ``n_unique`` for duplicates. That
+        # avoids allocating a filtered frame or a ``set(range(n_dataset_rows))`` on the
+        # happy path — for 10M+ row cohorts those allocations alone would cost hundreds of
+        # MB of transient overhead stacked on ``merged``. Only on the failure branch do we
+        # materialize the out-of-range / missing samples for the error message.
         observed = merged["dataset_row_idx"]
         observed_count = observed.len()
+        observed_min = observed.min() if observed_count else 0
+        observed_max = observed.max() if observed_count else -1
+        all_in_range = observed_min >= 0 and observed_max < n_dataset_rows
         observed_unique_count = observed.n_unique()
-        out_of_range_series = observed.filter((observed < 0) | (observed >= n_dataset_rows)).unique()
-        if (
-            observed_count != n_dataset_rows
-            or observed_unique_count != n_dataset_rows
-            or out_of_range_series.len() > 0
-        ):
-            # Failure path — building Python structures here is OK, the run is dying.
-            out_of_range = sorted(out_of_range_series.to_list())[:20]
+        if observed_count != n_dataset_rows or not all_in_range or observed_unique_count != n_dataset_rows:
+            # Failure path — OK to allocate filtered frames and Python sets; run is dying.
+            out_of_range = sorted(
+                observed.filter((observed < 0) | (observed >= n_dataset_rows)).unique().to_list()
+            )[:20]
             in_range_observed = set(
                 observed.filter((observed >= 0) & (observed < n_dataset_rows)).unique().to_list()
             )
