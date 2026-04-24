@@ -8,20 +8,30 @@ The generation CLI calls two functions from this module, one before and one afte
   ``dataset_row_idx`` (Int64) and ``tokens`` (List[Int64]) — the per-row trimmed token sequence
   (post-EOS ``PAD_INDEX`` stripping done at write time).
 - :func:`finalize_predictions` — runs on **rank 0 only**, after an inter-rank barrier. For
-  each trajectory, reads all rank outputs, concatenates + sorts by ``dataset_row_idx``, and
-  feeds the merged rows to :func:`format_trajectories` for the final MEDS-shaped parquet write.
+  each trajectory, reads all rank outputs, concatenates them, validates
+  ``dataset_row_idx`` coverage, and feeds the merged rows to :func:`format_trajectories` for
+  the final MEDS-shaped parquet write.
 
 The filesystem is the coordination mechanism: no ``BasePredictionWriter`` callback, no explicit
 ``torch.distributed.all_gather``. Works uniformly for single-device (``world_size=1``: one
 rank output per trajectory, rank-0 merge is effectively a passthrough) and DDP (one rank output
-per ``(trajectory, rank)``; rank 0's ``pl.concat + sort`` stitches them together).
+per ``(trajectory, rank)``; rank 0's ``pl.concat`` stitches them together). Output row order is
+driven by the ``dataset_row_idx`` join in :func:`format_trajectories` — arrival/concat order
+across ranks is not semantically meaningful, so no sort is performed.
 
 **Filesystem visibility requirement.** Under multi-node DDP, ``rank_outputs_dir`` (i.e. the
 generation ``output_dir``) must live on a filesystem visible to every rank / every node.
 Node-local scratch is the classic pitfall — rank 0 would only see its own node's rank outputs
-and raise a "no rank outputs" or row-count error. Single-node runs (including multi-GPU on a
+and raise a "no rank outputs" or coverage error. Single-node runs (including multi-GPU on a
 single host) have no such requirement since all ranks share the same filesystem by
 construction.
+
+**Timeline-delta preprocessing coupling.** Finalize hardcodes
+:data:`TIMELINE_DELTA_TOKEN` = ``"TIMELINE//DELTA"`` to match the preprocessing pipeline's
+default ``add_time_derived_measurements.timeline_tokens.time_delta_code``. Overriding that
+prefix in preprocessing is not supported — :func:`_timeline_delta_seconds_per_unit` will raise
+because no codes match. See the ``TIMELINE_DELTA_TOKEN`` comment below and
+mmcdermott/MEDS_transforms#391 for the upstream follow-up.
 """
 
 import logging
@@ -379,6 +389,49 @@ def format_trajectories(
     code_metadata = _get_code_metadata(base_dataset)
     seconds_per_unit = _timeline_delta_seconds_per_unit(code_metadata)
 
+    # Explode the per-row list of tokens, strip any residual PAD_INDEX, and resolve each
+    # ``code_idx`` to a code string + ``value_mean`` via left join. ``_trim_post_pad`` already
+    # drops post-EOS padding at shard-write time; the explicit PAD filter is a belt-and-
+    # suspenders guard for any hypothetical left-padded generator.
+    with_codes = (
+        merged.explode("tokens")
+        .rename({"tokens": "code_idx"})
+        .filter(pl.col("code_idx") != MEDSTorchBatch.PAD_INDEX)
+        .join(code_metadata, on="code_idx", how="left")
+    )
+    # A null ``code`` means a generated ``code_idx`` had no row in the code-metadata parquet.
+    # In normal use this can't happen — tokens are sampled from the model's own vocabulary.
+    # When it does happen the most likely cause is a checkpoint/dataset mismatch: the
+    # generation CLI was pointed at a preprocessing output whose vocabulary doesn't line up
+    # with the one the model was trained on. Fail loudly instead of producing rows with null
+    # ``code`` that would silently pass through GeneratedTrajectorySchema.align.
+    missing_codes = with_codes.filter(pl.col("code").is_null())
+    if missing_codes.height:
+        unknown = sorted(missing_codes["code_idx"].unique().to_list())[:20]
+        raise RuntimeError(
+            f"{missing_codes.height} generated token(s) have code_idx values not present in "
+            f"the code metadata (first 20: {unknown}). This usually indicates a checkpoint / "
+            "code-metadata mismatch: the checkpoint passed to MEICAR_generate_trajectories "
+            "was trained on a different preprocessing output than the one pointed at by "
+            "``datamodule.config``."
+        )
+
+    with_rows = with_codes.join(schema_df, on="dataset_row_idx", how="left")
+    # A null ``subject_id`` after the schema join means a merged row carries a
+    # ``dataset_row_idx`` outside ``[0, len(base_dataset))``. ``finalize_predictions``'s
+    # coverage check is supposed to catch this upstream — reaching it here means
+    # ``format_trajectories`` was called directly on bad input, so the error is targeted at
+    # that path.
+    missing_rows = with_rows.filter(pl.col(DataSchema.subject_id_name).is_null())
+    if missing_rows.height:
+        unknown = sorted(missing_rows["dataset_row_idx"].unique().to_list())[:20]
+        raise RuntimeError(
+            f"{missing_rows.height} merged row(s) have dataset_row_idx values not present "
+            f"in base_dataset.schema_df (first 20: {unknown}). Expected the caller "
+            "(finalize_predictions) to have already validated coverage over "
+            "[0, len(base_dataset))."
+        )
+
     # ``TIMELINE//DELTA`` tokens increment each row's running time by
     # ``value_mean * seconds_per_unit``. The preprocessing pipeline pins a single unit across
     # the whole vocabulary (see :func:`_timeline_delta_seconds_per_unit`), so this is just a
@@ -387,15 +440,7 @@ def format_trajectories(
     # ``timedelta(seconds=float)`` precision (it truncates each step to microseconds before
     # summing).
     return (
-        merged.explode("tokens")
-        .rename({"tokens": "code_idx"})
-        # ``_trim_post_pad`` strips post-EOS padding at shard-write time, so in normal operation
-        # there should be no PAD_INDEX rows here. Filter belt-and-suspenders in case a
-        # hypothetical left-padded generator ever inserts them.
-        .filter(pl.col("code_idx") != MEDSTorchBatch.PAD_INDEX)
-        .join(code_metadata, on="code_idx", how="left")
-        .join(schema_df, on="dataset_row_idx", how="left")
-        .with_columns(
+        with_rows.with_columns(
             delta_us=pl.when(pl.col("code").str.starts_with(TIMELINE_DELTA_TOKEN))
             .then((pl.col("value_mean") * seconds_per_unit * 1_000_000).cast(pl.Int64))
             .otherwise(0)
@@ -430,10 +475,12 @@ def finalize_predictions(
     For each trajectory in ``trajectory_paths``:
 
     1. ``pl.read_parquet`` + ``pl.concat`` across all ``trajectory_{t}.rank_*.parquet``
-       rank outputs under ``rank_outputs_dir``. No sort needed — :func:`format_trajectories`
-       does a join against ``schema_df`` on ``dataset_row_idx``, so arrival order is
-       irrelevant.
-    2. Sanity check: ``len(merged) == n_dataset_rows``.
+       rank outputs under ``rank_outputs_dir``. No sort — :func:`format_trajectories` joins
+       against ``schema_df`` on ``dataset_row_idx`` and order is not semantically meaningful.
+    2. Coverage check: the merged ``dataset_row_idx`` values must equal
+       ``{0, ..., n_dataset_rows - 1}`` exactly once each. Catches duplicate/missing rows
+       with the same total count (e.g. two ranks both claiming row 0) which a pure length
+       check would silently accept.
     3. :func:`format_trajectories` on the merged DataFrame → final polars DataFrame.
     4. :class:`GeneratedTrajectorySchema.align` + ``pq.write_table`` to the trajectory's
        output path.
@@ -450,20 +497,31 @@ def finalize_predictions(
       called with an empty split.
 
     Examples:
-        Build a single-rank predict output for two base-dataset rows, merge it, and finalize
-        to a per-trajectory parquet:
+        Build per-trajectory predict outputs distributed across two ranks, merge them, and
+        finalize to a per-trajectory parquet. Each rank sees a disjoint slice of
+        ``dataset_row_idx`` — mirroring how Lightning's ``DistributedSampler`` partitions the
+        predict dataloader under DDP — and writes its own
+        ``trajectory_{t}.rank_{rank}.parquet``:
 
-        >>> preds = [
+        >>> preds_r0 = [
         ...     PredictStepOutput(
-        ...         tokens=torch.tensor([[31, 4, 14], [32, 16, 33]], dtype=torch.long),
-        ...         dataset_row_idxs=torch.tensor([0, 1]),
-        ...         trajectory_idxs=torch.tensor([0, 0]),
+        ...         tokens=torch.tensor([[31, 4, 14]], dtype=torch.long),
+        ...         dataset_row_idxs=torch.tensor([0]),
+        ...         trajectory_idxs=torch.tensor([0]),
+        ...     ),
+        ... ]
+        >>> preds_r1 = [
+        ...     PredictStepOutput(
+        ...         tokens=torch.tensor([[32, 16, 33]], dtype=torch.long),
+        ...         dataset_row_idxs=torch.tensor([1]),
+        ...         trajectory_idxs=torch.tensor([0]),
         ...     ),
         ... ]
         >>> with tempfile.TemporaryDirectory() as d:
         ...     rod = Path(d) / "_rank_outputs"
         ...     rod.mkdir()
-        ...     write_rank_output(preds, rank=0, rank_outputs_dir=rod)
+        ...     write_rank_output(preds_r0, rank=0, rank_outputs_dir=rod)
+        ...     write_rank_output(preds_r1, rank=1, rank_outputs_dir=rod)
         ...     out_fp = Path(d) / "trajectory_0.parquet"
         ...     finalize_predictions(
         ...         rank_outputs_dir=rod,
@@ -477,14 +535,70 @@ def finalize_predictions(
         (6, 5)
         >>> df.columns
         ['subject_id', 'time', 'code', 'numeric_value', 'prediction_time']
+
+        Single-rank (``world_size=1``) is the same code path with one rank file —
+        ``pl.concat`` over a one-element list is a passthrough:
+
+        >>> preds_solo = [
+        ...     PredictStepOutput(
+        ...         tokens=torch.tensor([[31, 4, 14], [32, 16, 33]], dtype=torch.long),
+        ...         dataset_row_idxs=torch.tensor([0, 1]),
+        ...         trajectory_idxs=torch.tensor([0, 0]),
+        ...     ),
+        ... ]
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     rod = Path(d) / "_rank_outputs"
+        ...     rod.mkdir()
+        ...     write_rank_output(preds_solo, rank=0, rank_outputs_dir=rod)
+        ...     out_fp = Path(d) / "trajectory_0.parquet"
+        ...     finalize_predictions(
+        ...         rank_outputs_dir=rod,
+        ...         trajectory_paths={0: out_fp},
+        ...         base_dataset=pytorch_dataset_with_task,
+        ...         n_dataset_rows=2,
+        ...         do_overwrite=True,
+        ...     )
+        ...     df = pl.read_parquet(out_fp)
+        >>> df.shape
+        (6, 5)
+
+        Duplicate or missing ``dataset_row_idx`` coverage across ranks raises a clear error
+        instead of silently producing malformed output. Here rank 1 accidentally re-claims
+        row 0, so row 1 is missing and row 0 is duplicated — the total count is still 2 and
+        would pass a naive length check:
+
+        >>> preds_r1_bad = [
+        ...     PredictStepOutput(
+        ...         tokens=torch.tensor([[5, 6, 7]], dtype=torch.long),
+        ...         dataset_row_idxs=torch.tensor([0]),
+        ...         trajectory_idxs=torch.tensor([0]),
+        ...     ),
+        ... ]
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     rod = Path(d) / "_rank_outputs"
+        ...     rod.mkdir()
+        ...     write_rank_output(preds_r0, rank=0, rank_outputs_dir=rod)
+        ...     write_rank_output(preds_r1_bad, rank=1, rank_outputs_dir=rod)
+        ...     finalize_predictions(
+        ...         rank_outputs_dir=rod,
+        ...         trajectory_paths={0: Path(d) / "bad.parquet"},
+        ...         base_dataset=pytorch_dataset_with_task,
+        ...         n_dataset_rows=2,
+        ...         do_overwrite=True,
+        ...     )
+        Traceback (most recent call last):
+            ...
+        RuntimeError: Trajectory 0: rank outputs should cover dataset_row_idx ...
+        First 20 missing: [1]; ...
     """
     for t, out_fp in trajectory_paths.items():
         if out_fp.is_file() and not do_overwrite:
             logger.info(f"Skipping {out_fp} as it already exists.")
             continue
 
-        # Glob order is unspecified. No sort needed here — ``format_trajectories`` joins by
-        # ``dataset_row_idx`` and the final output order is determined by that join.
+        # Glob order is unspecified; that's fine — ``format_trajectories`` joins by
+        # ``dataset_row_idx`` and the final output order is driven by that join, not by
+        # rank-file arrival order.
         rank_paths = list(rank_outputs_dir.glob(f"trajectory_{t}.rank_*.parquet"))
         if not rank_paths:
             raise RuntimeError(
@@ -496,12 +610,25 @@ def finalize_predictions(
             )
 
         merged = pl.concat([pl.read_parquet(p) for p in rank_paths])
-        if len(merged) != n_dataset_rows:
+        # Under DDP each rank writes a disjoint slice of dataset_row_idx; a correct merge
+        # covers ``{0, ..., n_dataset_rows - 1}`` exactly once per trajectory. A pure
+        # ``len(merged) == n_dataset_rows`` check misses duplicate/missing pairs (e.g.
+        # ``[0, 1, 1, 3]`` vs ``[0, 1, 2, 3]`` — same length, wrong coverage), so validate
+        # the set explicitly. The observed-count vs unique-count mismatch signals duplicates.
+        observed = merged["dataset_row_idx"].to_list()
+        observed_set = set(observed)
+        expected_set = set(range(n_dataset_rows))
+        if len(observed) != n_dataset_rows or observed_set != expected_set:
+            missing = sorted(expected_set - observed_set)[:20]
+            out_of_range = sorted(observed_set - expected_set)[:20]
             raise RuntimeError(
-                f"Trajectory {t}: merged row count {len(merged)} != n_dataset_rows "
-                f"{n_dataset_rows}. Check that every rank wrote its output and that no rows "
-                "were dropped upstream. Under multi-node DDP, also verify rank_outputs_dir is on "
-                "shared storage."
+                f"Trajectory {t}: rank outputs should cover dataset_row_idx exactly once "
+                f"each over {{0, ..., {n_dataset_rows - 1}}}; got {len(observed)} rows with "
+                f"{len(observed_set)} unique ids. First 20 missing: {missing}; first 20 "
+                f"out-of-range: {out_of_range}. Possible causes: (a) write_rank_output was "
+                "not run on every rank before finalize_predictions; (b) under multi-node "
+                "DDP, rank_outputs_dir is on a filesystem not visible to all ranks (e.g. "
+                "node-local scratch); (c) a rank wrote stale shards from a previous run."
             )
 
         logger.info(f"Writing trajectory {t} to {out_fp}.")

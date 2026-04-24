@@ -7,6 +7,17 @@ and the resolved Hydra config to ``output_dir`` so re-runs and post-hoc debuggin
 the invocation. Generation loads a checkpoint via ``model_initialization_dir``, runs the rolling
 sliding-window predict path, and emits per-task-sample trajectory parquets under
 ``output_dir/<split>/<sample>.parquet``.
+
+**Generation memory footprint.** The generate path currently runs ``trainer.predict(...)``,
+which fully materializes every rank's predict-step outputs in CPU memory (tokens are moved to
+CPU in ``predict_step`` before the accumulator sees them). With
+``RepeatedPredictionDataset`` that accumulation scales as
+``O(n_dataset_rows * n_trajectories_per_task_sample * generated_length)`` per rank. For large
+cohorts crossed with high trajectory counts this can become a practical ceiling before the
+shard-then-merge finalize even runs. Follow-up at mmcdermott/MEDS_EIC_AR#148 tracks a
+streaming ``BasePredictionWriter`` (or backend-native streaming) replacement; until then,
+tune ``N_trajectories_per_task_sample`` and ``inference.generate_for_splits`` to fit the
+available rank memory.
 """
 
 import logging
