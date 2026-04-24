@@ -12,8 +12,6 @@
 
 A MEDS, "Everything-is-code" style Autoregressive Generative Model, capable of zero-shot inference.
 
-This is based on the [MEDS-Torch](https://github.com/Oufattole/meds-torch) model of the same name.
-
 ## Installation
 
 ```bash
@@ -152,7 +150,14 @@ more configuration parameters than the pre-training step, so let's go through th
     splits you wish to generate samples. You can do this via the `inference.generate_for_splits` and
     `inference.N_trajectories_per_task_sample` parameters. The former is a list of splits to generate and the
     latter is the number of trajectories to generate per task sample. The default is to generate 20
-    trajectories for each task sample in the tuning and held out splits.
+    trajectories for each task sample in the tuning and held out splits. Each subject's N trajectories are
+    interleaved into a single predict pass (see [`generation/repeated_dataset.py`](src/MEDS_EIC_AR/generation/repeated_dataset.py)
+    and issue #89), rather than run as N independent passes.
+5. If your desired trajectory length exceeds the model's per-chunk context, generation automatically
+    switches to a rolling sliding-window path (see `Model._rolling_generate`). Set
+    `rolling_generation.max_new_tokens` to bound the total generated length. EOS and the step cap both
+    terminate generation early; between chunks the context is re-primed with the tail of the running
+    sequence.
 
 After these are set, you can run the following command to generate trajectories for a task cohort:
 
@@ -229,10 +234,14 @@ follows:
     ├── callbacks
     │   ├── default.yaml
     │   ├── early_stopping.yaml
+    │   ├── generation.yaml
+    │   ├── generation_speed_logger.yaml
     │   ├── learning_rate_monitor.yaml
     │   └── model_checkpoint.yaml
     ├── default.yaml
     ├── demo.yaml
+    ├── demo_generate.yaml
+    ├── generate.yaml
     └── logger
         ├── csv.yaml
         ├── mlflow.yaml
@@ -270,6 +279,14 @@ MEICAR_pretrain trainer.logger=wandb \
 
 This results in the tags `[model_size, "experiment-1"]` being sent to wandb.
 
+### Inference Backend
+
+Generation runs through a pluggable backend abstraction (`GenerationBackend` protocol in
+[`src/MEDS_EIC_AR/model/backends/`](src/MEDS_EIC_AR/model/backends/)). The default is `HFBackend`, which
+wraps `LlamaForCausalLM.generate` in-process. A non-HF backend (e.g. SGLang, in-flight at #117) can drop
+in behind the same interface without touching the rolling-generation loop or the trajectory-format
+pipeline. See issue #88 for motivation and the roadmap.
+
 ## Output Files
 
 The output files of the pre-training step are stored in the directory specified by the `output_dir` parameter
@@ -291,6 +308,7 @@ and take the following structure:
 │   ├── epoch=1-step=4.ckpt
 │   └── last.ckpt
 ├── config.yaml
+├── environment.txt
 ├── loggers
 │   └── csv
 │       └── version_0
@@ -299,3 +317,19 @@ and take the following structure:
 └── resolved_config.yaml
 
 ```
+
+The files worth calling out:
+
+- `config.yaml` — the Hydra config as-resolved at the start of the run. Used by resume to verify no
+    load-bearing param has changed.
+- `resolved_config.yaml` — the same config with Hydra interpolations resolved. Useful for comparing
+    runs and for downstream tooling that cannot resolve Hydra syntax.
+- `environment.txt` — a pip-freeze-style snapshot of the Python environment at training time
+    (Python version, platform, and every installed distribution and version), written via
+    [`save_environment_snapshot`](src/MEDS_EIC_AR/utils.py). Only written on initial run creation, not
+    on resume. Useful for reproducing a run and for tracking down environment drift between training
+    and inference.
+- `best_model.ckpt` — a copy of the best checkpoint according to the model-checkpoint callback (written
+    via `shutil.copyfile`, not a symlink, so the run directory is self-contained for rsync / archive).
+- `checkpoints/` — Lightning's per-step / per-epoch checkpoints plus `last.ckpt`.
+- `.logs/.hydra/` — Hydra's run metadata.

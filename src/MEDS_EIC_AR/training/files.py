@@ -13,6 +13,12 @@ ALLOWED_DIFFERENCE_KEYS = {
     "trainer.callbacks.model_checkpoint.dirpath",
     "trainer.default_root_dir",
     "log_dir",
+    # Cadence knobs — changing these across a resume is a legitimate workflow (shorter-than-planned
+    # val cadence during early debug, tightening once the run stabilizes, etc.) and doesn't affect
+    # the parameters or the loss/metric definitions, just *when* we log/validate. Safe to diverge.
+    "trainer.val_check_interval",
+    "trainer.check_val_every_n_epoch",
+    "trainer.log_every_n_steps",
 }
 
 STR_ENUM_PARAMS = {
@@ -198,6 +204,27 @@ def validate_resume_directory(output_dir: Path, cfg: DictConfig):
         Traceback (most recent call last):
             ...
         FileNotFoundError: Configuration file /tmp/tmp.../config.yaml does not exist in the output directory.
+
+    Cadence knobs (``val_check_interval``, ``check_val_every_n_epoch``, ``log_every_n_steps``) are
+    allowed to diverge across a resume — changing these doesn't affect the parameters or the
+    metric definitions, just *when* we log/validate, and adjusting them mid-run (e.g. tightening
+    validation cadence once a long training stabilizes) is a legitimate workflow:
+
+        >>> disk = '''
+        ...   config.yaml:
+        ...     max_seq_len: 10
+        ...     do_resume: false
+        ...     trainer:
+        ...       val_check_interval: 0.2
+        ...       log_every_n_steps: 50
+        ... '''
+        >>> input_cfg = DictConfig({
+        ...     "max_seq_len": 10,
+        ...     "do_resume": True,
+        ...     "trainer": {"val_check_interval": 1.0, "log_every_n_steps": 10},
+        ... })
+        >>> with yaml_disk(disk) as output_dir:
+        ...     validate_resume_directory(output_dir, input_cfg)  # no error
     """
     old_cfg_fp = output_dir / "config.yaml"
     if not old_cfg_fp.is_file():
@@ -253,6 +280,7 @@ def find_checkpoint_path(output_dir: Path) -> Path | None:
         │   ├── epoch=1-step=4.ckpt
         │   └── last.ckpt
         ├── config.yaml
+        ├── environment.txt
         ├── loggers
         │   └── csv
         │       └── version_0

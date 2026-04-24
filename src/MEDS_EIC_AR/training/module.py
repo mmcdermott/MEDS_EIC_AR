@@ -1,3 +1,11 @@
+"""PyTorch Lightning module for the MEDS-EIC-AR autoregressive model.
+
+:class:`MEICARModule` wraps :class:`~MEDS_EIC_AR.model.Model` and owns the optimizer / LR scheduler
+construction, the next-code metric collection, the resume-safe config fingerprinting, and the
+interleaved N-sample predict path that feeds :mod:`MEDS_EIC_AR.generation`. See
+:mod:`MEDS_EIC_AR.training` README for a higher-level overview.
+"""
+
 import copy
 import logging
 import re
@@ -13,6 +21,7 @@ from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from ..generation.repeated_dataset import PredictBatch, PredictStepOutput
 from ..model import Model
 from .metrics import NextCodeMetrics
 
@@ -267,6 +276,20 @@ class MEICARModule(L.LightningModule):
     def _is_norm_bias_param(n: str) -> bool:
         """Checks if a parameter name corresponds to a bias or normalization layer.
 
+        Standard AdamW practice: bias parameters and the gain parameters of normalization layers
+        (LayerNorm / RMSNorm) should not receive weight decay — they have different geometry from
+        linear weights, and decaying them pulls normalizations toward collapse. The optimizer groups
+        everything matching this predicate into a no-decay group.
+
+        The regex matches ``bias`` anywhere in the name plus any weight whose last component looks
+        like an optional ``layer_?`` prefix followed by ``norm`` (with optional trailing digits).
+        That covers Llama's RMSNorm names (``input_layernorm.weight``, ``post_attention_layernorm.weight``,
+        and the final ``model.norm.weight``) as well as LayerNorm-style names a different HF
+        architecture might expose. Llama has no biases by default (``attention_bias=False``, MLP/LM-
+        head biases absent), so in practice the ``bias`` branch is dormant for the current base — it
+        stays in the regex as cheap insurance for callers who override ``attention_bias=True`` or
+        swap to a bias-enabled architecture.
+
         Args:
             n: The name of the parameter.
 
@@ -282,10 +305,12 @@ class MEICARModule(L.LightningModule):
             True
             >>> MEICARModule._is_norm_bias_param("model.decoder.weight")
             False
-            >>> MEICARModule._is_norm_bias_param("model.HF_model.gpt_neox.final_layer_norm.weight")
+            >>> MEICARModule._is_norm_bias_param("model.HF_model.model.layers.0.input_layernorm.weight")
+            True
+            >>> MEICARModule._is_norm_bias_param("model.HF_model.model.norm.weight")
             True
         """
-        return bool(re.search(r"(bias|layer(_?)norm(\d*)\.weight)", n, re.IGNORECASE))
+        return bool(re.search(r"(bias|(layer_?)?norm(\d*)\.weight)", n, re.IGNORECASE))
 
     def _norm_bias_param_names(self) -> Iterator[str]:
         """Yields the names of parameters corresponding to the bias and normalization layers.
@@ -293,25 +318,17 @@ class MEICARModule(L.LightningModule):
         These parameters should not be subject to weight decay by the optimizer.
 
         Examples:
+            Llama has no biases by default (``attention_bias=False``, MLP/LM-head biases absent) and
+            uses RMSNorm, so the only matches are the two norm weights per layer
+            (``input_layernorm.weight`` + ``post_attention_layernorm.weight``) plus the final
+            ``model.norm.weight``:
+
             >>> list(pretrained_module._norm_bias_param_names())
-            ['model.HF_model.gpt_neox.layers.0.input_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.0.input_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.0.post_attention_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.0.post_attention_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.0.attention.query_key_value.bias',
-             'model.HF_model.gpt_neox.layers.0.attention.dense.bias',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_h_to_4h.bias',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_4h_to_h.bias',
-             'model.HF_model.gpt_neox.layers.1.input_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.1.input_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.1.post_attention_layernorm.weight',
-             'model.HF_model.gpt_neox.layers.1.post_attention_layernorm.bias',
-             'model.HF_model.gpt_neox.layers.1.attention.query_key_value.bias',
-             'model.HF_model.gpt_neox.layers.1.attention.dense.bias',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_h_to_4h.bias',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_4h_to_h.bias',
-             'model.HF_model.gpt_neox.final_layer_norm.weight',
-             'model.HF_model.gpt_neox.final_layer_norm.bias']
+            ['model.HF_model.model.layers.0.input_layernorm.weight',
+             'model.HF_model.model.layers.0.post_attention_layernorm.weight',
+             'model.HF_model.model.layers.1.input_layernorm.weight',
+             'model.HF_model.model.layers.1.post_attention_layernorm.weight',
+             'model.HF_model.model.norm.weight']
         """
 
         for name, _ in self.named_parameters():
@@ -330,17 +347,28 @@ class MEICARModule(L.LightningModule):
         These parameters should be subject to weight decay by the optimizer.
 
         Examples:
+            Under Llama the non-norm/bias params are the token embedding, the four attention
+            projections (``q_proj``/``k_proj``/``v_proj``/``o_proj``) per layer, the three
+            SwiGLU MLP projections (``gate_proj``/``up_proj``/``down_proj``) per layer, and the
+            output ``lm_head`` — no fused ``query_key_value``, no biases:
+
             >>> list(pretrained_module._non_norm_bias_param_names())
-            ['model.HF_model.gpt_neox.embed_in.weight',
-             'model.HF_model.gpt_neox.layers.0.attention.query_key_value.weight',
-             'model.HF_model.gpt_neox.layers.0.attention.dense.weight',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_h_to_4h.weight',
-             'model.HF_model.gpt_neox.layers.0.mlp.dense_4h_to_h.weight',
-             'model.HF_model.gpt_neox.layers.1.attention.query_key_value.weight',
-             'model.HF_model.gpt_neox.layers.1.attention.dense.weight',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_h_to_4h.weight',
-             'model.HF_model.gpt_neox.layers.1.mlp.dense_4h_to_h.weight',
-             'model.HF_model.embed_out.weight']
+            ['model.HF_model.model.embed_tokens.weight',
+             'model.HF_model.model.layers.0.self_attn.q_proj.weight',
+             'model.HF_model.model.layers.0.self_attn.k_proj.weight',
+             'model.HF_model.model.layers.0.self_attn.v_proj.weight',
+             'model.HF_model.model.layers.0.self_attn.o_proj.weight',
+             'model.HF_model.model.layers.0.mlp.gate_proj.weight',
+             'model.HF_model.model.layers.0.mlp.up_proj.weight',
+             'model.HF_model.model.layers.0.mlp.down_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.q_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.k_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.v_proj.weight',
+             'model.HF_model.model.layers.1.self_attn.o_proj.weight',
+             'model.HF_model.model.layers.1.mlp.gate_proj.weight',
+             'model.HF_model.model.layers.1.mlp.up_proj.weight',
+             'model.HF_model.model.layers.1.mlp.down_proj.weight',
+             'model.HF_model.lm_head.weight']
         """
 
         for name, _ in self.named_parameters():
@@ -447,13 +475,34 @@ class MEICARModule(L.LightningModule):
 
         return {"optimizer": optimizer, "lr_scheduler": LR_config}
 
-    def predict_step(self, batch: MEDSTorchBatch):
-        """Produces generated trajectories for a given batch of data.
+    def predict_step(self, batch: PredictBatch) -> PredictStepOutput:
+        """Produce generated trajectories for one predict batch.
 
-        Any keyword arguments stashed on ``self.generation_kwargs`` (typically set from the top-level
-        ``generate_trajectories`` CLI before ``trainer.predict`` is invoked) are forwarded to
-        :meth:`MEDS_EIC_AR.model.model.Model.generate`. This is how rolling-generation settings such as
-        ``max_new_tokens`` and ``rolling_context_size`` reach the model at prediction time without going
-        through the saved Lightning hparams.
+        Expects the :data:`PredictBatch` shape yielded by
+        :func:`MEDS_EIC_AR.generation.collate_with_meta` — a three-tuple
+        ``(batch, dataset_row_idxs, trajectory_idxs)`` — as produced by the expanded dataset that
+        ``MEICAR_generate_trajectories`` builds. The bare-``MEDSTorchBatch`` form supported by the
+        prior iteration is no longer accepted; callers wanting a single trajectory per subject
+        should set ``n_trajectories=1`` on :class:`RepeatedPredictionDataset`, which still yields
+        this tuple shape (just with a trivial ``trajectory_idxs`` axis).
+
+        Any keyword arguments stashed on ``self.generation_kwargs`` (typically set from the
+        top-level ``generate_trajectories`` CLI before ``trainer.predict`` is invoked) are
+        forwarded to :meth:`MEDS_EIC_AR.model.model.Model.generate`. This is how
+        rolling-generation settings such as ``max_new_tokens`` and ``rolling_context_size`` reach
+        the model at prediction time without going through the saved Lightning hparams.
+
+        Returns a :class:`~MEDS_EIC_AR.generation.PredictStepOutput` whose fields are documented on
+        the ``NamedTuple`` itself. All three tensors are detached and moved to CPU before returning —
+        ``Trainer.predict`` accumulates per-batch returns in a Python list across the entire
+        predict run (scaled by ``n_trajectories`` via the expanded dataset), so leaving them on-
+        device would pin per-batch GPU allocations for the full pass and OOM on non-trivial
+        cohorts. Downstream finalize runs on CPU anyway.
         """
-        return self.model.generate(batch, **self.generation_kwargs)
+        mdata_batch, dataset_row_idxs, trajectory_idxs = batch
+        tokens = self.model.generate(mdata_batch, **self.generation_kwargs)
+        return PredictStepOutput(
+            tokens=tokens.detach().cpu(),
+            dataset_row_idxs=dataset_row_idxs.detach().cpu(),
+            trajectory_idxs=trajectory_idxs.detach().cpu(),
+        )

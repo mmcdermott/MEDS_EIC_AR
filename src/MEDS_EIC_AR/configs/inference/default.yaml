@@ -3,3 +3,8 @@ generate_for_splits:
   - held_out
 
 N_trajectories_per_task_sample: 20
+
+# Forwarded to ``Model.generate(do_sample=...)``. Default ``true`` matches production use
+# (stochastic sampling for trajectory diversity). Set ``false`` for greedy argmax decoding —
+# useful for correctness regression tests where non-determinism would obscure the signal.
+do_sample: true

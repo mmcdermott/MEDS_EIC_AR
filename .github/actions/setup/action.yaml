@@ -9,6 +9,10 @@ inputs:
     description: The dependency group to install (benchmarks, dev, docs)
     required: false
     default: "dev"
+  extras:
+    description: Space-separated list of optional-dependency extras to install (e.g., "mlflow wandb").
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -20,9 +24,13 @@ runs:
       uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
-        cache-suffix: "py${{ inputs.python-version }}"
+        cache-suffix: "py${{ inputs.python-version }}${{ inputs.extras && format('-{0}', inputs.extras) || '' }}"
 
     - name: Install packages
       shell: bash
       run: |
-        uv sync --locked --group ${{ inputs.group }}
+        extras_args=""
+        for extra in ${{ inputs.extras }}; do
+          extras_args="$extras_args --extra $extra"
+        done
+        uv sync --locked --group ${{ inputs.group }} $extras_args

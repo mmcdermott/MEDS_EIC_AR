@@ -256,3 +256,76 @@ def test_rolling_generate_respects_budget(rolling_model: Model, rolling_batch: M
         assert out.shape[1] <= budget, (
             f"Output length {out.shape[1]} exceeds max_new_tokens={budget} with rolling_context_size={ctx}."
         )
+
+
+# ---------------------------------------------------------------------------
+# Direct unit tests on RepeatedPredictionDataset + collate_with_meta (#89)
+# ---------------------------------------------------------------------------
+
+
+def test_collate_with_meta_round_trip_through_dataloader():
+    """Run the expanded dataset through a real DataLoader and confirm the per-row metadata is yielded
+    alongside the base batch and unscrambles back to the right ``(dataset_row_idx, trajectory_idx)`` indices.
+
+    This is the wire-up test for the issue #89 path: ``RepeatedPredictionDataset`` →
+    ``collate_with_meta`` → destructure-tuple is the chain ``predict_step`` and the regrouping
+    code in ``MEICAR_generate_trajectories`` rely on, so it's worth testing end-to-end with a
+    real dataloader rather than just calling the helpers in isolation.
+    """
+    from functools import partial
+
+    from torch.utils.data import DataLoader
+
+    from MEDS_EIC_AR.generation.repeated_dataset import (
+        RepeatedPredictionDataset,
+        collate_with_meta,
+    )
+
+    # Build a fake dataset whose items are MEDSTorchBatch-shaped (single-row) and whose ``code``
+    # encodes the dataset_row_idx so we can verify which underlying base item each row came from.
+    class FakeBaseDataset:
+        def __init__(self, n: int) -> None:
+            self.n = n
+
+        def __len__(self) -> int:
+            return self.n
+
+        def __getitem__(self, i: int) -> torch.Tensor:
+            return torch.tensor([i, 100 + i, 200 + i], dtype=torch.long)
+
+        def collate(self, items):
+            codes = torch.stack(items, dim=0)
+            return Mock(code=codes, PAD_INDEX=0, mode="SM")
+
+    base = FakeBaseDataset(n=3)
+    n_trajectories = 4
+    expanded = RepeatedPredictionDataset(base, n_trajectories=n_trajectories)
+    loader = DataLoader(
+        expanded,
+        # batch_size deliberately not a multiple of n_trajectories so we hit a cross-subject batch
+        batch_size=5,
+        shuffle=False,
+        collate_fn=partial(collate_with_meta, base_collate=base.collate),
+    )
+
+    all_dataset_row_idxs: list[int] = []
+    all_trajectory_idxs: list[int] = []
+    all_first_codes: list[int] = []
+    for yielded in loader:
+        # ``collate_with_meta`` returns a three-tuple; Lightning passes whatever the dataloader
+        # yields straight through to ``predict_step``, which destructures it the same way.
+        batch, dataset_row_idxs, trajectory_idxs = yielded
+        assert dataset_row_idxs.shape == (batch.code.shape[0],)
+        assert trajectory_idxs.shape == (batch.code.shape[0],)
+        all_dataset_row_idxs.extend(dataset_row_idxs.tolist())
+        all_trajectory_idxs.extend(trajectory_idxs.tolist())
+        all_first_codes.extend(batch.code[:, 0].tolist())
+
+    # 3 base-dataset rows * 4 trajectories = 12 rows total, in dataset-row-changes-slow order.
+    expected_dataset_row_idxs = [s for s in range(3) for _ in range(n_trajectories)]
+    expected_trajectory_idxs = [k for _ in range(3) for k in range(n_trajectories)]
+    # The fake dataset returns code[0] = dataset_row_idx for whichever base item is being rendered,
+    # so the per-row first code should equal the dataset_row_idx that row carries.
+    assert all_dataset_row_idxs == expected_dataset_row_idxs
+    assert all_trajectory_idxs == expected_trajectory_idxs
+    assert all_first_codes == expected_dataset_row_idxs
