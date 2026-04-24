@@ -639,19 +639,34 @@ def finalize_predictions(
         all_in_range = observed_min >= 0 and observed_max < n_dataset_rows
         observed_unique_count = observed.n_unique()
         if observed_count != n_dataset_rows or not all_in_range or observed_unique_count != n_dataset_rows:
-            # Failure path — OK to allocate filtered frames and Python sets; run is dying.
-            out_of_range = sorted(
-                observed.filter((observed < 0) | (observed >= n_dataset_rows)).unique().to_list()
-            )[:20]
-            in_range_observed = set(
-                observed.filter((observed >= 0) & (observed < n_dataset_rows)).unique().to_list()
+            # Failure path — keep diagnostics bounded so a very large cohort can still raise
+            # a clear error rather than cascading into an OOM. Don't build a Python ``set`` of
+            # all ``n_dataset_rows`` ids; instead, sort the unique in-range observed ids and
+            # scan them for gaps, stopping after the first 20. Out-of-range sampling uses
+            # polars' own ``.head(20)`` for the same reason.
+            out_of_range = (
+                observed.filter((observed < 0) | (observed >= n_dataset_rows))
+                .unique()
+                .sort()
+                .head(20)
+                .to_list()
+            )
+            in_range_unique_sorted = (
+                observed.filter((observed >= 0) & (observed < n_dataset_rows)).unique().sort()
             )
             missing: list[int] = []
-            for i in range(n_dataset_rows):
-                if i not in in_range_observed:
-                    missing.append(i)
-                    if len(missing) >= 20:
-                        break
+            next_expected = 0
+            for idx_val in in_range_unique_sorted:
+                idx_val = int(idx_val)
+                while next_expected < idx_val and len(missing) < 20:
+                    missing.append(next_expected)
+                    next_expected += 1
+                if len(missing) >= 20:
+                    break
+                next_expected = idx_val + 1
+            while next_expected < n_dataset_rows and len(missing) < 20:
+                missing.append(next_expected)
+                next_expected += 1
             raise RuntimeError(
                 f"Trajectory {t}: rank outputs should cover dataset_row_idx exactly once "
                 f"each over {{0, ..., {n_dataset_rows - 1}}}; got {observed_count} rows with "
