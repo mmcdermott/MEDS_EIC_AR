@@ -13,8 +13,9 @@ Groups of helpers in this module:
   ``output_dir`` on initial run creation (not on resume), capturing Python version, platform, and every
   installed distribution and version. See issue #24 / PR #129.
 - **Resolved-config persistence** (``save_resolved_config``).
-- **Logger detection** (``is_mlflow_logger``) — mlflow-optional-import-safe predicate used by the
-  training hooks that need to know if they should do MLflow-specific things.
+- **Logger detection** (``is_mlflow_logger``, ``is_wandb_logger``) — optional-import-safe predicates
+  used by the training hooks and by ``save_logger_run_ids`` to route each attached logger to its
+  backend-specific run-id save path.
 """
 
 import logging

@@ -23,7 +23,6 @@ from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch, MEDSTorchDataConfig
-from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
