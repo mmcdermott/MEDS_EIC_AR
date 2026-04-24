@@ -653,11 +653,13 @@ def finalize_predictions(
         all_in_range = observed_min >= 0 and observed_max < n_dataset_rows
         observed_unique_count = observed.n_unique()
         if observed_count != n_dataset_rows or not all_in_range or observed_unique_count != n_dataset_rows:
-            # Failure path — keep diagnostics bounded in both memory AND time so a large
-            # cohort can still raise a clear error. Use a polars anti-join against the
-            # expected ``[0, n_dataset_rows)`` range to compute missing ids vectorized
-            # (O(N) polars, not O(N) Python), rather than a Python-level scan that could
-            # drag for ~10M iterations when e.g. only the final id is missing.
+            # Failure path — keep diagnostics bounded in both memory AND time on very large
+            # cohorts so a coverage miss can still raise a clear error rather than cascading
+            # into an OOM. Don't allocate a full ``pl.int_range(0, n_dataset_rows)`` expected
+            # column (that doubles the peak footprint on top of ``observed``). Instead sort
+            # the unique in-range observed ids once and derive the missing ids from the
+            # gaps between consecutive values — vectorized on the polars side via ``shift`` +
+            # filter, then expand only the first 20 in Python.
             out_of_range = (
                 observed.filter((observed < 0) | (observed >= n_dataset_rows))
                 .unique()
@@ -665,18 +667,32 @@ def finalize_predictions(
                 .head(20)
                 .to_list()
             )
-            in_range_observed_df = (
-                observed.filter((observed >= 0) & (observed < n_dataset_rows))
-                .unique()
-                .to_frame("dataset_row_idx")
+            sorted_in_range = observed.filter((observed >= 0) & (observed < n_dataset_rows)).unique().sort()
+            # Each consecutive pair ``(prev, curr)`` with ``curr - prev > 1`` brackets a run
+            # of missing ids ``(prev + 1, ..., curr - 1)``. ``shift(1, fill_value=-1)``
+            # supplies the sentinel so the leading gap ``[0, sorted_in_range[0])`` is
+            # captured too; ``head(20)`` caps the number of gap intervals we'll expand.
+            gap_intervals = (
+                sorted_in_range.to_frame("curr")
+                .with_columns(prev=pl.col("curr").shift(1, fill_value=-1))
+                .filter(pl.col("curr") - pl.col("prev") > 1)
+                .head(20)
             )
-            expected_df = pl.select(dataset_row_idx=pl.int_range(0, n_dataset_rows, dtype=pl.Int64))
-            missing = (
-                expected_df.join(in_range_observed_df, on="dataset_row_idx", how="anti")
-                .sort("dataset_row_idx")
-                .head(20)["dataset_row_idx"]
-                .to_list()
-            )
+            missing: list[int] = []
+            for row in gap_intervals.iter_rows(named=True):
+                gap_start = row["prev"] + 1
+                while gap_start < row["curr"] and len(missing) < 20:
+                    missing.append(gap_start)
+                    gap_start += 1
+                if len(missing) >= 20:
+                    break
+            # Trailing gap: ids beyond the max observed in-range id.
+            if len(missing) < 20:
+                last_observed = sorted_in_range.last() if sorted_in_range.len() > 0 else -1
+                trailing_start = last_observed + 1
+                while trailing_start < n_dataset_rows and len(missing) < 20:
+                    missing.append(trailing_start)
+                    trailing_start += 1
             raise RuntimeError(
                 f"Trajectory {t}: rank outputs should cover dataset_row_idx exactly once "
                 f"each over {{0, ..., {n_dataset_rows - 1}}}; got {observed_count} rows with "
