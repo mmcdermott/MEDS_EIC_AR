@@ -23,6 +23,13 @@ from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch, MEDSTorchDataConfig
+
+# ``load_yaml_file`` is imported for its side effect — it is decorated with ``@OmegaConfResolver``
+# and importing the symbol registers the ``load_yaml_file`` OmegaConf interpolation used by
+# ``src/MEDS_EIC_AR/configs/_generate_trajectories.yaml`` (``${load_yaml_file:...}``). Do not remove
+# as "unused": static analysis can't see the config-side reference and dropping the import breaks
+# generation CLI startup with ``UnsupportedInterpolationType``.
+from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
