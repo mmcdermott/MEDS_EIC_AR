@@ -634,16 +634,30 @@ def finalize_predictions(
         # materialize the out-of-range / missing samples for the error message.
         observed = merged["dataset_row_idx"]
         observed_count = observed.len()
+        # Guard before ``min``/``max`` — those return ``None`` on an all-null (or empty)
+        # column, which would otherwise raise a confusing ``TypeError`` from the
+        # comparisons below. ``dataset_row_idx`` nulls shouldn't happen (``write_rank_output``
+        # writes concrete Int64 indices), but if they do we want a clear diagnostic instead
+        # of the interpreter-level error.
+        observed_null_count = observed.null_count()
+        if observed_null_count:
+            raise RuntimeError(
+                f"Trajectory {t}: merged rank outputs contain {observed_null_count} null "
+                "dataset_row_idx value(s) out of "
+                f"{observed_count}. This should never happen — write_rank_output always "
+                "emits concrete Int64 indices. Likely indicates corruption in the rank "
+                "output parquets under rank_outputs_dir."
+            )
         observed_min = observed.min() if observed_count else 0
         observed_max = observed.max() if observed_count else -1
         all_in_range = observed_min >= 0 and observed_max < n_dataset_rows
         observed_unique_count = observed.n_unique()
         if observed_count != n_dataset_rows or not all_in_range or observed_unique_count != n_dataset_rows:
-            # Failure path — keep diagnostics bounded so a very large cohort can still raise
-            # a clear error rather than cascading into an OOM. Don't build a Python ``set`` of
-            # all ``n_dataset_rows`` ids; instead, sort the unique in-range observed ids and
-            # scan them for gaps, stopping after the first 20. Out-of-range sampling uses
-            # polars' own ``.head(20)`` for the same reason.
+            # Failure path — keep diagnostics bounded in both memory AND time so a large
+            # cohort can still raise a clear error. Use a polars anti-join against the
+            # expected ``[0, n_dataset_rows)`` range to compute missing ids vectorized
+            # (O(N) polars, not O(N) Python), rather than a Python-level scan that could
+            # drag for ~10M iterations when e.g. only the final id is missing.
             out_of_range = (
                 observed.filter((observed < 0) | (observed >= n_dataset_rows))
                 .unique()
@@ -651,22 +665,18 @@ def finalize_predictions(
                 .head(20)
                 .to_list()
             )
-            in_range_unique_sorted = (
-                observed.filter((observed >= 0) & (observed < n_dataset_rows)).unique().sort()
+            in_range_observed_df = (
+                observed.filter((observed >= 0) & (observed < n_dataset_rows))
+                .unique()
+                .to_frame("dataset_row_idx")
             )
-            missing: list[int] = []
-            next_expected = 0
-            for idx_val in in_range_unique_sorted:
-                idx_val = int(idx_val)
-                while next_expected < idx_val and len(missing) < 20:
-                    missing.append(next_expected)
-                    next_expected += 1
-                if len(missing) >= 20:
-                    break
-                next_expected = idx_val + 1
-            while next_expected < n_dataset_rows and len(missing) < 20:
-                missing.append(next_expected)
-                next_expected += 1
+            expected_df = pl.select(dataset_row_idx=pl.int_range(0, n_dataset_rows, dtype=pl.Int64))
+            missing = (
+                expected_df.join(in_range_observed_df, on="dataset_row_idx", how="anti")
+                .sort("dataset_row_idx")
+                .head(20)["dataset_row_idx"]
+                .to_list()
+            )
             raise RuntimeError(
                 f"Trajectory {t}: rank outputs should cover dataset_row_idx exactly once "
                 f"each over {{0, ..., {n_dataset_rows - 1}}}; got {observed_count} rows with "
