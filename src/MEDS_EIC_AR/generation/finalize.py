@@ -391,57 +391,22 @@ def format_trajectories(
     code_metadata = _get_code_metadata(base_dataset)
     seconds_per_unit = _timeline_delta_seconds_per_unit(code_metadata)
 
-    # Explode the per-row list of tokens, strip any residual PAD_INDEX, and resolve each
-    # ``code_idx`` to a code string + ``value_mean`` via left join. ``_trim_post_pad`` already
-    # drops post-EOS padding at shard-write time; the explicit PAD filter is a belt-and-
-    # suspenders guard for any hypothetical left-padded generator.
     with_codes = (
         merged.explode("tokens")
         .rename({"tokens": "code_idx"})
         .filter(pl.col("code_idx") != MEDSTorchBatch.PAD_INDEX)
         .join(code_metadata, on="code_idx", how="left")
     )
-    # A null ``code`` means a generated ``code_idx`` had no row in the code-metadata parquet.
-    # In normal use this can't happen — tokens are sampled from the model's own vocabulary.
-    # When it does happen the most likely cause is a checkpoint/dataset mismatch: the
-    # generation CLI was pointed at a preprocessing output whose vocabulary doesn't line up
-    # with the one the model was trained on. Fail loudly instead of producing rows with null
-    # ``code`` that would silently pass through GeneratedTrajectorySchema.align. Gate on a
-    # scalar ``null_count()`` so the happy path avoids allocating a filtered frame.
+    # Null ``code`` means a generated token has no row in the code-metadata parquet —
+    # almost always a checkpoint/dataset vocab mismatch.
     missing_code_count = with_codes["code"].null_count()
     if missing_code_count:
-        missing_codes = with_codes.filter(pl.col("code").is_null())
-        unknown = sorted(missing_codes["code_idx"].unique().to_list())[:20]
+        unknown = sorted(with_codes.filter(pl.col("code").is_null())["code_idx"].unique().to_list())[:20]
         raise RuntimeError(
-            f"{missing_code_count} generated token(s) have code_idx values not present in "
-            f"the code metadata (first 20: {unknown}). This usually indicates a checkpoint / "
-            "code-metadata mismatch: the checkpoint passed to MEICAR_generate_trajectories "
-            "was trained on a different preprocessing output than the one pointed at by "
-            "``datamodule.config``."
-        )
-
-    with_rows = with_codes.join(schema_df, on="dataset_row_idx", how="left")
-    # A null ``subject_id`` after the schema join means a merged row carries a
-    # ``dataset_row_idx`` outside ``[0, len(base_dataset))``. ``finalize_predictions``'s
-    # coverage check is supposed to catch this upstream — reaching it here means
-    # ``format_trajectories`` was called directly on bad input, so the error is targeted at
-    # that path. Same scalar-gate pattern — especially important here because ``with_rows``
-    # is post-``explode`` and can be very large.
-    missing_subject_id_count = with_rows[DataSchema.subject_id_name].null_count()
-    if missing_subject_id_count:
-        missing_rows = with_rows.filter(pl.col(DataSchema.subject_id_name).is_null())
-        # ``missing_subject_id_count`` counts *token* rows, not base-dataset rows —
-        # a single bad ``dataset_row_idx`` with many tokens would inflate the number.
-        # Report the unique-id count alongside the raw token-row count so both signals
-        # are visible.
-        unknown_ids = sorted(missing_rows["dataset_row_idx"].unique().to_list())[:20]
-        n_unknown_ids = missing_rows["dataset_row_idx"].n_unique()
-        raise RuntimeError(
-            f"{n_unknown_ids} unresolved dataset_row_idx value(s) across "
-            f"{missing_subject_id_count} token-row(s) (first 20 ids: {unknown_ids}). These "
-            "are not present in base_dataset.schema_df — expected the caller "
-            "(finalize_predictions) to have already validated coverage over "
-            "[0, len(base_dataset))."
+            f"{missing_code_count} generated token(s) have code_idx values not in the code "
+            f"metadata (first 20: {unknown}). Likely a checkpoint/dataset vocab mismatch: "
+            "the checkpoint was trained on a different preprocessing output than "
+            "``datamodule.config`` points at."
         )
 
     # ``TIMELINE//DELTA`` tokens increment each row's running time by
@@ -452,7 +417,8 @@ def format_trajectories(
     # ``timedelta(seconds=float)`` precision (it truncates each step to microseconds before
     # summing).
     return (
-        with_rows.with_columns(
+        with_codes.join(schema_df, on="dataset_row_idx", how="left")
+        .with_columns(
             delta_us=pl.when(pl.col("code").str.starts_with(TIMELINE_DELTA_TOKEN))
             .then((pl.col("value_mean") * seconds_per_unit * 1_000_000).cast(pl.Int64))
             .otherwise(0)
@@ -600,17 +566,13 @@ def finalize_predictions(
         ...     )
         Traceback (most recent call last):
             ...
-        RuntimeError: Trajectory 0: rank outputs should cover dataset_row_idx ...
-        First 20 missing: [1]; ...
+        RuntimeError: Trajectory 0: rank outputs should cover dataset_row_idx exactly once ...
     """
     for t, out_fp in trajectory_paths.items():
         if out_fp.is_file() and not do_overwrite:
             logger.info(f"Skipping {out_fp} as it already exists.")
             continue
 
-        # Glob order is unspecified; that's fine — ``format_trajectories`` joins by
-        # ``dataset_row_idx`` and the final output order is driven by that join, not by
-        # rank-file arrival order.
         rank_paths = list(rank_outputs_dir.glob(f"trajectory_{t}.rank_*.parquet"))
         if not rank_paths:
             raise RuntimeError(
@@ -622,85 +584,22 @@ def finalize_predictions(
             )
 
         merged = pl.concat([pl.read_parquet(p) for p in rank_paths])
-        # Under DDP each rank writes a disjoint slice of dataset_row_idx; a correct merge
-        # covers ``{0, ..., n_dataset_rows - 1}`` exactly once per trajectory. A pure
-        # ``len(merged) == n_dataset_rows`` check misses duplicate/missing pairs (e.g.
-        # ``[0, 1, 1, 3]`` vs ``[0, 1, 2, 3]`` — same length, wrong coverage). Validate the
-        # three failure modes (wrong count / out-of-range / duplicate) using scalar
-        # aggregates only: ``min``/``max`` for range, ``n_unique`` for duplicates. That
-        # avoids allocating a filtered frame or a ``set(range(n_dataset_rows))`` on the
-        # happy path — for 10M+ row cohorts those allocations alone would cost hundreds of
-        # MB of transient overhead stacked on ``merged``. Only on the failure branch do we
-        # materialize the out-of-range / missing samples for the error message.
+        # Coverage check: merged dataset_row_idx values must be exactly ``{0, ..., n-1}``.
+        # Length + unique + min + max is sufficient: n distinct integers in ``[0, n-1]``
+        # must be that set. No intermediate frame allocation.
         observed = merged["dataset_row_idx"]
-        observed_count = observed.len()
-        # Guard before ``min``/``max`` — those return ``None`` on an all-null (or empty)
-        # column, which would otherwise raise a confusing ``TypeError`` from the
-        # comparisons below. ``dataset_row_idx`` nulls shouldn't happen (``write_rank_output``
-        # writes concrete Int64 indices), but if they do we want a clear diagnostic instead
-        # of the interpreter-level error.
-        observed_null_count = observed.null_count()
-        if observed_null_count:
-            raise RuntimeError(
-                f"Trajectory {t}: merged rank outputs contain {observed_null_count} null "
-                "dataset_row_idx value(s) out of "
-                f"{observed_count}. This should never happen — write_rank_output always "
-                "emits concrete Int64 indices. Likely indicates corruption in the rank "
-                "output parquets under rank_outputs_dir."
-            )
-        observed_min = observed.min() if observed_count else 0
-        observed_max = observed.max() if observed_count else -1
-        all_in_range = observed_min >= 0 and observed_max < n_dataset_rows
-        observed_unique_count = observed.n_unique()
-        if observed_count != n_dataset_rows or not all_in_range or observed_unique_count != n_dataset_rows:
-            # Failure path — keep diagnostics bounded in both memory AND time on very large
-            # cohorts so a coverage miss can still raise a clear error rather than cascading
-            # into an OOM. Don't allocate a full ``pl.int_range(0, n_dataset_rows)`` expected
-            # column (that doubles the peak footprint on top of ``observed``). Instead sort
-            # the unique in-range observed ids once and derive the missing ids from the
-            # gaps between consecutive values — vectorized on the polars side via ``shift`` +
-            # filter, then expand only the first 20 in Python.
-            out_of_range = (
-                observed.filter((observed < 0) | (observed >= n_dataset_rows))
-                .unique()
-                .sort()
-                .head(20)
-                .to_list()
-            )
-            sorted_in_range = observed.filter((observed >= 0) & (observed < n_dataset_rows)).unique().sort()
-            # Each consecutive pair ``(prev, curr)`` with ``curr - prev > 1`` brackets a run
-            # of missing ids ``(prev + 1, ..., curr - 1)``. ``shift(1, fill_value=-1)``
-            # supplies the sentinel so the leading gap ``[0, sorted_in_range[0])`` is
-            # captured too; ``head(20)`` caps the number of gap intervals we'll expand.
-            gap_intervals = (
-                sorted_in_range.to_frame("curr")
-                .with_columns(prev=pl.col("curr").shift(1, fill_value=-1))
-                .filter(pl.col("curr") - pl.col("prev") > 1)
-                .head(20)
-            )
-            missing: list[int] = []
-            for row in gap_intervals.iter_rows(named=True):
-                gap_start = row["prev"] + 1
-                while gap_start < row["curr"] and len(missing) < 20:
-                    missing.append(gap_start)
-                    gap_start += 1
-                if len(missing) >= 20:
-                    break
-            # Trailing gap: ids beyond the max observed in-range id.
-            if len(missing) < 20:
-                last_observed = sorted_in_range.last() if sorted_in_range.len() > 0 else -1
-                trailing_start = last_observed + 1
-                while trailing_start < n_dataset_rows and len(missing) < 20:
-                    missing.append(trailing_start)
-                    trailing_start += 1
+        if (
+            observed.len() != n_dataset_rows
+            or observed.n_unique() != n_dataset_rows
+            or observed.min() != 0
+            or observed.max() != n_dataset_rows - 1
+        ):
             raise RuntimeError(
                 f"Trajectory {t}: rank outputs should cover dataset_row_idx exactly once "
-                f"each over {{0, ..., {n_dataset_rows - 1}}}; got {observed_count} rows with "
-                f"{observed_unique_count} unique ids. First 20 missing: {missing}; first 20 "
-                f"out-of-range: {out_of_range}. Possible causes: (a) write_rank_output was "
-                "not run on every rank before finalize_predictions; (b) under multi-node "
-                "DDP, rank_outputs_dir is on a filesystem not visible to all ranks (e.g. "
-                "node-local scratch); (c) a rank wrote stale shards from a previous run."
+                f"over {{0, ..., {n_dataset_rows - 1}}}; got {observed.len()} rows with "
+                f"{observed.n_unique()} unique ids (min={observed.min()}, "
+                f"max={observed.max()}). Likely cause: a rank didn't write, "
+                "rank_outputs_dir not visible to all ranks, or stale shards from a previous run."
             )
 
         logger.info(f"Writing trajectory {t} to {out_fp}.")
