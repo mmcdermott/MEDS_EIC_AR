@@ -75,24 +75,27 @@ class Model(torch.nn.Module):
     `code` key.
 
         >>> sample_batch
-        MEDSTorchBatch(code=tensor([[38,  22, 36,  3, 12, 29, 35,  4, 37],
-                                    [38,  22, 36,  2, 21, 25, 35,  4, 37]]),
+        MEDSTorchBatch(code=tensor([[38,  5, 36,  3, 13, 29, 35,  4, 37],
+                                    [38,  5, 36,  2, 22, 25, 35,  4, 37]]),
                        ...)
 
     We run over the batch in the normal way, which internally calls the `forward` method of the model:
 
         >>> loss, outputs = model(sample_batch)
         >>> print(loss)
-        tensor(3.6602, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
+        tensor(3.6660, dtype=torch.float16, grad_fn=<NllLoss2DBackward0>)
         >>> print(f"Outputs have keys: {', '.join(outputs.keys())}")
         Outputs have keys: logits, past_key_values
         >>> print(f"Logits shape: {outputs.logits.shape}")
         Logits shape: torch.Size([2, 9, 39])
         >>> print(outputs.logits)
-        tensor([[[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.3962e-02, ...,  1.6510e-02]],
+        tensor([[[0.0203,  ..., 0.0191],
+                 ...,
+                 [0.0138,  ..., 0.0166]],
         <BLANKLINE>
-                [[ 2.0309e-02, ...,  1.9135e-02], ..., [ 1.4549e-02, ...,  1.6312e-02]]],
-               dtype=torch.float16,
+                [[0.0203,  ..., 0.0191],
+                 ...,
+                 [0.0145,  ..., 0.0163]]], dtype=torch.float16,
                grad_fn=<UnsafeViewBackward0>)
 
     The models parameters can be accessed in the normal way.
@@ -100,9 +103,9 @@ class Model(torch.nn.Module):
         >>> sample_param_name, sample_param = next(iter(model.named_parameters()))
         >>> print(f"{sample_param_name} ({sample_param.shape}): {sample_param}")
         HF_model.gpt_neox.embed_in.weight (torch.Size([39, 4])): Parameter containing:
-        tensor([[-0.0247, -0.0222,  0.0160,  0.0219], ..., [-0.0050, -0.0061, -0.0358,  0.0136]],
-               dtype=torch.float16,
-               requires_grad=True)
+        tensor([[-0.0247,  ...,  0.0219],
+                ...,
+                [-0.0050,  ...,  0.0136]], dtype=torch.float16, requires_grad=True)
 
     Let's validate that they have gradients that can be realized via `.backward()` as normal:
 
@@ -110,11 +113,9 @@ class Model(torch.nn.Module):
         Sample parameter grad?: None
         >>> loss.backward()
         >>> print(f"Sample parameter grad?: {sample_param.grad}")
-        Sample parameter grad?:
-        tensor([[ 0.0000,  0.0000,  0.0000,  0.0000],
+        Sample parameter grad?: tensor([[0.0000,  ..., 0.0000],
                 ...,
-                [ 0.0341, -0.0679, -0.0286,  0.0625]],
-               dtype=torch.float16)
+                [0.0152,  ..., 0.0791]], dtype=torch.float16)
 
     With a single backward pass, we should not get any infinite gradients:
 
