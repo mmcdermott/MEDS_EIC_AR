@@ -3,31 +3,40 @@
 Two distinct bugs are covered, intentionally co-located so the eventual fix can be
 reviewed against both at once:
 
-- **Issue #152 — save fires too late**: ``save_logger_run_ids`` is invoked at
-  ``__main__.pretrain`` *after* ``trainer.fit(...)`` returns. For a clean-completion
-  run that's fine; for the case the helper actually exists to support
-  (interrupted-and-resumed runs from OOM / SIGINT / OS reboot) ``trainer.fit`` never
-  returns, the save line never executes, no ``wandb_run_id.txt`` is written, and the
-  next ``MEICAR_pretrain do_resume=True`` invocation finds nothing to restore — wandb
-  spawns a fresh run and continuity is lost.
+- **Issue #152 — save fires too late, resume never reattaches**:
+  ``save_logger_run_ids`` is invoked at ``__main__.pretrain`` *after* ``trainer.fit(...)``
+  returns. For a clean-completion run that's fine; for the case the helper actually
+  exists to support (interrupted-and-resumed runs from OOM / SIGINT / OS reboot)
+  ``trainer.fit`` never returns, the save line never executes, no
+  ``wandb_run_id.txt`` is written, and the next ``MEICAR_pretrain do_resume=true``
+  invocation finds nothing to restore — wandb spawns a fresh run and continuity is
+  silently lost.
 
 - **Issue #131 — generate save/restore paths don't connect**: ``generate_trajectories``
   *restores* run ids from ``cfg.model_initialization_dir`` but *saves* them to
   ``cfg.output_dir``. Nothing reads ``output_dir`` back on the next generation resume
   — it always re-restores from the training dir. The save is an orphan write.
 
-Both tests are deliberately end-to-end and use a **real offline ``WandbLogger``**, not
-a stub. The point is to catch this bug *and* any nearby ones — including upstream
-attribute-shape changes in wandb / Lightning, callback wiring mistakes that go through
-the helper without firing under real Lightning fit semantics, or fixes that patch the
-helper signature but forget to update the CLI call sites.
+The #152 test runs the *full real CLI* via subprocess: it ``Popen``-launches
+``MEICAR_pretrain``, waits for wandb to materialize and a checkpoint to land, then
+``SIGKILL``s the child (the OS-reboot / OOM-killer analog — atexit and signal
+handlers do not run, so persistence has to come from a hook that fires inside
+training itself, not from any clean-shutdown path). It then launches a second
+``MEICAR_pretrain do_resume=true`` and asserts the resumed run reattaches to the
+*same* wandb id, not a fresh one. That covers both halves of the bug — persistence
+and resume — through the same code paths a user actually exercises.
+
+Both tests use a real offline ``WandbLogger``, so upstream attribute-shape changes
+in wandb / Lightning surface here too, not just inside helper-level dummy classes.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
+import time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -35,125 +44,239 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
+
+# Maximum time we'll wait for the first MEICAR_pretrain subprocess to (a) launch
+# wandb and (b) save at least one checkpoint. CPU-bound demo training is fast (~ms
+# per batch), but cold-start subprocess launch + dataset materialization + torch
+# import all happen first; a generous ceiling avoids spurious CI flake without
+# making the happy path slow (we exit the wait as soon as the conditions are met).
+_PRE_KILL_TIMEOUT_SEC = 120.0
+# Maximum time we'll wait for the resumed MEICAR_pretrain subprocess to materialize
+# its WandbLogger (i.e. for an offline-run dir to exist whose run id matches the
+# pre-kill saved id). Once that condition is observed, the resume side of the
+# contract is proved and we can shut the second subprocess down.
+_RESUME_TIMEOUT_SEC = 120.0
+# Polling cadence used by both waits. Short enough that we exit the wait quickly
+# once the disk-side condition is true; long enough that polling overhead is
+# negligible against the underlying ms-scale training step.
+_POLL_INTERVAL_SEC = 0.25
+
+
+def _wait_for(predicate, timeout: float, *, on_timeout_msg: str) -> None:
+    """Poll ``predicate()`` every ``_POLL_INTERVAL_SEC`` until true or timeout.
+
+    Raised AssertionError carries ``on_timeout_msg`` so the failure mode is
+    immediately legible — the test reader doesn't have to re-derive what we were
+    waiting for from the predicate body.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(_POLL_INTERVAL_SEC)
+    raise AssertionError(on_timeout_msg)
+
+
+def _wandb_offline_run_dirs(save_dir: Path) -> list[Path]:
+    """Return all ``offline-run-{date}-{id}`` directories under a wandb save_dir.
+
+    Wandb names offline runs ``offline-run-YYYYMMDD_HHMMSS-{id}`` under
+    ``<save_dir>/wandb/``. We glob across two levels so the lookup is robust to
+    minor layout changes in upstream wandb.
+    """
+    return list(save_dir.glob("**/offline-run-*-*"))
+
+
+def _read_wandb_id_from_dir(d: Path) -> str:
+    """Extract the trailing wandb run id from an ``offline-run-{date}-{id}`` directory name."""
+    return d.name.rsplit("-", 1)[-1]
+
+
 # ---------------------------------------------------------------------------
-# Issue #152 — wandb run id must be on disk before trainer.fit returns
+# Issue #152 — kill-and-resume against the real CLI
 # ---------------------------------------------------------------------------
 
 
-def test_pretrain_persists_wandb_run_id_when_real_fit_crashes_mid_training(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+def test_pretrain_real_cli_sigkill_resumes_to_same_wandb_run(
     preprocessed_dataset: Path,
+    tmp_path_factory: pytest.TempPathFactory,
 ):
-    """Bug #152: drive a *real* ``Trainer.fit`` for one training batch and crash from inside a callback. The
-    wandb run id must be on disk before the exception propagates.
+    """Bug #152, end-to-end: SIGKILL ``MEICAR_pretrain`` mid-training, then resume.
 
-    Today ``__main__.pretrain`` calls ``save_logger_run_ids`` *after* ``trainer.fit(...)``
-    returns. An interrupted run (the case the helper exists for) never persists its id
-    and a subsequent ``MEICAR_pretrain do_resume=True`` finds no saved id — wandb spawns
-    a fresh run and continuity is silently lost.
+    The user-visible contract this test pins down:
 
-    This test is deliberately not a mocked-fit test: it builds a real Lightning Trainer
-    from the demo pretrain config, attaches a real offline ``WandbLogger``, and lets fit
-    run a real training batch. A ``_KillSwitch`` callback then raises ``RuntimeError``
-    from ``on_train_batch_end`` (mimicking an OOM / driver fault). Running the test
-    against a fix that wires save_logger_run_ids onto the wrong hook, or onto a callback
-    list real Lightning never iterates, will still fail here even though a mocked-fit
-    test would pass — which is the whole point.
+    1. After ``MEICAR_pretrain`` reaches the training loop, the wandb run id is on
+       disk under ``output_dir/loggers/wandb_run_id.txt``. Even a SIGKILL (OS
+       reboot / OOM-killer analog — no signal handlers, no atexit, no clean
+       teardown) leaves the file behind.
+    2. A subsequent ``MEICAR_pretrain do_resume=true`` against the same
+       ``output_dir`` reattaches to the *same* wandb run id (creates a second
+       ``offline-run-{date}-{id}`` dir with the matching id), rather than spawning
+       a fresh run.
+
+    Today both halves fail. ``__main__.pretrain`` calls ``save_logger_run_ids``
+    only after ``trainer.fit(...)`` returns, so SIGKILL means no file gets
+    written. Then the resume call's ``apply_saved_logger_run_ids`` finds no saved
+    id and lets WandbLogger spawn a fresh run.
+
+    Going through the real CLI via subprocess is deliberate: it exercises the
+    actual ``@hydra.main`` decorator path, real signal-handling under SIGKILL
+    (the OS terminates the process — no Python cleanup runs at all), and the real
+    resume flow. The previous in-process test could pass against fixes that
+    accidentally relied on Python-level cleanup; this one cannot.
     """
     pytest.importorskip("wandb")
 
-    # Keep wandb fully offline so the test is hermetic — no remote contact, no auth, no
-    # network flake. ``WANDB_DIR`` redirects state into the test's tmp_path so we don't
-    # leave a ``./wandb/`` directory behind in the repo root.
-    monkeypatch.setenv("WANDB_MODE", "offline")
-    monkeypatch.setenv("WANDB_DIR", str(tmp_path / "wandb_state"))
-    monkeypatch.setenv("WANDB_CONFIG_DIR", str(tmp_path / "wandb_cfg"))
-    monkeypatch.setenv("WANDB_CACHE_DIR", str(tmp_path / "wandb_cache"))
-    monkeypatch.setenv("WANDB_SILENT", "true")
-    monkeypatch.setenv("WANDB_DISABLE_GIT", "true")
+    output_dir = tmp_path_factory.mktemp("kill_resume_run")
+    wandb_save_dir = output_dir / "loggers"
 
-    output_dir = tmp_path / "interrupted_run"
-    output_dir.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "WANDB_MODE": "offline",
+            "WANDB_DIR": str(tmp_path_factory.mktemp("wandb_state")),
+            "WANDB_CONFIG_DIR": str(tmp_path_factory.mktemp("wandb_cfg")),
+            "WANDB_CACHE_DIR": str(tmp_path_factory.mktemp("wandb_cache")),
+            "WANDB_SILENT": "true",
+            "WANDB_DISABLE_GIT": "true",
+        }
+    )
 
-    import lightning.pytorch as L
-    from lightning.pytorch.callbacks import Callback
+    # Common base command. Both run 1 and run 2 use the same config so the resume
+    # config-diff check (validate_resume_directory) passes.
+    base_cmd = [
+        "MEICAR_pretrain",
+        "--config-name=_demo_pretrain",
+        f"output_dir={output_dir}",
+        f"datamodule.config.tensorized_cohort_dir={preprocessed_dataset}",
+        "trainer/logger=wandb",
+        "trainer.logger.offline=true",
+        # Bump so demo training doesn't complete before we get a chance to
+        # SIGKILL it. Demo settings (overfit_batches=2, val_check_interval=1)
+        # save a checkpoint after every batch, so a checkpoint will land within
+        # the first second or so of real training; the bump just prevents the
+        # job from finishing on its own.
+        "trainer.max_epochs=200",
+        # Same reason — disable max_steps so it doesn't gate on step count.
+        "trainer.max_steps=-1",
+    ]
 
-    class _KillSwitch(Callback):
-        """Raises after the first training batch, mimicking a mid-fit OOM / driver fault.
+    # ---- Run 1: launch, wait for wandb + checkpoint to land, then SIGKILL. ----
 
-        Hook choice (``on_train_batch_end``) is deliberate: it fires *after* Lightning has
-        called ``on_train_start`` on every other callback, so any save-run-ids callback wired
-        to ``on_train_start`` has already had its chance to persist the id by the time the
-        crash hits. If the fix wires persistence to a hook that runs only on clean fit
-        completion (e.g., ``on_fit_end``), the file won't be on disk when this test asserts
-        — which is exactly the property #152 is asking the fix to guarantee.
-        """
+    proc1 = subprocess.Popen(
+        base_cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
 
-        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-            raise RuntimeError("simulated mid-training crash for #152 regression test")
-
-    # Patch the ``instantiate`` symbol that ``__main__.pretrain`` imports so the *real*
-    # Trainer Lightning builds gets our kill switch prepended. All other ``instantiate(...)``
-    # calls (datamodule, lightning module) pass through unchanged. Prepending (vs appending)
-    # makes the kill switch fire before ``ModelCheckpoint``'s post-batch hooks so we don't
-    # accidentally exercise the checkpoint-save error path on the way out.
-    import MEDS_EIC_AR.__main__ as main_mod
-
-    orig_instantiate = main_mod.instantiate
-
-    def patched_instantiate(cfg, *args, **kwargs):
-        obj = orig_instantiate(cfg, *args, **kwargs)
-        if isinstance(obj, L.Trainer):
-            obj.callbacks.insert(0, _KillSwitch())
-        return obj
-
-    monkeypatch.setattr(main_mod, "instantiate", patched_instantiate)
-
-    from hydra import compose, initialize_config_module
-
-    from MEDS_EIC_AR.__main__ import pretrain
-
-    with initialize_config_module(config_module="MEDS_EIC_AR.configs", version_base=None):
-        cfg = compose(
-            config_name="_demo_pretrain",
-            overrides=[
-                f"output_dir={output_dir}",
-                f"datamodule.config.tensorized_cohort_dir={preprocessed_dataset}",
-                "trainer/logger=wandb",
-                "trainer.logger.offline=true",
-                f"trainer.logger.save_dir={tmp_path / 'wandb_save'}",
-                "trainer.logger.project=meds_eic_ar_test",
-                # Drop the ``${hydra:runtime.choices...}`` interpolation in the wandb config
-                # — under ``hydra.compose`` (no ``hydra.main``) ``HydraConfig`` is not set,
-                # so the interpolation would fail to resolve. Tags are not relevant to this
-                # test's invariant.
-                "~trainer.logger.tags",
-            ],
+    try:
+        _wait_for(
+            lambda: (
+                bool(_wandb_offline_run_dirs(wandb_save_dir))
+                and (output_dir / "checkpoints").exists()
+                and any((output_dir / "checkpoints").glob("*.ckpt"))
+            ),
+            timeout=_PRE_KILL_TIMEOUT_SEC,
+            on_timeout_msg=(
+                "Timed out waiting for run 1 to materialize wandb + write a checkpoint. "
+                "Without these the kill-and-resume contract can't be exercised: no live "
+                "wandb run to capture the id from, and no checkpoint for resume to attach "
+                "to. Subprocess returncode (None == still running): "
+                f"{proc1.poll()}"
+            ),
         )
 
-    with pytest.raises(RuntimeError, match="simulated mid-training crash"):
-        pretrain.__wrapped__(cfg)
+        run1_dirs = _wandb_offline_run_dirs(wandb_save_dir)
+        assert len(run1_dirs) == 1, (
+            f"Expected exactly one offline-run dir during run 1; got {[d.name for d in run1_dirs]}"
+        )
+        live_wandb_id = _read_wandb_id_from_dir(run1_dirs[0])
+
+        # SIGKILL is the case the helper exists for: OS reboot, OOM-killer, hard
+        # crash. No Python-level teardown runs — atexit hooks, finally blocks,
+        # Lightning's ``on_exception`` hook, wandb's offline-finalize thread, all
+        # skipped. Persistence has to come from inside training, not cleanup.
+        proc1.send_signal(signal.SIGKILL)
+    finally:
+        try:
+            proc1.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc1.kill()
+            proc1.wait(timeout=5)
 
     saved_fp = output_dir / "loggers" / "wandb_run_id.txt"
     assert saved_fp.is_file(), (
-        "wandb_run_id.txt was not written before fit raised — save_logger_run_ids fires only "
-        "after trainer.fit returns, so an interrupted run never persists its id (#152). The "
-        "fix is to persist on on_train_start via a Lightning Callback."
+        f"After SIGKILL, {saved_fp} does not exist. save_logger_run_ids fires only "
+        "after trainer.fit returns, so an interrupted run never persists its id "
+        "(#152). The fix is to persist on on_train_start via a Lightning Callback, "
+        "before any compute that might crash."
     )
     saved_id = saved_fp.read_text().strip()
-    assert saved_id, f"wandb_run_id.txt was written but is empty (contents: {saved_id!r})"
+    assert saved_id == live_wandb_id, (
+        f"Saved id {saved_id!r} does not match the live wandb run id {live_wandb_id!r} "
+        f"(from offline-run dir {run1_dirs[0].name!r}). save_logger_run_ids wrote a "
+        "string but it isn't the live ``WandbLogger.experiment.id`` — the fix needs "
+        "to read the live id, not anything cached."
+    )
 
-    # Cross-check: the saved id is the actual offline wandb run id. Look for a wandb
-    # offline-run directory under save_dir whose suffix matches the saved id. Catches a
-    # broken fix that writes some unrelated string instead of the live ``logger.experiment.id``.
-    wandb_run_dirs = list((tmp_path / "wandb_save").glob("**/offline-run-*-*"))
-    assert wandb_run_dirs, "Expected at least one wandb offline-run directory to exist."
-    matching = [d for d in wandb_run_dirs if d.name.endswith(f"-{saved_id}")]
-    assert matching, (
-        f"Saved wandb id {saved_id!r} does not match any actual wandb run dir under "
-        f"{tmp_path / 'wandb_save'}: {[d.name for d in wandb_run_dirs]}. The fix wrote a "
-        "string but it isn't the live ``WandbLogger.experiment.id``."
+    # ---- Run 2: resume, wait for second offline-run to materialize, then stop. ----
+
+    resume_cmd = [
+        *base_cmd,
+        "do_resume=true",
+        # ``do_resume`` does not bypass the config-diff check, so the resume cfg
+        # must match run 1's exactly (modulo ALLOWED_DIFFERENCE_KEYS in
+        # training/files.py). Both invocations use ``base_cmd`` so this holds.
+    ]
+
+    proc2 = subprocess.Popen(
+        resume_cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        _wait_for(
+            lambda: any(
+                _read_wandb_id_from_dir(d) == live_wandb_id
+                for d in _wandb_offline_run_dirs(wandb_save_dir)
+                if d not in run1_dirs
+            ),
+            timeout=_RESUME_TIMEOUT_SEC,
+            on_timeout_msg=(
+                f"Timed out waiting for the resumed run to attach to wandb id "
+                f"{live_wandb_id!r}. Either the resume launched but spawned a fresh "
+                "wandb id (apply_saved_logger_run_ids didn't read the saved id back), "
+                "or the resume failed entirely. "
+                f"offline-run dirs seen: {[d.name for d in _wandb_offline_run_dirs(wandb_save_dir)]}. "
+                f"resume subprocess returncode (None == still running): {proc2.poll()}"
+            ),
+        )
+    finally:
+        # Shut the resume run down cleanly. We've already proved the contract; no
+        # need to let it train to completion. SIGTERM gives Lightning a chance to
+        # finalize the wandb run dir cleanly so we don't leave a half-written
+        # state behind.
+        proc2.send_signal(signal.SIGTERM)
+        try:
+            proc2.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc2.kill()
+            proc2.wait(timeout=5)
+
+    # Final cross-check: there should be at least two offline-run dirs and at
+    # least two of them should carry ``live_wandb_id`` (one from run 1, one from
+    # run 2 attaching to the same id). This is what wandb-side continuity looks
+    # like on disk.
+    final_dirs = _wandb_offline_run_dirs(wandb_save_dir)
+    matching = [d for d in final_dirs if _read_wandb_id_from_dir(d) == live_wandb_id]
+    assert len(matching) >= 2, (
+        f"Expected at least two offline-run dirs tagged with {live_wandb_id!r} "
+        f"(run 1 + resume), got {[d.name for d in matching]} (out of "
+        f"{[d.name for d in final_dirs]}). The resume spawned a fresh wandb run "
+        "instead of attaching to the saved id."
     )
 
 
