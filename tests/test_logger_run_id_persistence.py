@@ -147,7 +147,7 @@ def test_pretrain_persists_wandb_run_id_when_real_fit_crashes_mid_training(
     # Cross-check: the saved id is the actual offline wandb run id. Look for a wandb
     # offline-run directory under save_dir whose suffix matches the saved id. Catches a
     # broken fix that writes some unrelated string instead of the live ``logger.experiment.id``.
-    wandb_run_dirs = list((tmp_path / "wandb_save").glob("**/run-*-*"))
+    wandb_run_dirs = list((tmp_path / "wandb_save").glob("**/offline-run-*-*"))
     assert wandb_run_dirs, "Expected at least one wandb offline-run directory to exist."
     matching = [d for d in wandb_run_dirs if d.name.endswith(f"-{saved_id}")]
     assert matching, (
@@ -240,6 +240,11 @@ def test_generate_trajectories_resume_reads_output_dir_id_not_training_dir_id(
         "trainer.logger.offline=true",
         f"trainer.logger.save_dir={output_dir / 'wandb_save'}",
         "trainer.logger.project=meds_eic_ar_test",
+        # Drop the ``${hydra:runtime.choices.lightning_module/model}`` interpolation —
+        # the generate config has no ``lightning_module/model`` group choice, so the tag
+        # resolves to ``None`` and recent wandb / pydantic versions reject non-string tags.
+        # Tags are not relevant to this test's invariant.
+        "~trainer.logger.tags",
     ]
 
     result = subprocess.run(cmd, capture_output=True, env=env, check=False)
@@ -261,7 +266,7 @@ def test_generate_trajectories_resume_reads_output_dir_id_not_training_dir_id(
     # Cross-check: the offline wandb run dir for this generation run should be tagged with
     # the prior_gen_id, proving wandb actually attached to it (not a coincidence of file
     # contents).
-    wandb_run_dirs = list((output_dir / "wandb_save").glob("**/run-*-*"))
+    wandb_run_dirs = list((output_dir / "wandb_save").glob("**/offline-run-*-*"))
     assert wandb_run_dirs, "Expected an offline wandb run dir under output_dir/wandb_save."
     matching = [d for d in wandb_run_dirs if d.name.endswith(f"-{prior_gen_id}")]
     assert matching, (

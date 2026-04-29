@@ -32,18 +32,38 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 logger = logging.getLogger(__name__)
 
 
+def _logger_class_candidates(logger_name: str) -> list[type]:
+    """Return all importable Lightning logger classes named ``logger_name``.
+
+    The repo's ``configs/trainer/logger/{wandb,mlflow}.yaml`` use the
+    ``pytorch_lightning.loggers.*`` import path, but recent Lightning packaging
+    splits that namespace from the canonical ``lightning.pytorch.loggers.*`` path,
+    and the two re-exports do *not* share class identity (``pytorch_lightning.loggers.wandb.WandbLogger``
+    is a subclass of, not the same object as, ``lightning.pytorch.loggers.WandbLogger``).
+    A naive ``isinstance(logger, lightning.pytorch.loggers.WandbLogger)`` therefore
+    returns ``False`` for a Hydra-instantiated logger from the repo's yaml, silently
+    skipping run-id persistence in production. We probe both module paths and
+    ``isinstance`` against every class we found.
+    """
+    candidates: list[type] = []
+    for module_path in ("lightning.pytorch.loggers", "pytorch_lightning.loggers"):
+        try:
+            module = __import__(module_path, fromlist=[logger_name])
+        except ImportError:
+            continue
+        cls = getattr(module, logger_name, None)
+        if isinstance(cls, type) and cls not in candidates:
+            candidates.append(cls)
+    return candidates
+
+
 def is_mlflow_logger(logger: Logger) -> bool:
     """This function checks if a pytorch lightning logger is an MLFlow logger.
 
     It is protected against the case that mlflow is not installed.
     """
-
-    try:
-        from lightning.pytorch.loggers import MLFlowLogger
-
-        return isinstance(logger, MLFlowLogger)
-    except ImportError:
-        return False
+    candidates = _logger_class_candidates("MLFlowLogger")
+    return any(isinstance(logger, cls) for cls in candidates)
 
 
 def is_wandb_logger(logger: Logger) -> bool:
@@ -62,20 +82,16 @@ def is_wandb_logger(logger: Logger) -> bool:
         >>> from unittest.mock import patch
         >>> original_import = builtins.__import__
         >>> def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        ...     if name == "lightning.pytorch.loggers" and "WandbLogger" in fromlist:
+        ...     if name in ("lightning.pytorch.loggers", "pytorch_lightning.loggers") \\
+        ...             and "WandbLogger" in fromlist:
         ...         raise ImportError
         ...     return original_import(name, globals, locals, fromlist, level)
         >>> with patch.object(builtins, "__import__", fake_import):
         ...     is_wandb_logger(DummyLogger())
         False
     """
-
-    try:
-        from lightning.pytorch.loggers import WandbLogger
-
-        return isinstance(logger, WandbLogger)
-    except ImportError:
-        return False
+    candidates = _logger_class_candidates("WandbLogger")
+    return any(isinstance(logger, cls) for cls in candidates)
 
 
 def hash_based_seed(seed: int | None, split: str) -> int:
@@ -515,12 +531,22 @@ def _read_saved_id(fp: Path) -> str | None:
     return content or None
 
 
-def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
+def apply_saved_logger_run_ids(
+    trainer_cfg: DictConfig,
+    run_dir: Path,
+    fallback_dir: Path | None = None,
+) -> None:
     """Populate logger configs with saved experiment IDs if present.
 
-    This helper mutates the provided trainer configuration in-place and reads
-    any saved run IDs from ``<run_dir>/loggers``. It is kept separate from
-    OmegaConf resolvers so configuration loading remains straightforward.
+    Reads any saved run IDs from ``<run_dir>/loggers`` and mutates ``trainer_cfg``
+    in-place. When ``fallback_dir`` is supplied and a given id file is missing or empty
+    under ``run_dir``, the helper falls back to ``<fallback_dir>/loggers/<file>``.
+
+    The fallback exists to support generation, where the run-specific
+    ``cfg.output_dir`` (primary) takes precedence over the model checkpoint's
+    ``cfg.model_initialization_dir`` (fallback). On the first-ever generation against a
+    fresh ``output_dir`` the helper inherits the training run's ids; on subsequent
+    resumes it reads back ``output_dir``'s own save-point. See issue #131.
 
     Example:
         >>> from yaml_to_disk import yaml_disk
@@ -596,20 +622,41 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
 
     loggers = [e for e in raw_entries if e is not None and hasattr(e, "get")]
 
-    log_dir = Path(run_dir) / "loggers"
+    primary_log_dir = Path(run_dir) / "loggers"
+    fallback_log_dir = (Path(fallback_dir) / "loggers") if fallback_dir is not None else None
+
+    def _read_with_fallback(filename: str) -> str | None:
+        """Read ``filename`` from ``primary_log_dir`` first, falling back to ``fallback_log_dir``."""
+        saved = _read_saved_id(primary_log_dir / filename)
+        if saved is None and fallback_log_dir is not None:
+            saved = _read_saved_id(fallback_log_dir / filename)
+        return saved
 
     for logger_cfg in loggers:
         target = str(logger_cfg.get("_target_", "")).lower()
         if "wandb" in target:
-            fp = log_dir / "wandb_run_id.txt"
-            saved = _read_saved_id(fp)
+            saved = _read_with_fallback("wandb_run_id.txt")
             if saved and not logger_cfg.get("id"):
+                # ``logger_cfg`` may be a Hydra-composed DictConfig in struct mode (the
+                # default for configs loaded via ``hydra.main`` / ``hydra.compose``).
+                # Setting a key absent from the source yaml — like ``resume``, which the
+                # repo's ``configs/trainer/logger/wandb.yaml`` does not declare — would
+                # raise ``ConfigKeyError`` under struct enforcement. Temporarily drop the
+                # struct flag so the resume-keyword assignment goes through, then restore
+                # it. ``id`` is already declared in the yaml so it doesn't need this.
                 logger_cfg["id"] = saved
-                logger_cfg.setdefault("resume", "allow")
+                if isinstance(logger_cfg, DictConfig):
+                    was_struct = OmegaConf.is_struct(logger_cfg)
+                    OmegaConf.set_struct(logger_cfg, False)
+                    try:
+                        logger_cfg.setdefault("resume", "allow")
+                    finally:
+                        OmegaConf.set_struct(logger_cfg, was_struct)
+                else:
+                    logger_cfg.setdefault("resume", "allow")
         elif "mlflow" in target:
-            fp = log_dir / "mlflow_run_id.txt"
             applied_saved_run_id = False
-            saved = _read_saved_id(fp)
+            saved = _read_with_fallback("mlflow_run_id.txt")
             if saved and not logger_cfg.get("run_id"):
                 logger_cfg["run_id"] = saved
                 applied_saved_run_id = True
@@ -628,7 +675,7 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
             # "resume this run_id, but log to a new store" — is incoherent (the run_id doesn't
             # exist in the new store), and this code now prevents it by construction.
             if applied_saved_run_id:
-                saved_uri = _read_saved_id(log_dir / "mlflow_tracking_uri.txt")
+                saved_uri = _read_with_fallback("mlflow_tracking_uri.txt")
                 if saved_uri:
                     logger_cfg["tracking_uri"] = saved_uri
 
