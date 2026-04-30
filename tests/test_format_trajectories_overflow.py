@@ -118,14 +118,18 @@ def test_format_trajectories_normal_path_unchanged_by_saturation():
     with patch.object(finalize, "_get_code_metadata", return_value=code_metadata):
         out = format_trajectories(base_dataset, merged)
 
-    # Token 1 is a normal delta bin (value_mean = 3e-6 years ≈ 94.67 ms); token 3 is DISCHARGE.
-    # The DISCHARGE row lands at ``LAST_TIME + value_mean(f32) * 31556926 s/yr * 1e6 us/s``
-    # cast to Int64 — i.e., the same arithmetic the unfixed code produces, just without the
-    # strict-cast crash on overflow. Pinning the exact microsecond confirms the saturating
-    # cast doesn't perturb the non-overflow path.
+    # Token 1 is a normal delta bin (value_mean = 3e-6 years ≈ 94.67 s); token 3 is DISCHARGE.
+    # The DISCHARGE row lands at ``LAST_TIME + value_mean(f64) * 31556926 s/yr * 1e6 us/s``
+    # cast to Int64 = 94670781 us = 1 min 34.670781 s past LAST_TIME.
+    #
+    # The pre-fix path multiplied in f32 and produced 94670784 us; the saturating-cast path
+    # casts ``value_mean`` to f64 first (the cast site comment explains why — f32 arithmetic
+    # at ~1e19 produces values one ULP above Int64 max even after clipping), so the same
+    # input produces a 3-us-shifted timestamp. That's a deliberate precision improvement,
+    # not a regression — pinning it here so a future return-to-f32-arithmetic change shows up.
     discharge_row = out.filter(pl.col(DataSchema.code_name) == "DISCHARGE")
     assert discharge_row.height == 1
-    assert discharge_row[DataSchema.time_name][0] == datetime(2024, 1, 1, 11, 1, 34, 670784)  # noqa: DTZ001
+    assert discharge_row[DataSchema.time_name][0] == datetime(2024, 1, 1, 11, 1, 34, 670781)  # noqa: DTZ001
 
 
 def test_format_trajectories_logs_warning_on_polluted_bin(caplog):
