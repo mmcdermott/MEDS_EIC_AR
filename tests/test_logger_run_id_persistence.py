@@ -1,30 +1,30 @@
-"""Failing regression tests for the logger run-id save / restore flow.
+"""End-to-end regression tests for the logger run-id save / restore flow.
 
-Two distinct bugs are covered, intentionally co-located so the eventual fix can be
-reviewed against both at once:
+Two distinct bugs are covered, intentionally co-located so a future regression in
+either path is caught by one test file:
 
 - **Issue #152 — save fires too late, resume never reattaches**:
-  ``save_logger_run_ids`` is invoked at ``__main__.pretrain`` *after* ``trainer.fit(...)``
-  returns. For a clean-completion run that's fine; for the case the helper actually
-  exists to support (interrupted-and-resumed runs from OOM / SIGINT / OS reboot)
-  ``trainer.fit`` never returns, the save line never executes, no
-  ``wandb_run_id.txt`` is written, and the next ``MEICAR_pretrain do_resume=true``
-  invocation finds nothing to restore — wandb spawns a fresh run and continuity is
-  silently lost.
+  Pretrain previously called ``save_logger_run_ids`` only *after* ``trainer.fit(...)``
+  returned. Interrupted runs (OOM, SIGINT, OS reboot) never persisted their id, so
+  the next ``MEICAR_pretrain do_resume=true`` invocation found nothing and wandb
+  spawned a fresh run. The fix is the ``SaveLoggerRunIDsOnTrainStart`` callback,
+  hydra-instantiated into the default training callback set, which writes the id
+  from ``on_train_start`` (before any compute that might crash).
 
-- **Issue #131 — generate save/restore paths don't connect**: ``generate_trajectories``
-  *restores* run ids from ``cfg.model_initialization_dir`` but *saves* them to
-  ``cfg.output_dir``. Nothing reads ``output_dir`` back on the next generation resume
-  — it always re-restores from the training dir. The save is an orphan write.
+- **Issue #131 — generate save/restore paths don't connect**: generation previously
+  *restored* run ids from ``cfg.model_initialization_dir`` but *saved* them to
+  ``cfg.output_dir``. Nothing read ``output_dir`` back, and the trailing save was
+  an orphan write. The fix is to drop the orphan write entirely: generation always
+  reads logger ids from ``model_initialization_dir`` (the training run's
+  save-point) and never writes its own. Generation runs are now always associated
+  with the pre-trained logger.
 
-The #152 test runs the *full real CLI* via subprocess: it ``Popen``-launches
-``MEICAR_pretrain``, waits for wandb to materialize and a checkpoint to land, then
-``SIGKILL``s the child (the OS-reboot / OOM-killer analog — atexit and signal
-handlers do not run, so persistence has to come from a hook that fires inside
-training itself, not from any clean-shutdown path). It then launches a second
-``MEICAR_pretrain do_resume=true`` and asserts the resumed run reattaches to the
-*same* wandb id, not a fresh one. That covers both halves of the bug — persistence
-and resume — through the same code paths a user actually exercises.
+The #152 test runs the full real CLI via subprocess and uses ``SIGKILL`` (the
+OS-reboot / OOM-killer analog — no Python-level teardown runs at all), so
+persistence has to come from a hook that fires inside training, not from any
+clean-shutdown path. The #131 test runs the full ``MEICAR_generate_trajectories``
+CLI via subprocess so the assertion exercises the actual call site, not a unit-
+level helper.
 
 Both tests use a real offline ``WandbLogger``, so upstream attribute-shape changes
 in wandb / Lightning surface here too, not just inside helper-level dummy classes.
@@ -285,36 +285,29 @@ def test_pretrain_real_cli_sigkill_resumes_to_same_wandb_run(
 # ---------------------------------------------------------------------------
 
 
-def test_generate_trajectories_resume_reads_output_dir_id_not_training_dir_id(
+def test_generate_trajectories_attaches_to_training_id_and_does_not_save_to_output_dir(
     pretrained_model: Path,
     preprocessed_dataset_with_task: tuple[Path, Path, str],
     tmp_path_factory: pytest.TempPathFactory,
 ):
-    """Bug #131: a saved generation run id under ``output_dir`` must be honored on the next generation resume
-    — not silently shadowed by the training run id under ``model_initialization_dir``.
+    """Bug #131: generation must always associate with the pre-trained logger and never write its own ids.
 
-    Drives the full ``MEICAR_generate_trajectories`` CLI via subprocess (matches existing
-    end-to-end test style). Pre-seeds two distinguishable wandb run ids: one in
-    ``model_initialization_dir/loggers/`` (training save-point) and one in
-    ``output_dir/loggers/`` (a prior generation run's save-point). Runs generation. Asserts
-    the output_dir's saved id is preserved, proving:
+    The redesigned contract:
 
-    1. ``apply_saved_logger_run_ids`` read ``output_dir`` (not just
-       ``model_initialization_dir``);
-    2. Lightning's WandbLogger was instantiated with ``id=<prior_gen_id>`` and attached to
-       the corresponding offline run;
-    3. The trailing ``save_logger_run_ids(trainer.loggers, output_dir)`` then re-saved the
-       same id back to ``output_dir/loggers/wandb_run_id.txt``.
+    1. ``MEICAR_generate_trajectories`` reads logger ids only from
+       ``model_initialization_dir/loggers/``. Generation is a continuation of the
+       training run; the training save-point is the single source of truth.
+    2. Generation does not write logger ids to ``output_dir``. Anything pre-existing
+       in ``output_dir/loggers/`` from a prior generation run is left alone.
 
-    Under the bug, step 1 reads from ``model_initialization_dir`` instead, so the run
-    attaches to the *training* id, and the trailing save **overwrites** ``output_dir``'s
-    saved id with the training id. The assertion ``output_dir id is unchanged`` catches
-    that overwrite.
+    The wrong-shape orphan write (#131's original failure mode — generation saving
+    to ``output_dir`` while only restoring from ``model_initialization_dir``) is gone
+    because the *write* side is removed entirely, not because a layered read papers
+    over it.
 
-    Going through the CLI (subprocess) instead of an in-process driver guards against
-    fixes that patch the helper signature but forget to update the actual call site in
-    ``__main__.generate_trajectories`` — the failure mode that would silently slip past
-    a unit test on the helper alone.
+    Drives the full ``MEICAR_generate_trajectories`` CLI via subprocess so the
+    assertion exercises the actual ``__main__.generate_trajectories`` call path —
+    a unit test on the helper alone could pass while the call site forgets to use it.
     """
     pytest.importorskip("wandb")
 
@@ -323,7 +316,7 @@ def test_generate_trajectories_resume_reads_output_dir_id_not_training_dir_id(
     # Distinguishable, wandb-valid 8-char ids. Wandb's ``run.id`` must be base36-y to pass
     # ``wandb.sdk.lib.runid.check_id``; alphanumeric works.
     training_id = "trainabc"
-    prior_gen_id = "priorxyz"
+    pre_existing_in_output = "priorxyz"
 
     # Copy the session-shared pretrained_model dir to a private location so we can
     # mutate its loggers/ directory without affecting other tests.
@@ -333,11 +326,12 @@ def test_generate_trajectories_resume_reads_output_dir_id_not_training_dir_id(
     init_loggers.mkdir(parents=True, exist_ok=True)
     (init_loggers / "wandb_run_id.txt").write_text(training_id)
 
-    # Pre-seed the generation output_dir with the prior-generation save-point.
+    # Pre-seed the generation output_dir with a *different* id, to prove generation
+    # ignores it on read AND doesn't overwrite it on (non-)write.
     output_dir = tmp_path_factory.mktemp("generation_output")
     out_loggers = output_dir / "loggers"
     out_loggers.mkdir(parents=True, exist_ok=True)
-    (out_loggers / "wandb_run_id.txt").write_text(prior_gen_id)
+    (out_loggers / "wandb_run_id.txt").write_text(pre_existing_in_output)
 
     env = os.environ.copy()
     env.update(
@@ -377,23 +371,23 @@ def test_generate_trajectories_resume_reads_output_dir_id_not_training_dir_id(
             f"stdout:\n{result.stdout.decode()}\nstderr:\n{result.stderr.decode()}"
         )
 
+    # Contract part 2: pre-existing output_dir id is untouched. Generation does not save
+    # its own logger ids anywhere under output_dir.
     saved = (out_loggers / "wandb_run_id.txt").read_text().strip()
-    assert saved == prior_gen_id, (
-        f"output_dir's wandb_run_id.txt was overwritten with {saved!r} (expected the "
-        f"pre-existing generation id {prior_gen_id!r}). Bug #131: "
-        f"``apply_saved_logger_run_ids`` reads only from ``model_initialization_dir``, "
-        f"so wandb attached to the training id ({training_id!r}) and the trailing "
-        "save_logger_run_ids clobbered the output_dir save-point."
+    assert saved == pre_existing_in_output, (
+        f"output_dir's wandb_run_id.txt changed to {saved!r} (expected pre-existing "
+        f"{pre_existing_in_output!r} to be left alone). Generation should not write "
+        "logger ids to output_dir under the redesigned #131 contract."
     )
 
-    # Cross-check: the offline wandb run dir for this generation run should be tagged with
-    # the prior_gen_id, proving wandb actually attached to it (not a coincidence of file
-    # contents).
+    # Contract part 1: wandb actually attached to the *training* id. The offline-run dir
+    # under output_dir/wandb_save/ should carry the training_id suffix, not anything else.
     wandb_run_dirs = list((output_dir / "wandb_save").glob("**/offline-run-*-*"))
     assert wandb_run_dirs, "Expected an offline wandb run dir under output_dir/wandb_save."
-    matching = [d for d in wandb_run_dirs if d.name.endswith(f"-{prior_gen_id}")]
+    matching = [d for d in wandb_run_dirs if d.name.endswith(f"-{training_id}")]
     assert matching, (
-        f"No wandb offline-run dir tagged with {prior_gen_id!r}; "
-        f"found: {[d.name for d in wandb_run_dirs]}. WandbLogger did not attach to the "
-        "saved generation id — the apply path read the wrong dir."
+        f"No wandb offline-run dir tagged with the training id {training_id!r}; "
+        f"found: {[d.name for d in wandb_run_dirs]}. Generation must attach to the "
+        "training run's saved id (read from model_initialization_dir/loggers/), not "
+        "spawn a fresh wandb id."
     )

@@ -6,30 +6,19 @@ from pathlib import Path
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import Logger
 
+from MEDS_EIC_AR.utils import save_logger_run_ids
+
 
 class SaveLoggerRunIDsOnTrainStart(Callback):
     """Persist MLFlow / WandB run ids on ``on_train_start`` so an interrupted fit is resumable.
 
-    ``MEICAR_pretrain`` previously called :func:`MEDS_EIC_AR.utils.save_logger_run_ids`
-    only *after* ``trainer.fit`` returned. That meant interrupted runs (OOM, SIGINT, OS
-    reboot — exactly the cases run-id persistence exists to handle) never persisted their
-    id, and the next ``MEICAR_pretrain do_resume=True`` invocation could not attach to the
-    in-flight wandb / mlflow run. Persisting at training start gets the id on disk before
-    any compute that might crash, so resume sees the saved id even after a hard failure.
-
-    Lightning fires ``on_train_start`` after the loggers have been materialized (the
-    WandbLogger ``.experiment`` is initialized lazily during ``setup``), so reading
-    ``trainer.loggers[i].experiment.id`` is safe at this hook. Issue #152 has the full
-    motivation.
+    Writes to ``<trainer.default_root_dir>/loggers/`` — the same root every other
+    output (checkpoints, hydra config dump) is anchored at, so a single ``output_dir``
+    knob in the trainer config controls the whole run's on-disk layout.
     """
 
-    def __init__(self, output_dir: Path | str):
-        self.output_dir = Path(output_dir)
-
     def on_train_start(self, trainer, pl_module):
-        from MEDS_EIC_AR.utils import save_logger_run_ids
-
-        save_logger_run_ids(trainer.loggers, self.output_dir)
+        save_logger_run_ids(trainer.loggers, Path(trainer.default_root_dir))
 
 
 class GenerationSpeedLogger(Callback):

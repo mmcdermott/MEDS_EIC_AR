@@ -51,12 +51,7 @@ from .generation import (
     validate_rolling_cfg,
 )
 from .generation.finalize import finalize_predictions, write_rank_output
-from .training import (
-    MEICARModule,
-    SaveLoggerRunIDsOnTrainStart,
-    find_checkpoint_path,
-    validate_resume_directory,
-)
+from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
 from .utils import (
@@ -70,7 +65,6 @@ from .utils import (
     oc_min,
     resolve_generation_context_size,
     save_environment_snapshot,
-    save_logger_run_ids,
     save_resolved_config,
     sub,
 )
@@ -140,9 +134,6 @@ def pretrain(cfg: DictConfig):
 
     apply_saved_logger_run_ids(cfg.trainer, output_dir)
     trainer = instantiate(cfg.trainer)
-    # Persist run ids on training start (not just on fit return) so an interrupted run is
-    # resumable. See issue #152.
-    trainer.callbacks.append(SaveLoggerRunIDsOnTrainStart(output_dir))
     if any(is_mlflow_logger(logger) for logger in trainer.loggers):
         # We do the import only here to avoid importing mlflow if it isn't installed.
         import mlflow
@@ -158,7 +149,6 @@ def pretrain(cfg: DictConfig):
         trainer_kwargs["ckpt_path"] = ckpt_path
 
     trainer.fit(**trainer_kwargs)
-    save_logger_run_ids(trainer.loggers, output_dir)
 
     best_ckpt_path = Path(trainer.checkpoint_callback.best_model_path)
     if not best_ckpt_path.is_file():
@@ -239,17 +229,12 @@ def generate_trajectories(cfg: DictConfig):
             "you're running this for any other purpose, set inference.do_sample=true."
         )
 
-    # Layered restore: prefer a generation save-point under ``output_dir`` over the
-    # training save-point under ``model_initialization_dir``. On a fresh ``output_dir``
-    # this falls through to the training run id (the original behavior); on subsequent
-    # generation resumes it reads the prior generation's saved id, so the
-    # ``save_logger_run_ids(trainer.loggers, output_dir)`` at the bottom of this function
-    # is no longer an orphan write. See issue #131.
-    apply_saved_logger_run_ids(
-        cfg.trainer,
-        Path(cfg.output_dir),
-        fallback_dir=Path(cfg.model_initialization_dir),
-    )
+    # Generation is always associated with the training run's logger, so the only
+    # place to look for run ids is the training save-point under
+    # ``model_initialization_dir``. Issue #131 reported an orphan-write where
+    # generation also saved its own ids under ``output_dir`` — that write is gone now,
+    # eliminating the bug at the source rather than papering over it with a layered read.
+    apply_saved_logger_run_ids(cfg.trainer, Path(cfg.model_initialization_dir))
     trainer = instantiate(cfg.trainer)
 
     inference = cfg.inference
@@ -364,10 +349,4 @@ def generate_trajectories(cfg: DictConfig):
             )
         trainer.strategy.barrier()
 
-    # Save the generation run's logger ids into the *generation* ``output_dir``, not the
-    # training checkpoint's ``model_initialization_dir``. A caller using the escape hatch
-    # described in ``apply_saved_logger_run_ids`` (explicit fresh ``run_id`` for generation)
-    # would otherwise overwrite the training run's saved ids and change what future pretrain-
-    # resume attaches to. Separating the two directories keeps the pretrain save-point frozen.
-    save_logger_run_ids(trainer.loggers, Path(cfg.output_dir))
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")
