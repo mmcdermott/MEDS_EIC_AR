@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 TIMELINE_DELTA_TOKEN = "TIMELINE//DELTA"
 
 
-def _get_code_metadata(dataset: MEDSPytorchDataset) -> pl.DataFrame:
+def get_code_metadata(dataset: MEDSPytorchDataset) -> pl.DataFrame:
     """Return a DataFrame mapping code indices to their code strings and mean numeric values.
 
     Reads ``dataset.config.code_metadata_fp`` and produces a polars DataFrame with one row per
@@ -80,14 +80,16 @@ def _get_code_metadata(dataset: MEDSPytorchDataset) -> pl.DataFrame:
     (e.g. ``156.485596`` for a code named ``HEIGHT//value_[156.4856,...)``). This is not a bug;
     it's the upstream naming convention.
 
-    Used only inside :func:`format_trajectories`; private to this module.
+    Used inside :func:`format_trajectories` and as input to
+    :func:`validate_timeline_delta_bins_in_int64_range`; the latter is composed at the CLI
+    entry point in ``MEICAR_generate_trajectories``.
 
     Args:
         dataset: The dataset used for generation.
 
     Examples:
         >>> with pl.Config(tbl_rows=-1):
-        ...     print(_get_code_metadata(pytorch_dataset).sort("code_idx"))
+        ...     print(get_code_metadata(pytorch_dataset).sort("code_idx"))
         shape: (38, 3)
         ┌──────────┬─────────────────────────────────┬────────────┐
         │ code_idx ┆ code                            ┆ value_mean │
@@ -134,18 +136,8 @@ def _get_code_metadata(dataset: MEDSPytorchDataset) -> pl.DataFrame:
         │ 38       ┆ TIMELINE//START                 ┆ null       │
         └──────────┴─────────────────────────────────┴────────────┘
     """
-    return _load_code_metadata(dataset.config.code_metadata_fp)
-
-
-def _load_code_metadata(code_metadata_fp: Path) -> pl.DataFrame:
-    """Path-based variant of :func:`_get_code_metadata` — see that function for the schema.
-
-    Split out so :func:`validate_timeline_delta_bins_in_int64_range` can read code metadata
-    without needing a fully-instantiated ``MEDSPytorchDataset`` (the validator runs at CLI
-    startup, before any dataset object exists).
-    """
     columns = ["code", "code/vocab_index", "values/n_occurrences", "values/sum"]
-    metadata = pl.read_parquet(code_metadata_fp, columns=columns, use_pyarrow=True)
+    metadata = pl.read_parquet(dataset.config.code_metadata_fp, columns=columns, use_pyarrow=True)
     return metadata.select(
         pl.col("code/vocab_index").cast(pl.Int64).alias("code_idx"),
         pl.col("code"),
@@ -191,7 +183,7 @@ def _timeline_delta_seconds_per_unit(code_metadata: pl.DataFrame) -> float:
     return normalize_time_unit(units.pop())[1]
 
 
-def validate_timeline_delta_bins_in_int64_range(code_metadata_fp: Path) -> None:
+def validate_timeline_delta_bins_in_int64_range(code_metadata: pl.DataFrame) -> None:
     """Fail fast at CLI startup if any TIMELINE//DELTA bin would overflow Int64 microseconds.
 
     :func:`format_trajectories` encodes per-token time deltas as Int64 microseconds
@@ -203,24 +195,70 @@ def validate_timeline_delta_bins_in_int64_range(code_metadata_fp: Path) -> None:
 
     Even with a saturating cast the resulting trajectory would be nonsense (the offending
     delta clamps to ~292,000 years, breaking any longitudinal interpretation), so the right
-    move is to refuse to start: scan the small (``n_vocab``-sized) code metadata once at CLI
-    entry and raise ``ValueError`` with the offending bins named, before any model load or
+    move is to refuse to start: scan the (n_vocab-sized) code metadata once at CLI entry
+    and raise ``ValueError`` with the offending bins named, before any model load or
     predict pass runs. The fix for the underlying pollution lives upstream in
     ``fit_quantile_binning`` / ``bin_numeric_values`` (use a trimmed mean / median rather
     than a raw mean for the bin representative); this validator is the downstream guard.
 
+    Takes the materialized code-metadata DataFrame produced by :func:`get_code_metadata`
+    rather than a path so it can be doctested with inline DataFrames; the call site in
+    ``MEICAR_generate_trajectories`` composes the two.
+
     Args:
-        code_metadata_fp: path to the dataset's ``codes.parquet`` (typically
-            ``MEDSPytorchDataset.config.code_metadata_fp``).
+        code_metadata: as returned by :func:`get_code_metadata` — one row per vocabulary
+            entry with ``code`` (Utf8) and ``value_mean`` (Float32, nullable) columns.
 
     Raises:
         ValueError: if any TIMELINE//DELTA bin's ``value_mean * seconds_per_unit * 1e6``
             exceeds the Int64 representable range.
+
+    Examples:
+        Clean vocabulary — bins are well within Int64 microseconds, validator passes silently:
+
+        >>> clean = pl.DataFrame(
+        ...     [
+        ...         {"code_idx": 1, "code": "TIMELINE//DELTA//years//value_[0,1)", "value_mean": 0.000003},
+        ...         {"code_idx": 2, "code": "TIMELINE//DELTA//years//value_[1,2)", "value_mean": 31.86},
+        ...         {"code_idx": 3, "code": "DISCHARGE", "value_mean": None},
+        ...     ],
+        ...     schema={"code_idx": pl.Int64, "code": pl.Utf8, "value_mean": pl.Float32},
+        ... )
+        >>> validate_timeline_delta_bins_in_int64_range(clean)
+
+        Polluted bin — value_mean past the (~292k years) cliff, validator names the offender:
+
+        >>> polluted = pl.DataFrame(
+        ...     [
+        ...         {"code_idx": 1, "code": "TIMELINE//DELTA//years//value_[0,1)", "value_mean": 0.000003},
+        ...         {
+        ...             "code_idx": 2,
+        ...             "code": "TIMELINE//DELTA//years//value_[POLLUTED)",
+        ...             "value_mean": 1e30,
+        ...         },
+        ...     ],
+        ...     schema={"code_idx": pl.Int64, "code": pl.Utf8, "value_mean": pl.Float32},
+        ... )
+        >>> validate_timeline_delta_bins_in_int64_range(polluted)  # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+            ...
+        ValueError: 1 TIMELINE//DELTA bin(s) have value_mean * 31556926.080000002 ...POLLUTED...
+
+        Overflow in a non-delta bin (e.g. a HR measurement bin whose ``value_mean`` is the
+        mean numeric_value, not a time encoding) is irrelevant and ignored:
+
+        >>> non_delta_overflow = pl.DataFrame(
+        ...     [
+        ...         {"code_idx": 1, "code": "TIMELINE//DELTA//years//value_[0,1)", "value_mean": 0.000003},
+        ...         {"code_idx": 2, "code": "BIG_NUMBER//value_[POLLUTED)", "value_mean": 1e30},
+        ...     ],
+        ...     schema={"code_idx": pl.Int64, "code": pl.Utf8, "value_mean": pl.Float32},
+        ... )
+        >>> validate_timeline_delta_bins_in_int64_range(non_delta_overflow)
     """
-    metadata = _load_code_metadata(code_metadata_fp)
-    seconds_per_unit = _timeline_delta_seconds_per_unit(metadata)
+    seconds_per_unit = _timeline_delta_seconds_per_unit(code_metadata)
     int64_max = (1 << 63) - 1
-    overflow = metadata.filter(
+    overflow = code_metadata.filter(
         pl.col("code").str.starts_with(TIMELINE_DELTA_TOKEN)
         & ((pl.col("value_mean").cast(pl.Float64) * seconds_per_unit * 1_000_000).abs() > int64_max)
     ).select("code", "value_mean")
@@ -228,14 +266,14 @@ def validate_timeline_delta_bins_in_int64_range(code_metadata_fp: Path) -> None:
         return
     pairs = overflow.to_dicts()
     raise ValueError(
-        f"{overflow.height} TIMELINE//DELTA bin(s) in {code_metadata_fp} have "
-        f"value_mean * {seconds_per_unit} s/unit * 1e6 exceeding the Int64 microsecond "
-        "range. format_trajectories cannot encode these deltas without overflow, and the "
-        "resulting trajectories would be nonsensical even if it could. This usually means "
-        "upstream bin statistics were poisoned by a single outlier numeric_value averaged "
-        "into the bin's representative; fix the bin reduction in fit_quantile_binning / "
-        "bin_numeric_values (trimmed mean or median) and re-run preprocessing. Affected "
-        f"(code, value_mean) pairs: {pairs}. See issue #154 for context."
+        f"{overflow.height} TIMELINE//DELTA bin(s) have value_mean * {seconds_per_unit} "
+        "s/unit * 1e6 exceeding the Int64 microsecond range. format_trajectories cannot "
+        "encode these deltas without overflow, and the resulting trajectories would be "
+        "nonsensical even if it could. This usually means upstream bin statistics were "
+        "poisoned by a single outlier numeric_value averaged into the bin's representative; "
+        "fix the bin reduction in fit_quantile_binning / bin_numeric_values (trimmed mean "
+        f"or median) and re-run preprocessing. Affected (code, value_mean) pairs: {pairs}. "
+        "See issue #154 for context."
     )
 
 
@@ -374,7 +412,7 @@ def format_trajectories(
         ...     schema={"dataset_row_idx": pl.Int64, "tokens": pl.List(pl.Int64)},
         ... )
 
-        Per :func:`_get_code_metadata`'s doctest, in this vocabulary token IDs 31-36 are the
+        Per :func:`get_code_metadata`'s doctest, in this vocabulary token IDs 31-36 are the
         ``TIMELINE//DELTA//years//...`` codes and the rest are non-delta. Delta tokens
         advance the per-row running time by ``value_mean * seconds_per_year`` (the single
         unit pinned by the preprocessing pipeline, resolved once by
@@ -446,7 +484,7 @@ def format_trajectories(
         # ``with_row_index`` materializes a UInt32 column; cast to Int64 to match ``merged``.
         .with_columns(pl.col("dataset_row_idx").cast(pl.Int64))
     )
-    code_metadata = _get_code_metadata(base_dataset)
+    code_metadata = get_code_metadata(base_dataset)
     seconds_per_unit = _timeline_delta_seconds_per_unit(code_metadata)
 
     with_codes = (
@@ -688,6 +726,7 @@ def finalize_predictions(
 __all__ = [
     "finalize_predictions",
     "format_trajectories",
+    "get_code_metadata",
     "validate_timeline_delta_bins_in_int64_range",
     "write_rank_output",
 ]

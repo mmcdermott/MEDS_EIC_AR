@@ -1,6 +1,7 @@
 from .finalize import (
     finalize_predictions,
     format_trajectories,
+    get_code_metadata,
     validate_timeline_delta_bins_in_int64_range,
     write_rank_output,
 )

@@ -52,6 +52,7 @@ from .generation import (
 )
 from .generation.finalize import (
     finalize_predictions,
+    get_code_metadata,
     validate_timeline_delta_bins_in_int64_range,
     write_rank_output,
 )
@@ -184,7 +185,7 @@ def generate_trajectories(cfg: DictConfig):
     # blowing up partway through hours of generation — and even a "saturating" decode of such
     # a bin would yield an uninterpretable trajectory, so refusing to start is the right
     # behavior. The fix lives upstream in the bin-reduction stage; this is the downstream guard.
-    validate_timeline_delta_bins_in_int64_range(D.config.code_metadata_fp)
+    validate_timeline_delta_bins_in_int64_range(get_code_metadata(D.train_dataloader().dataset))
 
     # Validate rolling-generation config early — before loading the checkpoint and before running any
     # batches — so bad values (zero or negative budgets) fail fast with a clear message instead of
