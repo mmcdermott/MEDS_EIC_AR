@@ -58,14 +58,6 @@ logger = logging.getLogger(__name__)
 # and unit via code metadata instead of this out-of-band coupling.
 TIMELINE_DELTA_TOKEN = "TIMELINE//DELTA"
 
-# Largest f64 value that, when cast to Int64, stays in range. ``2**63 - 1`` (true Int64 max)
-# rounds *up* to ``2**63`` in f64, which then trips polars' strict cast — so we use the
-# adjacent representable f64 below it (``2**63 - 1024``). Used as the saturation bound when
-# clipping ``value_mean * seconds_per_unit * 1e6`` before the Int64 cast in
-# :func:`format_trajectories`. See issue #154.
-_INT64_F64_MAX = 9223372036854774784.0
-_INT64_F64_MIN = -_INT64_F64_MAX
-
 
 def _get_code_metadata(dataset: MEDSPytorchDataset) -> pl.DataFrame:
     """Return a DataFrame mapping code indices to their code strings and mean numeric values.
@@ -142,8 +134,18 @@ def _get_code_metadata(dataset: MEDSPytorchDataset) -> pl.DataFrame:
         │ 38       ┆ TIMELINE//START                 ┆ null       │
         └──────────┴─────────────────────────────────┴────────────┘
     """
+    return _load_code_metadata(dataset.config.code_metadata_fp)
+
+
+def _load_code_metadata(code_metadata_fp: Path) -> pl.DataFrame:
+    """Path-based variant of :func:`_get_code_metadata` — see that function for the schema.
+
+    Split out so :func:`validate_timeline_delta_bins_in_int64_range` can read code metadata
+    without needing a fully-instantiated ``MEDSPytorchDataset`` (the validator runs at CLI
+    startup, before any dataset object exists).
+    """
     columns = ["code", "code/vocab_index", "values/n_occurrences", "values/sum"]
-    metadata = pl.read_parquet(dataset.config.code_metadata_fp, columns=columns, use_pyarrow=True)
+    metadata = pl.read_parquet(code_metadata_fp, columns=columns, use_pyarrow=True)
     return metadata.select(
         pl.col("code/vocab_index").cast(pl.Int64).alias("code_idx"),
         pl.col("code"),
@@ -189,36 +191,51 @@ def _timeline_delta_seconds_per_unit(code_metadata: pl.DataFrame) -> float:
     return normalize_time_unit(units.pop())[1]
 
 
-def _warn_on_overflowing_delta_bins(code_metadata: pl.DataFrame, seconds_per_unit: float) -> None:
-    """Log a warning naming any TIMELINE//DELTA bin whose microsecond delta overflows Int64.
+def validate_timeline_delta_bins_in_int64_range(code_metadata_fp: Path) -> None:
+    """Fail fast at CLI startup if any TIMELINE//DELTA bin would overflow Int64 microseconds.
 
-    Issue #154: ``value_mean * seconds_per_unit * 1e6`` can overflow Int64 when an upstream
-    bin's mean is corrupted by a single extreme numeric_value (the reproducer was a bin with
-    ``value_mean ≈ 1.9e19`` "years"). :func:`format_trajectories` saturates the cast so the
-    run finishes, but silent saturation hides which bin is bad — and the bad bin will keep
-    producing nonsensical timestamps until it's fixed upstream. Surfacing the offending
-    ``(code, value_mean)`` pairs once at finalize gives users the breadcrumb to track it
-    back to ``fit_quantile_binning`` / ``bin_numeric_values`` output.
+    :func:`format_trajectories` encodes per-token time deltas as Int64 microseconds
+    (``value_mean * seconds_per_unit * 1e6``). When a TIMELINE//DELTA bin's ``value_mean``
+    is large enough that this product exceeds the Int64 range — which happens when upstream
+    bin statistics get poisoned by a single outlier ``numeric_value`` averaged into the bin
+    (issue #154's reproducer was ``value_mean ≈ 1.9e19`` "years") — the strict cast in
+    finalize blows up partway through generation, after potentially hours of compute.
 
-    Scoped to the small (n_vocab) ``code_metadata`` rather than the per-token exploded
-    DataFrame so this scan is cheap regardless of trajectory length.
+    Even with a saturating cast the resulting trajectory would be nonsense (the offending
+    delta clamps to ~292,000 years, breaking any longitudinal interpretation), so the right
+    move is to refuse to start: scan the small (``n_vocab``-sized) code metadata once at CLI
+    entry and raise ``ValueError`` with the offending bins named, before any model load or
+    predict pass runs. The fix for the underlying pollution lives upstream in
+    ``fit_quantile_binning`` / ``bin_numeric_values`` (use a trimmed mean / median rather
+    than a raw mean for the bin representative); this validator is the downstream guard.
+
+    Args:
+        code_metadata_fp: path to the dataset's ``codes.parquet`` (typically
+            ``MEDSPytorchDataset.config.code_metadata_fp``).
+
+    Raises:
+        ValueError: if any TIMELINE//DELTA bin's ``value_mean * seconds_per_unit * 1e6``
+            exceeds the Int64 representable range.
     """
-    overflow = code_metadata.filter(
+    metadata = _load_code_metadata(code_metadata_fp)
+    seconds_per_unit = _timeline_delta_seconds_per_unit(metadata)
+    int64_max = (1 << 63) - 1
+    overflow = metadata.filter(
         pl.col("code").str.starts_with(TIMELINE_DELTA_TOKEN)
-        & ((pl.col("value_mean").cast(pl.Float64) * seconds_per_unit * 1_000_000).abs() > _INT64_F64_MAX)
+        & ((pl.col("value_mean").cast(pl.Float64) * seconds_per_unit * 1_000_000).abs() > int64_max)
     ).select("code", "value_mean")
     if overflow.height == 0:
         return
     pairs = overflow.to_dicts()
-    logger.warning(
-        "format_trajectories: %d TIMELINE//DELTA bin(s) have value_mean * %s s/unit * 1e6 "
-        "exceeding the Int64 microsecond range; saturating their delta cast to ±i64 max so "
-        "generation finalize doesn't crash. This typically indicates polluted bin statistics "
-        "upstream (a single outlier numeric_value averaged into the bin). Affected (code, "
-        "value_mean) pairs: %s. See issue #154 for context.",
-        overflow.height,
-        seconds_per_unit,
-        pairs,
+    raise ValueError(
+        f"{overflow.height} TIMELINE//DELTA bin(s) in {code_metadata_fp} have "
+        f"value_mean * {seconds_per_unit} s/unit * 1e6 exceeding the Int64 microsecond "
+        "range. format_trajectories cannot encode these deltas without overflow, and the "
+        "resulting trajectories would be nonsensical even if it could. This usually means "
+        "upstream bin statistics were poisoned by a single outlier numeric_value averaged "
+        "into the bin's representative; fix the bin reduction in fit_quantile_binning / "
+        "bin_numeric_values (trimmed mean or median) and re-run preprocessing. Affected "
+        f"(code, value_mean) pairs: {pairs}. See issue #154 for context."
     )
 
 
@@ -381,44 +398,40 @@ def format_trajectories(
         >>> with pl.Config(tbl_rows=-1):
         ...     print(format_trajectories(pytorch_dataset_with_task, merged))
         shape: (16, 5)
-        ┌────────────┬─────────────────┬─────────────────────┬─────────────────────────────┬───────────────┐
-        │ subject_id ┆ time            ┆ prediction_time     ┆ code                        ┆ numeric_value │
-        │ ---        ┆ ---             ┆ ---                 ┆ ---                         ┆ ---           │
-        │ i64        ┆ datetime[μs]    ┆ datetime[μs]        ┆ str                         ┆ f32           │
-        ╞════════════╪═════════════════╪═════════════════════╪═════════════════════════════╪═══════════════╡
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//years//val ┆ 0.000003      │
-        │            ┆ 17:50:27.999999 ┆                     ┆ ue_…                        ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ DISCHARGE                   ┆ null          │
-        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
-        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ DISCHARGE                   ┆ null          │
-        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ ADMISSION//PULMONARY        ┆ null          │
-        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ DISCHARGE                   ┆ null          │
-        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
-        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107.5)     ┆ 105.099998    │
-        │            ┆ 17:50:27.999999 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//years//val ┆ 0.00004       │
-        │            ┆ 18:11:40.400032 ┆                     ┆ ue_…                        ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:00:00 ┆ HR//value_[107.5,107.7)     ┆ 107.5         │
-        │            ┆ 18:11:40.400032 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//years//val ┆ 0.000015      │
-        │            ┆ 18:33:18.999982 ┆                     ┆ ue_…                        ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.7,112.5)     ┆ 108.349998    │
-        │            ┆ 18:33:18.999982 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//years//val ┆ 0.00004       │
-        │            ┆ 18:54:31.400015 ┆                     ┆ ue_…                        ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.5,107.7)     ┆ 107.5         │
-        │            ┆ 18:54:31.400015 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ ADMISSION//CARDIAC          ┆ null          │
-        │            ┆ 18:54:31.400015 ┆                     ┆                             ┆               │
-        │ 239684     ┆ 2010-05-11      ┆ 2010-05-11 18:30:00 ┆ TIMELINE//END               ┆ null          │
-        │            ┆ 18:54:31.400015 ┆                     ┆                             ┆               │
-        └────────────┴─────────────────┴─────────────────────┴─────────────────────────────┴───────────────┘
+        ┌────────────┬───────────────────────┬─────────────────────┬───────────────────────┬───────────────┐
+        │ subject_id ┆ time                  ┆ prediction_time     ┆ code                  ┆ numeric_value │
+        │ ---        ┆ ---                   ┆ ---                 ┆ ---                   ┆ ---           │
+        │ i64        ┆ datetime[μs]          ┆ datetime[μs]        ┆ str                   ┆ f32           │
+        ╞════════════╪═══════════════════════╪═════════════════════╪═══════════════════════╪═══════════════╡
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//year ┆ 0.000003      │
+        │            ┆                       ┆                     ┆ s//value_…            ┆               │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ DISCHARGE             ┆ null          │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107. ┆ 105.099998    │
+        │            ┆                       ┆                     ┆ 5)                    ┆               │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ DISCHARGE             ┆ null          │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ ADMISSION//PULMONARY  ┆ null          │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ DISCHARGE             ┆ null          │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107. ┆ 105.099998    │
+        │            ┆                       ┆                     ┆ 5)                    ┆               │
+        │ 239684     ┆ 2010-05-11 17:50:28   ┆ 2010-05-11 18:00:00 ┆ HR//value_[105.1,107. ┆ 105.099998    │
+        │            ┆                       ┆                     ┆ 5)                    ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:00:00 ┆ TIMELINE//DELTA//year ┆ 0.00004       │
+        │            ┆ 18:11:40.400          ┆                     ┆ s//value_…            ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:00:00 ┆ HR//value_[107.5,107. ┆ 107.5         │
+        │            ┆ 18:11:40.400          ┆                     ┆ 7)                    ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//year ┆ 0.000015      │
+        │            ┆ 18:33:18.999968       ┆                     ┆ s//value_…            ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.7,112. ┆ 108.349998    │
+        │            ┆ 18:33:18.999968       ┆                     ┆ 5)                    ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//DELTA//year ┆ 0.00004       │
+        │            ┆ 18:54:31.399968       ┆                     ┆ s//value_…            ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ HR//value_[107.5,107. ┆ 107.5         │
+        │            ┆ 18:54:31.399968       ┆                     ┆ 7)                    ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ ADMISSION//CARDIAC    ┆ null          │
+        │            ┆ 18:54:31.399968       ┆                     ┆                       ┆               │
+        │ 239684     ┆ 2010-05-11            ┆ 2010-05-11 18:30:00 ┆ TIMELINE//END         ┆ null          │
+        │            ┆ 18:54:31.399968       ┆                     ┆                       ┆               │
+        └────────────┴───────────────────────┴─────────────────────┴───────────────────────┴───────────────┘
     """
     # Flatten the nested ``tokens`` column to one row per generated code, then join against
     # schema (for subject_id / prediction_time / last-time per base-dataset row) and against
@@ -435,7 +448,6 @@ def format_trajectories(
     )
     code_metadata = _get_code_metadata(base_dataset)
     seconds_per_unit = _timeline_delta_seconds_per_unit(code_metadata)
-    _warn_on_overflowing_delta_bins(code_metadata, seconds_per_unit)
 
     with_codes = (
         merged.explode("tokens")
@@ -465,23 +477,16 @@ def format_trajectories(
     return (
         with_codes.join(schema_df, on="dataset_row_idx", how="left")
         .with_columns(
+            # The strict Int64 cast is intentional: any TIMELINE//DELTA bin whose product
+            # would overflow Int64 microseconds is caught at CLI startup by
+            # :func:`validate_timeline_delta_bins_in_int64_range`, so finalize only ever sees
+            # well-formed bins here. If this strict cast ever does fire, that's a real bug
+            # (a polluted vocab that bypassed the validator) and a hard crash is the right
+            # behavior — the resulting trajectory would be uninterpretable.
             delta_us=pl.when(pl.col("code").str.starts_with(TIMELINE_DELTA_TOKEN))
-            .then(
-                # Saturating cast: clip the float microsecond product to the Int64-safe f64
-                # range *before* the strict cast, so a polluted ``value_mean`` (#154) yields a
-                # nonsensical-but-finite delta instead of crashing the entire generation
-                # finalize step. ``_warn_on_overflowing_delta_bins`` above logs which bin(s)
-                # tripped this so users can chase the upstream pollution.
-                #
-                # The explicit ``cast(Float64)`` matters: ``value_mean`` is Float32, and f32
-                # arithmetic on ~1e19 inputs is lossy enough that clipping in f32 still leaves
-                # a value that promotes to ``2**63`` (one ULP above Int64 max) on the way to
-                # the cast. Doing the multiply + clip in f64 keeps the bound representable.
-                (pl.col("value_mean").cast(pl.Float64) * seconds_per_unit * 1_000_000)
-                .clip(_INT64_F64_MIN, _INT64_F64_MAX)
-                .cast(pl.Int64)
-            )
+            .then(pl.col("value_mean") * seconds_per_unit * 1_000_000)
             .otherwise(0)
+            .cast(pl.Int64)
         )
         # Cumulative per-row: time = last_time + sum of all prior (and current) delta_us within
         # this dataset_row_idx. ``explode`` preserves source order within each list, so
@@ -680,4 +685,9 @@ def finalize_predictions(
             logger.debug(f"rmdir({rank_outputs_dir}) did not succeed: {exc}")
 
 
-__all__ = ["finalize_predictions", "format_trajectories", "write_rank_output"]
+__all__ = [
+    "finalize_predictions",
+    "format_trajectories",
+    "validate_timeline_delta_bins_in_int64_range",
+    "write_rank_output",
+]

@@ -1,149 +1,120 @@
-"""Regression tests for format_trajectories int64 overflow on extreme TIMELINE//DELTA bin means.
+"""Regression tests for the issue #154 vocabulary validator.
 
-Issue #154: when any ``TIMELINE//DELTA`` bin's ``value_mean`` is large enough that
-``value_mean * seconds_per_unit * 1e6`` exceeds the Int64 range, the strict cast in
-:func:`MEDS_EIC_AR.generation.finalize.format_trajectories` raises ``InvalidOperationError``
-and tears down the entire generation run — even when only one row in one trajectory
-hits the polluted bin. The fix replaces the strict cast with a saturating one (clip to
-the Int64-safe f64 bounds, then cast), so the run continues and the offending row gets
-an out-of-range-but-finite timestamp instead of crashing the job.
+A polluted ``TIMELINE//DELTA`` bin (a single outlier numeric_value averaged into the bin
+upstream) makes ``value_mean * seconds_per_unit * 1e6`` overflow Int64 microseconds, so
+``format_trajectories`` cannot encode the per-token delta and the resulting trajectory
+would be uninterpretable even if the cast were saturating. The fix is to refuse to start
+generation at all when the vocab has any such bin —
+:func:`validate_timeline_delta_bins_in_int64_range` runs at CLI startup, before any model
+load or predict pass, and raises ``ValueError`` naming the offending bins so the user can
+go fix the upstream bin reduction (``fit_quantile_binning`` / ``bin_numeric_values``).
 
-These tests don't go through the heavyweight ``MEDSPytorchDataset`` — we patch
-:func:`_get_code_metadata` and stand up a synthetic ``schema_df`` so the test isolates
-the cast behavior in ``format_trajectories``.
+These tests target the validator directly with synthetic ``codes.parquet`` files instead
+of standing up a full ``MEDSPytorchDataset`` — the validator's contract is a path in,
+nothing or an exception out.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from types import SimpleNamespace
-from unittest.mock import patch
+from typing import TYPE_CHECKING
 
 import polars as pl
 import pytest
-from meds import DataSchema, LabelSchema
-from meds_torchdata import MEDSPytorchDataset
 
-from MEDS_EIC_AR.generation import finalize
-from MEDS_EIC_AR.generation.finalize import TIMELINE_DELTA_TOKEN, format_trajectories
+from MEDS_EIC_AR.generation.finalize import (
+    TIMELINE_DELTA_TOKEN,
+    validate_timeline_delta_bins_in_int64_range,
+)
 
-# value_mean (in years) large enough that value_mean * 3.1557e7 * 1e6 overflows Int64.
-# Mirrors the polluted bin reported in issue #154 ("1.8985e19 years").
-_POLLUTED_VALUE_MEAN = 1.8985e19
+if TYPE_CHECKING:
+    from pathlib import Path
 
-# Saturating cast lower bound: largest f64 <= INT64_MAX (= 2**63 - 1024).
-_INT64_F64_MAX = 9223372036854774784
+_SECONDS_PER_YEAR = 31_556_926.08
+_INT64_MAX = (1 << 63) - 1
 
-
-def _build_code_metadata() -> pl.DataFrame:
-    """Synthetic vocab: one normal delta bin, one polluted delta bin, one non-delta code."""
-    return pl.DataFrame(
-        {
-            "code_idx": [1, 2, 3],
-            "code": [
-                f"{TIMELINE_DELTA_TOKEN}//years//value_[0,1)",
-                f"{TIMELINE_DELTA_TOKEN}//years//value_[POLLUTED)",
-                "DISCHARGE",
-            ],
-            "value_mean": [0.000003, _POLLUTED_VALUE_MEAN, None],
-        },
-        schema={"code_idx": pl.Int64, "code": pl.Utf8, "value_mean": pl.Float32},
-    )
+# Pick a value_mean (in years) that's strictly larger than the largest one that would still
+# fit in Int64 microseconds — derived from Int64 max so the test stays correct if the unit
+# or the cast width ever changes, instead of pinning the issue's reported "1.9e19" magic
+# number. ``* 2`` gives comfortable headroom past the boundary.
+_OVERFLOWING_VALUE_MEAN = 2.0 * _INT64_MAX / (_SECONDS_PER_YEAR * 1_000_000)
+_SAFE_VALUE_MEAN = 0.000003  # ~95 ms — the "normal" delta scale in the demo vocab.
 
 
-def _build_base_dataset() -> SimpleNamespace:
-    """Minimal stand-in for ``MEDSPytorchDataset``: only needs ``schema_df``."""
-    schema_df = pl.DataFrame(
-        {
-            DataSchema.subject_id_name: [42],
-            LabelSchema.prediction_time_name: [datetime(2024, 1, 1, 12, 0, 0)],  # noqa: DTZ001
-            MEDSPytorchDataset.LAST_TIME: [datetime(2024, 1, 1, 11, 0, 0)],  # noqa: DTZ001
-        },
+def _write_codes_parquet(fp: Path, rows: list[dict]) -> None:
+    """Write a minimal MEDS-shaped ``codes.parquet`` with just the columns the validator reads.
+
+    The four-column subset (``code``, ``code/vocab_index``, ``values/n_occurrences``,
+    ``values/sum``) matches what ``_load_code_metadata`` selects; ``value_mean`` is then
+    computed inside the validator as ``values/sum / values/n_occurrences``.
+    """
+    pl.DataFrame(
+        rows,
         schema={
-            DataSchema.subject_id_name: pl.Int64,
-            LabelSchema.prediction_time_name: pl.Datetime("us"),
-            MEDSPytorchDataset.LAST_TIME: pl.Datetime("us"),
+            "code": pl.Utf8,
+            "code/vocab_index": pl.Int64,
+            "values/n_occurrences": pl.Int64,
+            "values/sum": pl.Float64,
         },
+    ).write_parquet(fp)
+
+
+def _row(code: str, idx: int, value_mean: float | None) -> dict:
+    """Encode a vocab row in (sum, n_occurrences) form so value_mean computes back to ``value_mean``."""
+    if value_mean is None:
+        return {"code": code, "code/vocab_index": idx, "values/n_occurrences": 0, "values/sum": 0.0}
+    return {"code": code, "code/vocab_index": idx, "values/n_occurrences": 1, "values/sum": value_mean}
+
+
+def test_validator_passes_on_clean_vocab(tmp_path: Path):
+    """A vocabulary whose delta bins all fit in Int64 microseconds is accepted silently."""
+    fp = tmp_path / "codes.parquet"
+    _write_codes_parquet(
+        fp,
+        [
+            _row(f"{TIMELINE_DELTA_TOKEN}//years//value_[0,1)", 1, _SAFE_VALUE_MEAN),
+            _row(f"{TIMELINE_DELTA_TOKEN}//years//value_[1,2)", 2, _SAFE_VALUE_MEAN * 10),
+            _row("DISCHARGE", 3, None),
+        ],
     )
-    return SimpleNamespace(schema_df=schema_df)
+
+    validate_timeline_delta_bins_in_int64_range(fp)
 
 
-def _merged_with_polluted_token() -> pl.DataFrame:
-    # One row with the polluted-bin token (idx=2) followed by a non-delta token (idx=3).
-    return pl.DataFrame(
-        {"dataset_row_idx": [0], "tokens": [[2, 3]]},
-        schema={"dataset_row_idx": pl.Int64, "tokens": pl.List(pl.Int64)},
+def test_validator_rejects_polluted_vocab(tmp_path: Path):
+    """A vocabulary with any TIMELINE//DELTA bin past Int64 microseconds is refused, naming the bin."""
+    fp = tmp_path / "codes.parquet"
+    polluted_code = f"{TIMELINE_DELTA_TOKEN}//years//value_[POLLUTED)"
+    _write_codes_parquet(
+        fp,
+        [
+            _row(f"{TIMELINE_DELTA_TOKEN}//years//value_[0,1)", 1, _SAFE_VALUE_MEAN),
+            _row(polluted_code, 2, _OVERFLOWING_VALUE_MEAN),
+            _row("DISCHARGE", 3, None),
+        ],
     )
 
+    with pytest.raises(ValueError, match="TIMELINE//DELTA") as exc_info:
+        validate_timeline_delta_bins_in_int64_range(fp)
+    msg = str(exc_info.value)
+    assert polluted_code in msg, f"validator should name the offending bin: {msg!r}"
+    assert "Int64" in msg, f"validator should explain the failure mode: {msg!r}"
 
-def _merged_normal_only() -> pl.DataFrame:
-    return pl.DataFrame(
-        {"dataset_row_idx": [0], "tokens": [[1, 3]]},
-        schema={"dataset_row_idx": pl.Int64, "tokens": pl.List(pl.Int64)},
+
+def test_validator_ignores_overflow_in_non_delta_bins(tmp_path: Path):
+    """Only TIMELINE//DELTA bins gate generation; other codes' value_mean is irrelevant here.
+
+    A non-delta code's ``value_mean`` is the mean numeric_value of observations of that code
+    (e.g. the mean heart rate within a HR bin) — it never participates in the time-encoding
+    cast. Pin this so a future "validate every bin" change doesn't sneak in and start
+    rejecting datasets with legitimately large numeric measurements.
+    """
+    fp = tmp_path / "codes.parquet"
+    _write_codes_parquet(
+        fp,
+        [
+            _row(f"{TIMELINE_DELTA_TOKEN}//years//value_[0,1)", 1, _SAFE_VALUE_MEAN),
+            _row("BIG_NUMBER//value_[POLLUTED)", 2, _OVERFLOWING_VALUE_MEAN),
+        ],
     )
 
-
-def test_format_trajectories_saturates_on_polluted_bin_instead_of_crashing():
-    """An extreme ``value_mean`` no longer crashes the run; the row gets a saturated time."""
-    base_dataset = _build_base_dataset()
-    code_metadata = _build_code_metadata()
-    merged = _merged_with_polluted_token()
-
-    with patch.object(finalize, "_get_code_metadata", return_value=code_metadata):
-        out = format_trajectories(base_dataset, merged)
-
-    # Two output rows: the polluted delta token and the trailing DISCHARGE.
-    assert out.height == 2
-    # Polluted-bin numeric_value passes through unchanged (the value is what diagnoses upstream
-    # bin pollution; we don't silently scrub it on the trajectory side).
-    polluted_row = out.filter(pl.col(DataSchema.code_name).str.contains("POLLUTED"))
-    assert polluted_row.height == 1
-    assert polluted_row[DataSchema.numeric_value_name][0] == pytest.approx(_POLLUTED_VALUE_MEAN, rel=1e-3)
-
-    # The DISCHARGE row's timestamp is whatever ``LAST_TIME + saturated delta`` gives —
-    # nonsensical clinically, but finite. The contract is "no crash" — we don't pin the
-    # exact wall-clock timestamp here because polars datetime arithmetic on near-i64-max
-    # microsecond deltas is implementation-defined (it may wrap or clamp). What matters is
-    # that the run produced output for the trajectory.
-    discharge_row = out.filter(pl.col(DataSchema.code_name) == "DISCHARGE")
-    assert discharge_row.height == 1
-
-
-def test_format_trajectories_normal_path_unchanged_by_saturation():
-    """The clip is a no-op for non-polluted bins: timestamps match pre-fix behavior."""
-    base_dataset = _build_base_dataset()
-    code_metadata = _build_code_metadata()
-    merged = _merged_normal_only()
-
-    with patch.object(finalize, "_get_code_metadata", return_value=code_metadata):
-        out = format_trajectories(base_dataset, merged)
-
-    # Token 1 is a normal delta bin (value_mean = 3e-6 years ≈ 94.67 s); token 3 is DISCHARGE.
-    # The DISCHARGE row lands at ``LAST_TIME + value_mean(f64) * 31556926 s/yr * 1e6 us/s``
-    # cast to Int64 = 94670781 us = 1 min 34.670781 s past LAST_TIME.
-    #
-    # The pre-fix path multiplied in f32 and produced 94670784 us; the saturating-cast path
-    # casts ``value_mean`` to f64 first (the cast site comment explains why — f32 arithmetic
-    # at ~1e19 produces values one ULP above Int64 max even after clipping), so the same
-    # input produces a 3-us-shifted timestamp. That's a deliberate precision improvement,
-    # not a regression — pinning it here so a future return-to-f32-arithmetic change shows up.
-    discharge_row = out.filter(pl.col(DataSchema.code_name) == "DISCHARGE")
-    assert discharge_row.height == 1
-    assert discharge_row[DataSchema.time_name][0] == datetime(2024, 1, 1, 11, 1, 34, 670781)  # noqa: DTZ001
-
-
-def test_format_trajectories_logs_warning_on_polluted_bin(caplog):
-    """Polluted bins surface as a warning so users can identify the bad bin in the vocab."""
-    base_dataset = _build_base_dataset()
-    code_metadata = _build_code_metadata()
-    merged = _merged_with_polluted_token()
-
-    with (
-        caplog.at_level("WARNING", logger=finalize.__name__),
-        patch.object(finalize, "_get_code_metadata", return_value=code_metadata),
-    ):
-        format_trajectories(base_dataset, merged)
-
-    msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert any("POLLUTED" in m for m in msgs), f"Expected a warning naming the polluted bin, got: {msgs!r}"
-    assert any("saturat" in m.lower() or "clip" in m.lower() or "overflow" in m.lower() for m in msgs)
+    validate_timeline_delta_bins_in_int64_range(fp)
