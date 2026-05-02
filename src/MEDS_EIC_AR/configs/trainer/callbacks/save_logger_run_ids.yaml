@@ -1,0 +1,2 @@
+save_logger_run_ids:
+  _target_: MEDS_EIC_AR.training.SaveLoggerRunIDsOnTrainStart

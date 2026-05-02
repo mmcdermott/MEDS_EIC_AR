@@ -65,7 +65,6 @@ from .utils import (
     oc_min,
     resolve_generation_context_size,
     save_environment_snapshot,
-    save_logger_run_ids,
     save_resolved_config,
     sub,
 )
@@ -150,7 +149,6 @@ def pretrain(cfg: DictConfig):
         trainer_kwargs["ckpt_path"] = ckpt_path
 
     trainer.fit(**trainer_kwargs)
-    save_logger_run_ids(trainer.loggers, output_dir)
 
     best_ckpt_path = Path(trainer.checkpoint_callback.best_model_path)
     if not best_ckpt_path.is_file():
@@ -231,6 +229,11 @@ def generate_trajectories(cfg: DictConfig):
             "you're running this for any other purpose, set inference.do_sample=true."
         )
 
+    # Generation is always associated with the training run's logger, so the only
+    # place to look for run ids is the training save-point under
+    # ``model_initialization_dir``. Issue #131 reported an orphan-write where
+    # generation also saved its own ids under ``output_dir`` — that write is gone now,
+    # eliminating the bug at the source rather than papering over it with a layered read.
     apply_saved_logger_run_ids(cfg.trainer, Path(cfg.model_initialization_dir))
     trainer = instantiate(cfg.trainer)
 
@@ -346,10 +349,4 @@ def generate_trajectories(cfg: DictConfig):
             )
         trainer.strategy.barrier()
 
-    # Save the generation run's logger ids into the *generation* ``output_dir``, not the
-    # training checkpoint's ``model_initialization_dir``. A caller using the escape hatch
-    # described in ``apply_saved_logger_run_ids`` (explicit fresh ``run_id`` for generation)
-    # would otherwise overwrite the training run's saved ids and change what future pretrain-
-    # resume attaches to. Separating the two directories keeps the pretrain save-point frozen.
-    save_logger_run_ids(trainer.loggers, Path(cfg.output_dir))
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")

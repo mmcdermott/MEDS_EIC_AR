@@ -25,7 +25,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import torch
-from lightning.pytorch.loggers import Logger
+from lightning.pytorch.loggers import Logger, MLFlowLogger, WandbLogger
 from MEDS_transforms.configs.utils import OmegaConfResolver
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
@@ -33,49 +33,19 @@ logger = logging.getLogger(__name__)
 
 
 def is_mlflow_logger(logger: Logger) -> bool:
-    """This function checks if a pytorch lightning logger is an MLFlow logger.
-
-    It is protected against the case that mlflow is not installed.
-    """
-
-    try:
-        from lightning.pytorch.loggers import MLFlowLogger
-
-        return isinstance(logger, MLFlowLogger)
-    except ImportError:
-        return False
+    """Return whether a Lightning logger is an :class:`MLFlowLogger`."""
+    return isinstance(logger, MLFlowLogger)
 
 
 def is_wandb_logger(logger: Logger) -> bool:
-    """Check whether a Lightning logger is a WandB logger.
-
-    The import of :class:`~lightning.pytorch.loggers.WandbLogger` may fail if
-    the optional ``wandb`` dependency is not installed. This helper safely
-    returns ``False`` in that situation.
+    """Return whether a Lightning logger is a :class:`WandbLogger`.
 
     Example:
-        >>> class DummyLogger:
-        ...     ...
+        >>> class DummyLogger: ...
         >>> is_wandb_logger(DummyLogger())
         False
-        >>> import builtins
-        >>> from unittest.mock import patch
-        >>> original_import = builtins.__import__
-        >>> def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        ...     if name == "lightning.pytorch.loggers" and "WandbLogger" in fromlist:
-        ...         raise ImportError
-        ...     return original_import(name, globals, locals, fromlist, level)
-        >>> with patch.object(builtins, "__import__", fake_import):
-        ...     is_wandb_logger(DummyLogger())
-        False
     """
-
-    try:
-        from lightning.pytorch.loggers import WandbLogger
-
-        return isinstance(logger, WandbLogger)
-    except ImportError:
-        return False
+    return isinstance(logger, WandbLogger)
 
 
 def hash_based_seed(seed: int | None, split: str) -> int:
@@ -518,9 +488,11 @@ def _read_saved_id(fp: Path) -> str | None:
 def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
     """Populate logger configs with saved experiment IDs if present.
 
-    This helper mutates the provided trainer configuration in-place and reads
-    any saved run IDs from ``<run_dir>/loggers``. It is kept separate from
-    OmegaConf resolvers so configuration loading remains straightforward.
+    Reads any saved run IDs from ``<run_dir>/loggers`` and mutates ``trainer_cfg``
+    in-place. ``run_dir`` is the single source of truth: pretrain points it at its
+    ``output_dir`` (where the on-train-start callback also writes), generation points
+    it at ``model_initialization_dir`` so generation runs always attach to the
+    training-run logger.
 
     Example:
         >>> from yaml_to_disk import yaml_disk
@@ -601,15 +573,28 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
     for logger_cfg in loggers:
         target = str(logger_cfg.get("_target_", "")).lower()
         if "wandb" in target:
-            fp = log_dir / "wandb_run_id.txt"
-            saved = _read_saved_id(fp)
+            saved = _read_saved_id(log_dir / "wandb_run_id.txt")
             if saved and not logger_cfg.get("id"):
+                # ``logger_cfg`` may be a Hydra-composed DictConfig in struct mode (the
+                # default for configs loaded via ``hydra.main`` / ``hydra.compose``).
+                # Setting a key absent from the source yaml — like ``resume``, which the
+                # repo's ``configs/trainer/logger/wandb.yaml`` does not declare — would
+                # raise ``ConfigKeyError`` under struct enforcement. Temporarily drop the
+                # struct flag so the resume-keyword assignment goes through, then restore
+                # it. ``id`` is already declared in the yaml so it doesn't need this.
                 logger_cfg["id"] = saved
-                logger_cfg.setdefault("resume", "allow")
+                if isinstance(logger_cfg, DictConfig):
+                    was_struct = OmegaConf.is_struct(logger_cfg)
+                    OmegaConf.set_struct(logger_cfg, False)
+                    try:
+                        logger_cfg.setdefault("resume", "allow")
+                    finally:
+                        OmegaConf.set_struct(logger_cfg, was_struct)
+                else:
+                    logger_cfg.setdefault("resume", "allow")
         elif "mlflow" in target:
-            fp = log_dir / "mlflow_run_id.txt"
             applied_saved_run_id = False
-            saved = _read_saved_id(fp)
+            saved = _read_saved_id(log_dir / "mlflow_run_id.txt")
             if saved and not logger_cfg.get("run_id"):
                 logger_cfg["run_id"] = saved
                 applied_saved_run_id = True
@@ -653,12 +638,11 @@ def save_logger_run_ids(loggers: Sequence[Logger], run_dir: Path) -> None:
         ...         self.experiment = DummyWandBExp(exp_id)
         >>> import tempfile
         >>> from unittest.mock import patch
-        >>> mlflow_patch = patch(
-        ...     "lightning.pytorch.loggers.MLFlowLogger", DummyMLFlowLogger, create=True
-        ... )
-        >>> wandb_patch = patch(
-        ...     "lightning.pytorch.loggers.WandbLogger", DummyWandbLogger, create=True
-        ... )
+        >>> # ``is_mlflow_logger`` / ``is_wandb_logger`` resolve the class names from this
+        >>> # module's namespace (top-level import), so patch them there — patching the
+        >>> # ``lightning.pytorch.loggers.*`` source has no effect on already-bound names.
+        >>> mlflow_patch = patch("MEDS_EIC_AR.utils.MLFlowLogger", DummyMLFlowLogger)
+        >>> wandb_patch = patch("MEDS_EIC_AR.utils.WandbLogger", DummyWandbLogger)
         >>> with mlflow_patch, wandb_patch, tempfile.TemporaryDirectory() as tmp:
         ...     run_dir = Path(tmp)
         ...     save_logger_run_ids(
