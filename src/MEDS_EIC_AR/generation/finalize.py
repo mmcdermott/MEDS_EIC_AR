@@ -242,7 +242,7 @@ def validate_timeline_delta_bins_in_int64_range(code_metadata: pl.DataFrame) -> 
         >>> validate_timeline_delta_bins_in_int64_range(polluted)  # doctest: +ELLIPSIS
         Traceback (most recent call last):
             ...
-        ValueError: 1 TIMELINE//DELTA bin(s) have value_mean * 31556926.080000002 ...POLLUTED...
+        ValueError: 1 TIMELINE//DELTA bin(s) have a value_mean that, when converted ...POLLUTED...
 
         Overflow in a non-delta bin (e.g. a HR measurement bin whose ``value_mean`` is the
         mean numeric_value, not a time encoding) is irrelevant and ignored:
@@ -266,14 +266,14 @@ def validate_timeline_delta_bins_in_int64_range(code_metadata: pl.DataFrame) -> 
         return
     pairs = overflow.to_dicts()
     raise ValueError(
-        f"{overflow.height} TIMELINE//DELTA bin(s) have value_mean * {seconds_per_unit} "
-        "s/unit * 1e6 exceeding the Int64 microsecond range. format_trajectories cannot "
-        "encode these deltas without overflow, and the resulting trajectories would be "
-        "nonsensical even if it could. This usually means upstream bin statistics were "
-        "poisoned by a single outlier numeric_value averaged into the bin's representative; "
-        "fix the bin reduction in fit_quantile_binning / bin_numeric_values (trimmed mean "
-        f"or median) and re-run preprocessing. Affected (code, value_mean) pairs: {pairs}. "
-        "See issue #154 for context."
+        f"{overflow.height} TIMELINE//DELTA bin(s) have a value_mean that, when converted "
+        f"to microseconds (* {seconds_per_unit} s/unit * 1e6), exceeds the Int64 range. "
+        "format_trajectories cannot encode these deltas without overflow, and the resulting "
+        "trajectories would be nonsensical even if it could. This usually means upstream "
+        "bin statistics were poisoned by a single outlier numeric_value averaged into the "
+        "bin's representative; fix the bin reduction in fit_quantile_binning / "
+        f"bin_numeric_values (trimmed mean or median) and re-run preprocessing. Affected "
+        f"(code, value_mean) pairs: {pairs}. See issue #154 for context."
     )
 
 
@@ -721,12 +721,3 @@ def finalize_predictions(
             rank_outputs_dir.rmdir()
         except OSError as exc:
             logger.debug(f"rmdir({rank_outputs_dir}) did not succeed: {exc}")
-
-
-__all__ = [
-    "finalize_predictions",
-    "format_trajectories",
-    "get_code_metadata",
-    "validate_timeline_delta_bins_in_int64_range",
-    "write_rank_output",
-]
