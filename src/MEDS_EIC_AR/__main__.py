@@ -50,7 +50,12 @@ from .generation import (
     get_timeline_end_token_idx,
     validate_rolling_cfg,
 )
-from .generation.finalize import finalize_predictions, write_rank_output
+from .generation.finalize import (
+    finalize_predictions,
+    get_code_metadata,
+    validate_timeline_delta_bins_in_int64_range,
+    write_rank_output,
+)
 from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
@@ -171,6 +176,14 @@ def generate_trajectories(cfg: DictConfig):
     torch.set_float32_matmul_precision("medium")
 
     D = instantiate(cfg.datamodule)
+
+    # Reject vocabularies with TIMELINE//DELTA bins whose ``value_mean * seconds_per_unit *
+    # 1e6`` would overflow Int64 microseconds (issue #154). Doing this before the checkpoint
+    # load / predict pass means a polluted bin fails the run in the first second instead of
+    # blowing up partway through hours of generation — and even a "saturating" decode of such
+    # a bin would yield an uninterpretable trajectory, so refusing to start is the right
+    # behavior. The fix lives upstream in the bin-reduction stage; this is the downstream guard.
+    validate_timeline_delta_bins_in_int64_range(get_code_metadata(D.train_dataloader().dataset))
 
     # Validate rolling-generation config early — before loading the checkpoint and before running any
     # batches — so bad values (zero or negative budgets) fail fast with a clear message instead of
