@@ -1,9 +1,24 @@
 import statistics
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import Logger
+
+from MEDS_EIC_AR.utils import save_logger_run_ids
+
+
+class SaveLoggerRunIDsOnTrainStart(Callback):
+    """Persist MLFlow / WandB run ids on ``on_train_start`` so an interrupted fit is resumable.
+
+    Writes to ``<trainer.default_root_dir>/loggers/`` — the same root every other
+    output (checkpoints, hydra config dump) is anchored at, so a single ``output_dir``
+    knob in the trainer config controls the whole run's on-disk layout.
+    """
+
+    def on_train_start(self, trainer, pl_module):
+        save_logger_run_ids(trainer.loggers, Path(trainer.default_root_dir))
 
 
 class GenerationSpeedLogger(Callback):

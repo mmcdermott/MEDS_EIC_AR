@@ -50,7 +50,12 @@ from .generation import (
     get_timeline_end_token_idx,
     validate_rolling_cfg,
 )
-from .generation.finalize import finalize_predictions, write_rank_output
+from .generation.finalize import (
+    finalize_predictions,
+    get_code_metadata,
+    validate_timeline_delta_bins_in_int64_range,
+    write_rank_output,
+)
 from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
 # Import OmegaConf Resolvers
@@ -65,7 +70,6 @@ from .utils import (
     oc_min,
     resolve_generation_context_size,
     save_environment_snapshot,
-    save_logger_run_ids,
     save_resolved_config,
     sub,
 )
@@ -150,7 +154,6 @@ def pretrain(cfg: DictConfig):
         trainer_kwargs["ckpt_path"] = ckpt_path
 
     trainer.fit(**trainer_kwargs)
-    save_logger_run_ids(trainer.loggers, output_dir)
 
     best_ckpt_path = Path(trainer.checkpoint_callback.best_model_path)
     if not best_ckpt_path.is_file():
@@ -173,6 +176,14 @@ def generate_trajectories(cfg: DictConfig):
     torch.set_float32_matmul_precision("medium")
 
     D = instantiate(cfg.datamodule)
+
+    # Reject vocabularies with TIMELINE//DELTA bins whose ``value_mean * seconds_per_unit *
+    # 1e6`` would overflow Int64 microseconds (issue #154). Doing this before the checkpoint
+    # load / predict pass means a polluted bin fails the run in the first second instead of
+    # blowing up partway through hours of generation — and even a "saturating" decode of such
+    # a bin would yield an uninterpretable trajectory, so refusing to start is the right
+    # behavior. The fix lives upstream in the bin-reduction stage; this is the downstream guard.
+    validate_timeline_delta_bins_in_int64_range(get_code_metadata(D.train_dataloader().dataset))
 
     # Validate rolling-generation config early — before loading the checkpoint and before running any
     # batches — so bad values (zero or negative budgets) fail fast with a clear message instead of
@@ -231,6 +242,11 @@ def generate_trajectories(cfg: DictConfig):
             "you're running this for any other purpose, set inference.do_sample=true."
         )
 
+    # Generation is always associated with the training run's logger, so the only
+    # place to look for run ids is the training save-point under
+    # ``model_initialization_dir``. Issue #131 reported an orphan-write where
+    # generation also saved its own ids under ``output_dir`` — that write is gone now,
+    # eliminating the bug at the source rather than papering over it with a layered read.
     apply_saved_logger_run_ids(cfg.trainer, Path(cfg.model_initialization_dir))
     trainer = instantiate(cfg.trainer)
 
@@ -346,10 +362,4 @@ def generate_trajectories(cfg: DictConfig):
             )
         trainer.strategy.barrier()
 
-    # Save the generation run's logger ids into the *generation* ``output_dir``, not the
-    # training checkpoint's ``model_initialization_dir``. A caller using the escape hatch
-    # described in ``apply_saved_logger_run_ids`` (explicit fresh ``run_id`` for generation)
-    # would otherwise overwrite the training run's saved ids and change what future pretrain-
-    # resume attaches to. Separating the two directories keeps the pretrain save-point frozen.
-    save_logger_run_ids(trainer.loggers, Path(cfg.output_dir))
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")

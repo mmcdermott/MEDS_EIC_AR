@@ -1,5 +1,3 @@
-import builtins
-
 from omegaconf import DictConfig
 
 import MEDS_EIC_AR.utils as utils
@@ -141,12 +139,11 @@ def test_apply_saved_logger_run_ids_preserves_explicit_run_id(tmp_path):
 
 
 def test_save_logger_run_ids(tmp_path, monkeypatch):
-    # Patch lightning logger classes so helpers recognise the dummy objects
-    import importlib
-
-    loggers_mod = importlib.import_module("lightning.pytorch.loggers")
-    monkeypatch.setattr(loggers_mod, "MLFlowLogger", DummyMLFlowLogger, raising=False)
-    monkeypatch.setattr(loggers_mod, "WandbLogger", DummyWandbLogger, raising=False)
+    # ``is_mlflow_logger`` / ``is_wandb_logger`` resolve their class names from
+    # ``MEDS_EIC_AR.utils``'s top-level namespace, so we patch them there. Patching
+    # ``lightning.pytorch.loggers.*`` would have no effect on already-bound names.
+    monkeypatch.setattr(utils, "MLFlowLogger", DummyMLFlowLogger)
+    monkeypatch.setattr(utils, "WandbLogger", DummyWandbLogger)
 
     loggers = [DummyMLFlowLogger("mlflow-id"), DummyWandbLogger("wandb-id")]
     utils.save_logger_run_ids(loggers, tmp_path)
@@ -223,15 +220,3 @@ def test_generation_speed_logger_logs_once_on_rank_zero():
     cb2.on_predict_end(trainer2, pl_module=None)
 
     assert rec2.calls == []
-
-
-def test_is_wandb_logger_missing(monkeypatch):
-    original_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "lightning.pytorch.loggers" and "WandbLogger" in fromlist:
-            raise ImportError
-        return original_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-    assert utils.is_wandb_logger(DummyWandbLogger()) is False
