@@ -47,7 +47,8 @@ configuration structure is as follows:
     │   ├── generation.yaml
     │   ├── generation_speed_logger.yaml
     │   ├── learning_rate_monitor.yaml
-    │   └── model_checkpoint.yaml
+    │   ├── model_checkpoint.yaml
+    │   └── save_logger_run_ids.yaml
     ├── default.yaml
     ├── demo.yaml
     ├── demo_generate.yaml

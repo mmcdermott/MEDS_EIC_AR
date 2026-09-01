@@ -280,6 +280,7 @@ def find_checkpoint_path(output_dir: Path) -> Path | None:
         │   ├── epoch=1-step=4.ckpt
         │   └── last.ckpt
         ├── config.yaml
+        ├── environment.txt
         ├── loggers
         │   └── csv
         │       └── version_0

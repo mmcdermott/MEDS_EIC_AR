@@ -1,3 +1,25 @@
+"""CLI entry points for training (``MEICAR_pretrain``) and generation (``MEICAR_generate_trajectories``).
+
+Both commands are thin Hydra wrappers that resolve the run's config, wire up the
+:class:`~MEDS_EIC_AR.training.MEICARModule`, and hand off to Lightning. On initial run creation (not on
+resume), pre-training additionally writes a pip-freeze-style environment snapshot (``environment.txt``)
+and the resolved Hydra config to ``output_dir`` so re-runs and post-hoc debugging have a fingerprint of
+the invocation. Generation loads a checkpoint via ``model_initialization_dir``, runs the rolling
+sliding-window predict path, and emits per-task-sample trajectory parquets under
+``output_dir/<split>/<sample>.parquet``.
+
+**Generation memory footprint.** The generate path currently runs ``trainer.predict(...)``,
+which fully materializes every rank's predict-step outputs in CPU memory (tokens are moved to
+CPU in ``predict_step`` before the accumulator sees them). With
+``RepeatedPredictionDataset`` that accumulation scales as
+``O(n_dataset_rows * n_trajectories_per_task_sample * generated_length)`` per rank. For large
+cohorts crossed with high trajectory counts this can become a practical ceiling before the
+shard-then-merge finalize even runs. Follow-up at mmcdermott/MEDS_EIC_AR#148 tracks a
+streaming ``BasePredictionWriter`` (or backend-native streaming) replacement; until then,
+tune ``N_trajectories_per_task_sample`` and ``inference.generate_for_splits`` to fit the
+available rank memory.
+"""
+
 import logging
 import os
 import shutil
@@ -7,13 +29,17 @@ from importlib.resources import files
 from pathlib import Path
 
 import hydra
-import pyarrow.parquet as pq
 import torch
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch, MEDSTorchDataConfig
-from MEDS_trajectory_evaluation.schema import GeneratedTrajectorySchema
+
+# ``load_yaml_file`` is imported for its side effect — it is decorated with ``@OmegaConfResolver``
+# and importing the symbol registers the ``load_yaml_file`` OmegaConf interpolation used by
+# ``src/MEDS_EIC_AR/configs/_generate_trajectories.yaml`` (``${load_yaml_file:...}``). Do not remove
+# as "unused": static analysis can't see the config-side reference and dropping the import breaks
+# generation CLI startup with ``UnsupportedInterpolationType``.
 from MEDS_transforms.runner import load_yaml_file
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -21,9 +47,14 @@ from torch.utils.data import DataLoader
 from .generation import (
     RepeatedPredictionDataset,
     collate_with_meta,
-    format_trajectories,
     get_timeline_end_token_idx,
     validate_rolling_cfg,
+)
+from .generation.finalize import (
+    finalize_predictions,
+    get_code_metadata,
+    validate_timeline_delta_bins_in_int64_range,
+    write_rank_output,
 )
 from .training import MEICARModule, find_checkpoint_path, validate_resume_directory
 
@@ -38,7 +69,7 @@ from .utils import (
     num_gpus,
     oc_min,
     resolve_generation_context_size,
-    save_logger_run_ids,
+    save_environment_snapshot,
     save_resolved_config,
     sub,
 )
@@ -84,6 +115,11 @@ def pretrain(cfg: DictConfig):
     else:
         OmegaConf.save(cfg, output_dir / "config.yaml")
         save_resolved_config(cfg, output_dir / "resolved_config.yaml")
+        # Capture the Python environment once at run-creation time (not on resume — the point
+        # of an environment snapshot is "what was installed when this run was configured",
+        # and a resumed run reusing the same output_dir should point at that original snapshot
+        # rather than a fresh one capturing whatever's installed today).
+        save_environment_snapshot(output_dir / "environment.txt")
 
     logger.info("Setting torch float32 matmul precision to 'medium'.")
     torch.set_float32_matmul_precision("medium")
@@ -118,7 +154,6 @@ def pretrain(cfg: DictConfig):
         trainer_kwargs["ckpt_path"] = ckpt_path
 
     trainer.fit(**trainer_kwargs)
-    save_logger_run_ids(trainer.loggers, output_dir)
 
     best_ckpt_path = Path(trainer.checkpoint_callback.best_model_path)
     if not best_ckpt_path.is_file():
@@ -141,6 +176,14 @@ def generate_trajectories(cfg: DictConfig):
     torch.set_float32_matmul_precision("medium")
 
     D = instantiate(cfg.datamodule)
+
+    # Reject vocabularies with TIMELINE//DELTA bins whose ``value_mean * seconds_per_unit *
+    # 1e6`` would overflow Int64 microseconds (issue #154). Doing this before the checkpoint
+    # load / predict pass means a polluted bin fails the run in the first second instead of
+    # blowing up partway through hours of generation — and even a "saturating" decode of such
+    # a bin would yield an uninterpretable trajectory, so refusing to start is the right
+    # behavior. The fix lives upstream in the bin-reduction stage; this is the downstream guard.
+    validate_timeline_delta_bins_in_int64_range(get_code_metadata(D.train_dataloader().dataset))
 
     # Validate rolling-generation config early — before loading the checkpoint and before running any
     # batches — so bad values (zero or negative budgets) fail fast with a clear message instead of
@@ -209,6 +252,11 @@ def generate_trajectories(cfg: DictConfig):
         if backend is not None:
             M.model.set_backend(backend)
 
+    # Generation is always associated with the training run's logger, so the only
+    # place to look for run ids is the training save-point under
+    # ``model_initialization_dir``. Issue #131 reported an orphan-write where
+    # generation also saved its own ids under ``output_dir`` — that write is gone now,
+    # eliminating the bug at the source rather than papering over it with a layered read.
     apply_saved_logger_run_ids(cfg.trainer, Path(cfg.model_initialization_dir))
     trainer = instantiate(cfg.trainer)
 
@@ -229,6 +277,11 @@ def generate_trajectories(cfg: DictConfig):
         else:
             raise ValueError(f"Unknown split {split}.")
 
+        base_dataset = base_loader.dataset
+        if len(base_dataset) == 0:
+            logger.info(f"Split {split} has zero base-dataset rows; skipping generation.")
+            continue
+
         # Skip work for trajectories whose output parquet already exists. If every requested
         # trajectory is already on disk and ``do_overwrite`` is false, skip the predict pass
         # entirely; otherwise we still run a single pass over the full ``N``-expanded dataset and
@@ -247,14 +300,37 @@ def generate_trajectories(cfg: DictConfig):
             )
             continue
 
-        # Expand the base dataset so each subject contributes ``n_trajectories`` consecutive rows.
-        # See issue #89 for the motivation: one predict pass instead of ``N``, tighter padding,
-        # and prefix-cache reuse on backends that have one (#88, #97). The ordering invariant —
-        # subject changes slow, trajectory_idx changes fast — means rows for trajectory ``t``
-        # extracted from each batch in order land in subject-index order overall, which is what
-        # ``format_trajectories`` needs so its sequential ``schema_df.slice(...)`` lines up with
-        # the right subject metadata.
-        base_dataset = base_loader.dataset
+        # Stale-output guard + cleanup, BEFORE the predict pass. Rank outputs from a prior
+        # failed run (or a rerun with a different ``world_size`` whose old ``rank_{r}`` files
+        # no longer map to any current rank) would otherwise be picked up by
+        # ``finalize_predictions``'s glob alongside the current run's outputs. With
+        # ``do_overwrite=False``, every rank sees the shared filesystem state and raises
+        # ``FileExistsError`` together — this avoids a rank-0-only raise where non-zero ranks
+        # would then hang in a subsequent collective. Rank 0 does the actual cleanup +
+        # ``mkdir``; other ranks just proceed to ``trainer.predict`` where the strategy setup
+        # barrier synchronizes all ranks before any of them tries to write its rank output.
+        rank_outputs_dir = Path(cfg.output_dir) / split / "_rank_outputs"
+        stale = (
+            sorted(rank_outputs_dir.glob("trajectory_*.rank_*.parquet")) if rank_outputs_dir.exists() else []
+        )
+        if stale and not cfg.do_overwrite:
+            raise FileExistsError(
+                f"Found {len(stale)} stale rank-output file(s) under {rank_outputs_dir}. "
+                "A prior generation run did not finalize cleanly. Re-run with "
+                "do_overwrite=True to discard them and retry, or investigate and remove "
+                "them manually."
+            )
+        if trainer.is_global_zero:
+            for p in stale:
+                p.unlink()
+            rank_outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Expand the base dataset so each base-dataset row contributes ``n_trajectories``
+        # consecutive rows. See issue #89 for the motivation: one predict pass instead of
+        # ``N``, tighter padding, and prefix-cache reuse on backends that have one (#88, #97).
+        # The ordering invariant — ``dataset_row_idx`` changes slow, ``trajectory_idx``
+        # changes fast — means rows for trajectory ``t`` retain stable identifiers all the way
+        # through the shard-then-merge finalize step.
         expanded_dataset = RepeatedPredictionDataset(base_dataset, n_trajectories=n_trajectories)
         expanded_loader = DataLoader(
             expanded_dataset,
@@ -267,48 +343,33 @@ def generate_trajectories(cfg: DictConfig):
 
         seed = hash_based_seed(cfg.get("seed", None), split)
         logger.info(
-            f"Generating {n_trajectories} trajectories for each of {len(base_dataset)} subjects "
-            f"in split {split} (one interleaved predict pass over {len(expanded_dataset)} "
-            f"expanded rows, seed={seed})."
+            f"Generating {n_trajectories} trajectories for each of {len(base_dataset)} "
+            f"base-dataset rows in split {split} (one interleaved predict pass over "
+            f"{len(expanded_dataset)} expanded rows, seed={seed})."
         )
         seed_everything(seed, workers=True)
         predictions = trainer.predict(model=M, dataloaders=expanded_loader)
 
-        # Demux the flat predictions into per-trajectory, per-batch token lists. Within each batch
-        # the rows for trajectory ``t`` are in subject-index order (because the expanded dataset
-        # was built with subject-changes-slow ordering and ``shuffle=False``), and across batches
-        # the subject-index ranges are non-overlapping and increasing — so the concatenation per
-        # trajectory ``t`` is exactly the order that ``format_trajectories`` consumes from
-        # ``base_dataset.schema_df``.
-        #
-        # ``trajectory_idxs`` is a [B] long tensor recording, for each batch row, which of the N
-        # trajectories-per-subject that row corresponds to (0..N-1). It's distinct from
-        # ``subject_idxs`` which records the base-dataset index the row came from.
-        per_trajectory_batches: dict[int, list[torch.Tensor]] = {t: [] for t in range(n_trajectories)}
-        for pred in predictions:
-            tokens = pred["tokens"]
-            trajectory_idxs = pred["trajectory_idxs"]
-            # Iterate over the trajectories actually present in this batch rather than always
-            # doing N boolean compares. For batches that cover every trajectory (the common case
-            # when batch_size >= N), this is the same work; for tail batches or small batch sizes,
-            # it scales with the number of distinct trajectory_idxs in the batch instead.
-            for t in trajectory_idxs.unique().tolist():
-                mask = trajectory_idxs == t
-                per_trajectory_batches[t].append(tokens[mask])
+        # Shard-then-merge finalize. Every rank writes a per-trajectory rank output under
+        # ``rank_outputs_dir``; a barrier; rank 0 merges the per-rank partials into the final
+        # per-trajectory parquets. Works uniformly for single-device (``world_size=1``: one
+        # file per trajectory, rank-0 merge is effectively a passthrough) and DDP (one file
+        # per ``(trajectory, rank)``; rank 0's ``pl.concat`` stitches them together, with a
+        # coverage check over ``{0, ..., n_dataset_rows - 1}`` catching duplicate/missing
+        # ``dataset_row_idx`` values). No cross-rank gather, no ``BasePredictionWriter`` —
+        # the filesystem is the coordination primitive. Two explicit barriers:
+        # (1) post-write so rank 0 waits for every rank's output to land before reading,
+        # (2) post-finalize so non-zero ranks don't race into the next split.
+        write_rank_output(predictions, rank=trainer.global_rank, rank_outputs_dir=rank_outputs_dir)
+        trainer.strategy.barrier()
+        if trainer.is_global_zero:
+            finalize_predictions(
+                rank_outputs_dir=rank_outputs_dir,
+                trajectory_paths=trajectory_paths,
+                base_dataset=base_dataset,
+                n_dataset_rows=len(base_dataset),
+                do_overwrite=cfg.do_overwrite,
+            )
+        trainer.strategy.barrier()
 
-        for trajectory_idx, out_fp in trajectory_paths.items():
-            if out_fp.is_file() and not cfg.do_overwrite:
-                logger.info(f"Skipping {out_fp} as it already exists.")
-                continue
-            logger.info(f"Writing trajectory {trajectory_idx} for split {split} to {out_fp}.")
-            predictions_df = format_trajectories(base_dataset, per_trajectory_batches[trajectory_idx])
-            pa_table = GeneratedTrajectorySchema.align(predictions_df.to_arrow())
-            pq.write_table(pa_table, out_fp)
-
-    # Save the generation run's logger ids into the *generation* ``output_dir``, not the
-    # training checkpoint's ``model_initialization_dir``. A caller using the escape hatch
-    # described in ``apply_saved_logger_run_ids`` (explicit fresh ``run_id`` for generation)
-    # would otherwise overwrite the training run's saved ids and change what future pretrain-
-    # resume attaches to. Separating the two directories keeps the pretrain save-point frozen.
-    save_logger_run_ids(trainer.loggers, Path(cfg.output_dir))
     logger.info(f"Generation of trajectories complete in {datetime.now(tz=UTC) - st}")

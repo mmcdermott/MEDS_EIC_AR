@@ -1,3 +1,23 @@
+"""Shared utilities that don't fit the training / preprocessing / generation module split.
+
+Groups of helpers in this module:
+
+- **OmegaConf resolvers** (``gpus_available``, ``num_cores``, ``num_gpus``, ``oc_min``, ``int_prod``,
+  ``resolve_generation_context_size``) — registered as Hydra/OmegaConf resolvers so config
+  interpolations can read hardware state and compute derived values. ``hash_based_seed`` lives alongside
+  them as a regular Python helper (called from ``__main__`` at per-split seed time), not as a resolver.
+- **Logger restore/save** (``save_logger_run_ids``, ``apply_saved_logger_run_ids``) — lets training
+  resumes reuse the same MLflow / WandB run IDs so a paused-and-resumed run looks like a single run in
+  the tracking backend.
+- **Environment snapshotting** (``save_environment_snapshot``) — writes ``environment.txt`` to the run
+  ``output_dir`` on initial run creation (not on resume), capturing Python version, platform, and every
+  installed distribution and version. See issue #24 / PR #129.
+- **Resolved-config persistence** (``save_resolved_config``).
+- **Logger detection** (``is_mlflow_logger``, ``is_wandb_logger``) — optional-import-safe predicates
+  used by the training hooks and by ``save_logger_run_ids`` to route each attached logger to its
+  backend-specific run-id save path.
+"""
+
 import logging
 import multiprocessing
 from collections.abc import Sequence
@@ -5,7 +25,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import torch
-from lightning.pytorch.loggers import Logger
+from lightning.pytorch.loggers import Logger, MLFlowLogger, WandbLogger
 from MEDS_transforms.configs.utils import OmegaConfResolver
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
@@ -13,49 +33,19 @@ logger = logging.getLogger(__name__)
 
 
 def is_mlflow_logger(logger: Logger) -> bool:
-    """This function checks if a pytorch lightning logger is an MLFlow logger.
-
-    It is protected against the case that mlflow is not installed.
-    """
-
-    try:
-        from lightning.pytorch.loggers import MLFlowLogger
-
-        return isinstance(logger, MLFlowLogger)
-    except ImportError:
-        return False
+    """Return whether a Lightning logger is an :class:`MLFlowLogger`."""
+    return isinstance(logger, MLFlowLogger)
 
 
 def is_wandb_logger(logger: Logger) -> bool:
-    """Check whether a Lightning logger is a WandB logger.
-
-    The import of :class:`~lightning.pytorch.loggers.WandbLogger` may fail if
-    the optional ``wandb`` dependency is not installed. This helper safely
-    returns ``False`` in that situation.
+    """Return whether a Lightning logger is a :class:`WandbLogger`.
 
     Example:
-        >>> class DummyLogger:
-        ...     ...
+        >>> class DummyLogger: ...
         >>> is_wandb_logger(DummyLogger())
         False
-        >>> import builtins
-        >>> from unittest.mock import patch
-        >>> original_import = builtins.__import__
-        >>> def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        ...     if name == "lightning.pytorch.loggers" and "WandbLogger" in fromlist:
-        ...         raise ImportError
-        ...     return original_import(name, globals, locals, fromlist, level)
-        >>> with patch.object(builtins, "__import__", fake_import):
-        ...     is_wandb_logger(DummyLogger())
-        False
     """
-
-    try:
-        from lightning.pytorch.loggers import WandbLogger
-
-        return isinstance(logger, WandbLogger)
-    except ImportError:
-        return False
+    return isinstance(logger, WandbLogger)
 
 
 def hash_based_seed(seed: int | None, split: str) -> int:
@@ -390,6 +380,90 @@ def save_resolved_config(cfg: DictConfig, fp: Path) -> bool:
         return False
 
 
+def save_environment_snapshot(fp: Path) -> bool:
+    """Save a snapshot of the Python environment a run is using.
+
+    Writes a ``pip freeze``-style listing of installed packages plus a header with the
+    Python version and platform string. Lets anyone returning to a run output directory
+    later localize the exact codebase + dependency set that produced the result — useful
+    for reproducing or debugging trajectories from a model trained weeks or months ago,
+    when the underlying wheels on PyPI have moved on.
+
+    Format:
+
+    .. code-block:: text
+
+        # MEDS_EIC_AR run environment snapshot
+        # python: 3.12.3 (main, Jun  7 2024, 00:00:00) ...
+        # platform: Linux-6.8.0-generic-x86_64-with-glibc2.39
+        MEDS-EIC-AR==0.X.Y
+        lightning==2.5.1
+        ...
+
+    Never raises — any failure (permission denied, disk full, etc.) logs a warning and
+    returns ``False`` so the calling entry point can keep going. The snapshot is a
+    nice-to-have, not a correctness invariant.
+
+    Args:
+        fp: The path where the snapshot should be written. The parent directory is
+            created if it doesn't already exist.
+
+    Returns:
+        ``True`` if the snapshot was written successfully, ``False`` otherwise.
+
+    Example:
+        Case-insensitive alphabetical sort lets us anchor the doctest on a few
+        known-always-present top-level deps (``lightning``, ``polars``, ``torch``)
+        with ellipsis on their versions so CI doesn't flake on routine upstream
+        version bumps. The ordering of the three is stable: ``l < p < t``.
+
+        >>> with tempfile.NamedTemporaryFile(suffix=".txt") as tmp_file:
+        ...     _ = save_environment_snapshot(Path(tmp_file.name))
+        ...     print(Path(tmp_file.name).read_text())  # doctest: +ELLIPSIS
+        # MEDS_EIC_AR run environment snapshot
+        # python: ...
+        # platform: ...
+        ...
+        lightning==...
+        ...
+        polars==...
+        ...
+        torch==...
+        ...
+
+    Per-invariant assertions (header format, pip-freeze line shape, sort order,
+    missing-parent-dir handling, etc.) live in
+    ``tests/test_environment_snapshot.py`` as readable pytest cases rather than
+    cluttering the docstring.
+    """
+    import importlib.metadata
+    import platform
+    import sys
+
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# MEDS_EIC_AR run environment snapshot",
+            f"# python: {sys.version.splitlines()[0]}",
+            f"# platform: {platform.platform()}",
+        ]
+        packages = []
+        for dist in importlib.metadata.distributions():
+            name = dist.metadata["Name"]
+            if name is None:
+                continue
+            packages.append(f"{name}=={dist.version}")
+        # Case-insensitive sort so ``pip freeze`` -style orderings match across platforms
+        # (macOS distribution discovery returns mixed case; Linux usually canonicalizes).
+        packages.sort(key=str.lower)
+        lines.extend(packages)
+        fp.write_text("\n".join(lines) + "\n")
+        return True
+    except Exception as e:  # pragma: no cover — best-effort, swallows any disk/IO failure
+        logger.warning(f"Could not save environment snapshot: {e}")
+        return False
+
+
 def _read_saved_id(fp: Path) -> str | None:
     """Read a saved-id file defensively; return ``None`` if the file is missing, unreadable, or blank.
 
@@ -414,9 +488,11 @@ def _read_saved_id(fp: Path) -> str | None:
 def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
     """Populate logger configs with saved experiment IDs if present.
 
-    This helper mutates the provided trainer configuration in-place and reads
-    any saved run IDs from ``<run_dir>/loggers``. It is kept separate from
-    OmegaConf resolvers so configuration loading remains straightforward.
+    Reads any saved run IDs from ``<run_dir>/loggers`` and mutates ``trainer_cfg``
+    in-place. ``run_dir`` is the single source of truth: pretrain points it at its
+    ``output_dir`` (where the on-train-start callback also writes), generation points
+    it at ``model_initialization_dir`` so generation runs always attach to the
+    training-run logger.
 
     Example:
         >>> from yaml_to_disk import yaml_disk
@@ -497,15 +573,28 @@ def apply_saved_logger_run_ids(trainer_cfg: DictConfig, run_dir: Path) -> None:
     for logger_cfg in loggers:
         target = str(logger_cfg.get("_target_", "")).lower()
         if "wandb" in target:
-            fp = log_dir / "wandb_run_id.txt"
-            saved = _read_saved_id(fp)
+            saved = _read_saved_id(log_dir / "wandb_run_id.txt")
             if saved and not logger_cfg.get("id"):
+                # ``logger_cfg`` may be a Hydra-composed DictConfig in struct mode (the
+                # default for configs loaded via ``hydra.main`` / ``hydra.compose``).
+                # Setting a key absent from the source yaml — like ``resume``, which the
+                # repo's ``configs/trainer/logger/wandb.yaml`` does not declare — would
+                # raise ``ConfigKeyError`` under struct enforcement. Temporarily drop the
+                # struct flag so the resume-keyword assignment goes through, then restore
+                # it. ``id`` is already declared in the yaml so it doesn't need this.
                 logger_cfg["id"] = saved
-                logger_cfg.setdefault("resume", "allow")
+                if isinstance(logger_cfg, DictConfig):
+                    was_struct = OmegaConf.is_struct(logger_cfg)
+                    OmegaConf.set_struct(logger_cfg, False)
+                    try:
+                        logger_cfg.setdefault("resume", "allow")
+                    finally:
+                        OmegaConf.set_struct(logger_cfg, was_struct)
+                else:
+                    logger_cfg.setdefault("resume", "allow")
         elif "mlflow" in target:
-            fp = log_dir / "mlflow_run_id.txt"
             applied_saved_run_id = False
-            saved = _read_saved_id(fp)
+            saved = _read_saved_id(log_dir / "mlflow_run_id.txt")
             if saved and not logger_cfg.get("run_id"):
                 logger_cfg["run_id"] = saved
                 applied_saved_run_id = True
@@ -549,12 +638,11 @@ def save_logger_run_ids(loggers: Sequence[Logger], run_dir: Path) -> None:
         ...         self.experiment = DummyWandBExp(exp_id)
         >>> import tempfile
         >>> from unittest.mock import patch
-        >>> mlflow_patch = patch(
-        ...     "lightning.pytorch.loggers.MLFlowLogger", DummyMLFlowLogger, create=True
-        ... )
-        >>> wandb_patch = patch(
-        ...     "lightning.pytorch.loggers.WandbLogger", DummyWandbLogger, create=True
-        ... )
+        >>> # ``is_mlflow_logger`` / ``is_wandb_logger`` resolve the class names from this
+        >>> # module's namespace (top-level import), so patch them there — patching the
+        >>> # ``lightning.pytorch.loggers.*`` source has no effect on already-bound names.
+        >>> mlflow_patch = patch("MEDS_EIC_AR.utils.MLFlowLogger", DummyMLFlowLogger)
+        >>> wandb_patch = patch("MEDS_EIC_AR.utils.WandbLogger", DummyWandbLogger)
         >>> with mlflow_patch, wandb_patch, tempfile.TemporaryDirectory() as tmp:
         ...     run_dir = Path(tmp)
         ...     save_logger_run_ids(
