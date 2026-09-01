@@ -4,17 +4,13 @@ output_dir: ${oc.env:MTD_INPUT_DIR}
 stages:
   - reshard_to_split:
       n_subjects_per_shard: 10000
-  - add_time_derived_measurements:
-      age: null
-      time_of_day: null
-      # ``time_unit`` and the default ``time_delta_code`` prefix (``TIMELINE//DELTA``) are
-      # load-bearing for generation: ``src/MEDS_EIC_AR/generation/finalize.py`` parses the unit
-      # out of ``TIMELINE//DELTA//<unit>//...`` codes at finalize time via
-      # ``TIMELINE_DELTA_TOKEN`` and ``_timeline_delta_seconds_per_unit``. Overriding
-      # ``time_delta_code`` is not supported; changing ``time_unit`` must stay consistent across
-      # the whole vocabulary.
-      timeline_tokens:
-        time_unit: years
+  # Stage-order note (issue #126): rare-code and rare-subject filtering must run *before*
+  # ``add_time_derived_measurements``. Timeline delta tokens are inserted between consecutive
+  # events, so inserting them first and filtering after leaves back-to-back
+  # ``TIMELINE//DELTA//*`` tokens wherever the event between two deltas was dropped — a
+  # transition the model can never see at generation time, and one that skews the delta
+  # quantiles short. Filtering first makes each delta the gap between two *kept* events, which
+  # is the quantity an autoregressive model over kept tokens actually conditions on.
   - count_codes:
       # ``filter_measurements`` below only needs ``code/n_subjects`` (via ``min_subjects_per_code``).
       # ``code/n_occurrences`` was computed here but never consumed — ``fit_quantile_binning``
@@ -27,9 +23,14 @@ stages:
         - _matcher: # No filter for static measurements
             time:
               present: False
-        - _matcher: # No filter for birth, death, admission, discharge, registration, or time intervals.
+        - _matcher: # No filter for birth, death, admission, discharge, or registration.
+            # ``TIMELINE//*`` codes used to need an exemption here (via a ``.*TIME.*`` clause)
+            # because ``add_time_derived_measurements`` ran first. It now runs after this
+            # stage, so no timeline token exists yet to exempt — and keeping the clause would
+            # silently exempt any *raw* dataset code containing "TIME" from rare-code
+            # filtering, which was never the intent.
             code:
-              regex: "MEDS_DEATH.*|MEDS_BIRTH.*|.*ADMISSION.*|.*DISCHARGE.*|.*REGISTRATION.*|.*TIME.*"
+              regex: "MEDS_DEATH.*|MEDS_BIRTH.*|.*ADMISSION.*|.*DISCHARGE.*|.*REGISTRATION.*"
         - _matcher:
             time:
               present: True
@@ -37,6 +38,17 @@ stages:
   - filter_subjects:
       min_events_per_subject: ${oc.decode:${oc.env:MIN_EVENTS_PER_SUBJECT,10}}
       min_measurements_per_subject: null
+  - add_time_derived_measurements:
+      age: null
+      time_of_day: null
+      # ``time_unit`` and the default ``time_delta_code`` prefix (``TIMELINE//DELTA``) are
+      # load-bearing for generation: ``src/MEDS_EIC_AR/generation/finalize.py`` parses the unit
+      # out of ``TIMELINE//DELTA//<unit>//...`` codes at finalize time via
+      # ``TIMELINE_DELTA_TOKEN`` and ``_timeline_delta_seconds_per_unit``. Overriding
+      # ``time_delta_code`` is not supported; changing ``time_unit`` must stay consistent across
+      # the whole vocabulary.
+      timeline_tokens:
+        time_unit: years
   - fit_quantile_binning:
       aggregations:
         - code/n_occurrences
