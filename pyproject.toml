@@ -49,14 +49,27 @@ mlflow = ["mlflow", "psutil", "pynvml"]
 # Inference backend — lazy-imported inside ``MEDS_EIC_AR.model.backends.sglang``, only
 # needed for ``backend=sglang`` generation runs. See issues #88 and #109 for context.
 #
-# Installation note: SGLang's recent releases pull pre-release versions of
-# ``flash-attn-4``, so installing this extra with uv requires
-# ``uv sync --extra sglang --prerelease=allow`` (or the equivalent pip flag). We
-# intentionally keep a loose version bound here rather than pinning
-# ``0.5.10.post1`` — pinning in the core project forces the default resolve to
-# re-check the pin against the other extras' envelopes every time, which fails
-# without ``--prerelease=allow``. Pin in your deployment lockfile if you need
-# reproducibility; the ``GenerationBackend`` protocol isolates us from API churn.
+# Installation note: the bound is deliberately loose. On Python 3.11 a fresh resolve of
+# ``sglang>=0.4`` selects ``sglang==0.5.9``, whose own pins (``torch==2.9.1``,
+# ``transformers==4.57.1``, ``sgl-kernel==0.3.21``) already agree with this project's
+# ``uv.lock``; pinning here would instead force the default resolve to re-check the pin
+# against the other extras' envelopes on every sync. Pin in your deployment lockfile if you
+# need reproducibility; the ``GenerationBackend`` protocol isolates us from API churn.
+#
+# ``--prerelease=allow`` is *not* required for ``sglang==0.5.9``. It was needed only for
+# ``0.5.10.post1``, which pulled a pre-release ``flash-attn-4``. Note that ``flash-attn-4``
+# provides the ``flash_attn`` module namespace without matching distribution metadata, which
+# breaks ``importlib.metadata.version("flash_attn")`` callers — this project falls back to
+# SDPA cleanly when it is absent, so prefer leaving it uninstalled.
+#
+# GPU wheels are *not* fully expressible here. ``sgl-kernel`` on PyPI ships CUDA kernel images
+# only up to ``sm_120a``, so it raises ``no kernel image is available for execution on the
+# device`` on Blackwell parts at compute capability 12.1 (e.g. GB10 / DGX Spark). Those hosts
+# need the CUDA-13 build from SGLang's own index, which pip/uv cannot select from an extra:
+#
+#     uv pip install --index-url https://docs.sglang.ai/whl/cu130/ "sgl-kernel==0.3.21+cu130"
+#
+# See ``README.md`` ("Running SGLang on Blackwell SM 12.1") for the full recipe, and issue #163.
 sglang = ["sglang>=0.4"]
 
 [project.urls]

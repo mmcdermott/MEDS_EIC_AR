@@ -54,6 +54,57 @@ pip install flash-attn --no-build-isolation
 If you encounter errors, see the [flash-attn](https://github.com/Dao-AILab/flash-attention) package
 documentation.
 
+#### Running SGLang on Blackwell SM 12.1 (GB10 / DGX Spark)
+
+The `sglang` extra (`uv sync --extra sglang`) installs a working SGLang on most hosts, but **not** on
+Blackwell parts at compute capability 12.1. The `sgl-kernel` wheels published to PyPI carry CUDA kernel
+images only up to `sm_120a`, and `sm_120a` is not forward-compatible with SM 12.1, so the first RMSNorm
+call fails with:
+
+```
+RuntimeError: RMSNorm failed with error code no kernel image is available for execution on the device
+```
+
+The fix is to take `sgl-kernel` from SGLang's CUDA-13 wheel index, whose builds do contain `sm_121a`:
+
+```bash
+uv pip install -e .                       # keeps an already-installed CUDA torch in place
+uv pip install --index-url https://docs.sglang.ai/whl/cu130/ "sgl-kernel==0.3.21+cu130"
+```
+
+`0.3.21` is the version `sglang==0.5.9` pins, and a `+cu130` kernel build is compatible with a
+`torch==2.9.1+cu129` runtime — the ABI that matters is the torch version, not the CUDA variant. To
+confirm a candidate wheel actually covers your device:
+
+```bash
+cuobjdump --list-elf .venv/lib/python3.*/site-packages/sgl_kernel/sm100/common_ops.abi3.so \
+  | grep -o 'sm_[0-9]*[a-z]*' | sort -u        # must list sm_121a
+```
+
+Three further runtime requirements on this hardware:
+
+- `export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas` — the CUDA 12.8 `ptxas` bundled with torch 2.9.1
+    does not know `sm_121a`.
+- **Put `.venv/bin` on `PATH`.** SGLang JIT-compiles some kernels at engine startup and shells out to
+    `ninja`, which is installed as a venv console script; without it the engine dies with
+    `FileNotFoundError: [Errno 2] No such file or directory: 'ninja'`.
+- Use `attention_head_dim >= 64`, or pass `+backend.engine_kwargs.attention_backend=triton`. SGLang's
+    default FlashInfer attention backend rejects small head dims with
+    `FlashInfer Internal Error: Invalid configuration ... BatchPrefillWithRaggedKVCacheDispatched`.
+    The failure kills the scheduler subprocess and surfaces in the parent as exit `-9`, which looks
+    like an OOM rather than a shape error. See
+    [#163](https://github.com/mmcdermott/MEDS_EIC_AR/issues/163).
+
+Note also that `sglang_demo.yaml` sets `mem_fraction_static: 0.85`, a fraction of *total* memory. DGX
+Spark shares one 128 GB pool between CPU and GPU, so that reserves ~109 GB and leaves the host close to
+the OOM killer; `0.2`–`0.4` is ample for small models.
+
+> [!NOTE]
+> `uv sync --frozen` currently fails on aarch64 hosts: `uv.lock`'s `av` entry records no wheel or sdist,
+> because it was resolved on x86_64 where `av`'s aarch64-only marker is false. Use `uv pip install -e .`
+> until the lockfile is regenerated with an aarch64 resolution environment. See
+> [#161](https://github.com/mmcdermott/MEDS_EIC_AR/issues/161).
+
 ## Usage
 
 ### 1. Pre-process your data
