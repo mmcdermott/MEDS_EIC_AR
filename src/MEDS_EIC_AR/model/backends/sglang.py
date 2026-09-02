@@ -109,6 +109,33 @@ _SGLANG_OUTPUT_KEYS: tuple[str, ...] = ("output_ids", "token_ids")
 _SGLANG_CONTEXT_RESERVE = 2
 
 
+#: Positions SGLang holds back from the *input* side of the context window.
+#:
+#: Distinct from :data:`_SGLANG_CONTEXT_RESERVE`, which bounds how many tokens SGLang will
+#: *emit*. This one bounds how many prompt tokens it will actually *read*, and exceeding it is
+#: far more damaging: SGLang does not refuse the request, it silently drops the tail of the
+#: prompt and generates from the truncated prefix, so the model is conditioned on something the
+#: caller never asked for. Derivation, from ``sglang==0.5.9``::
+#:
+#:     max_req_len       = min(context_len - 1, max_token_pool_size - 1)   # tp_worker.py
+#:     max_req_input_len = max_req_len - 5                                 # tp_worker.py
+#:     if len(input_ids) >= max_req_input_len: truncate or reject          # managers/utils.py
+#:
+#: The comparison is ``>=``, so the longest prompt SGLang reads in full is
+#: ``max_req_input_len - 1``, i.e. ``context_len - 7`` whenever the context length is the
+#: binding term. Measured against a 16-position model: a 9-token prompt is honored, a 10-token
+#: prompt is already truncated.
+#:
+#: Why this is not merely SGLang's business: ``allow_auto_truncate=True`` (set unconditionally
+#: below) is what turns the rejection into a silent truncation, and SGLang's own truncation
+#: warning is emitted through a logger its engine init has already set to ERROR, so nothing
+#: surfaces. Left unchecked, ``Model._rolling_generate``'s default ``rolling_context_size`` of
+#: ``max_seq_len - 1`` sits far above this ceiling and every rolling chunk loses its prompt
+#: tail — which is exactly how SGLang came to emit grammar-invalid trajectories where the HF
+#: backend emitted valid ones (issue #171).
+_SGLANG_INPUT_RESERVE = 7
+
+
 #: Smallest attention head dimension SGLang's default FlashInfer attention backend can dispatch.
 #: Below this it aborts the scheduler subprocess with ``FlashInfer Internal Error: Invalid
 #: configuration``, which reaches the parent as SIGQUIT / exit ``-9`` — indistinguishable at a
@@ -380,9 +407,46 @@ class SGLangBackend:
         # ``generate_chunk`` many times with the same shape, and a per-call warning would bury
         # the run's real output.
         self._logged_context_clamp = False
+        self._logged_prompt_ceiling = False
         self._engine = sgl_module.Engine(model_path=str(hf_model_dir), **self._engine_kwargs)
         self._is_shutdown = False
         atexit.register(self.shutdown)
+
+    @property
+    def max_prompt_len(self) -> int | None:
+        """Longest prompt SGLang will read in full, or ``None`` if the context length is unknown.
+
+        Prompts longer than this are silently truncated by the engine rather than rejected (see
+        :data:`_SGLANG_INPUT_RESERVE`), so callers that build their own prompt windows -- notably
+        :meth:`MEDS_EIC_AR.model.model.Model._rolling_generate` -- must clamp to this rather than
+        to the model's raw context length. ``None`` means "unknown, don't clamp", which restores
+        the pre-fix behavior rather than guessing a ceiling that might be wrong.
+        """
+        if self._context_len is None:
+            return None
+        return max(self._context_len - _SGLANG_INPUT_RESERVE, 0)
+
+    def _check_prompt_len(self, prompt_len: int) -> None:
+        """Refuse a prompt SGLang would silently truncate.
+
+        Raising beats the alternative: SGLang would accept the request, drop the tail of the
+        prompt, and return tokens conditioned on a prefix the caller never asked for. That is
+        invisible at the API surface -- the output has the right shape and the right length --
+        and it is what produced grammar-invalid trajectories in issue #171.
+        """
+        ceiling = self.max_prompt_len
+        if ceiling is None or prompt_len <= ceiling:
+            return
+        raise ValueError(
+            f"SGLang would silently truncate this {prompt_len}-token prompt: on a "
+            f"{self._context_len}-position model it reads at most {ceiling} prompt tokens "
+            f"(max_req_input_len = min(context_len - 1, kv_pool - 1) - 5, compared with >=). "
+            "It does not reject the request -- it drops the tail and generates from the "
+            "remaining prefix, so the model would be conditioned on something you did not ask "
+            "for. The HF backend has no such limit. Lower the prompt window to at most "
+            f"{ceiling} tokens (for rolling generation, set "
+            f"rolling_generation.rolling_context_size<={ceiling})."
+        )
 
     def _cap_max_new_tokens(self, requested: int, prompt_len: int) -> int:
         """Clamp ``requested`` to what SGLang will actually honor for a ``prompt_len``-token prompt.
@@ -494,9 +558,11 @@ class SGLangBackend:
         # binding one, since ``max_new_tokens`` is shared across the whole call). Doing it here
         # rather than leaving it to ``allow_auto_truncate`` is what makes the shortfall visible;
         # see ``_SGLANG_CONTEXT_RESERVE``.
-        max_new_tokens = self._cap_max_new_tokens(
-            generation_config.max_new_tokens, max((len(p) for p in prompts), default=0)
-        )
+        longest_prompt = max((len(p) for p in prompts), default=0)
+        # Input ceiling first: an over-long prompt is silently truncated by the engine, which is
+        # strictly worse than the output-side shortfall handled just below.
+        self._check_prompt_len(longest_prompt)
+        max_new_tokens = self._cap_max_new_tokens(generation_config.max_new_tokens, longest_prompt)
 
         # Map HF ``GenerationConfig`` → SGLang sampling-params dict. Intentional translations:
         #   - ``do_sample=False`` → ``temperature=0.0`` regardless of the caller's configured

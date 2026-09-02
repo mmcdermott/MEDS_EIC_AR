@@ -897,12 +897,30 @@ class Model(torch.nn.Module):
         if max_new_tokens <= 0:
             raise ValueError(f"max_new_tokens must be positive; got {max_new_tokens}.")
 
+        # The prompt window is bounded by the model's context, but a backend may read fewer
+        # prompt tokens than the model can represent. SGLang is one: it reads at most
+        # ``context_len - 7`` and *silently truncates* anything longer, so a window sized to
+        # ``max_seq_len - 1`` would lose its tail on every chunk and condition the model on a
+        # prefix nobody asked for (issue #171). Backends advertise the limit via an optional
+        # ``max_prompt_len``; ``None`` (and the HF backend, which has no such limit) means
+        # "model context is the only bound", preserving previous behavior.
+        ctx_cap = self.max_seq_len - 1
+        backend_cap = getattr(self._backend, "max_prompt_len", None)
+        if backend_cap is not None:
+            if backend_cap <= 0:
+                raise ValueError(
+                    f"Backend {type(self._backend).__name__} reports max_prompt_len="
+                    f"{backend_cap}; it cannot accept any prompt for a model with "
+                    f"max_seq_len={self.max_seq_len}."
+                )
+            ctx_cap = min(ctx_cap, backend_cap)
+
         if rolling_context_size is None:
-            ctx_size = self.max_seq_len - 1
+            ctx_size = ctx_cap
         else:
             if rolling_context_size <= 0:
                 raise ValueError(f"rolling_context_size must be positive; got {rolling_context_size}.")
-            ctx_size = min(rolling_context_size, self.max_seq_len - 1)
+            ctx_size = min(rolling_context_size, ctx_cap)
 
         input_ids = batch.code
         pad_id = batch.PAD_INDEX

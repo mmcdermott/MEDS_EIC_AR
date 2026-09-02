@@ -31,6 +31,7 @@ from MEDS_EIC_AR.model.backends import GenerationBackend, SGLangBackend
 from MEDS_EIC_AR.model.backends.sglang import (
     _FLASHINFER_MIN_HEAD_DIM,
     _SGLANG_CONTEXT_RESERVE,
+    _SGLANG_INPUT_RESERVE,
     _pad_right_to_tensor,
     _strip_padding_to_lists,
 )
@@ -695,3 +696,57 @@ def test_unknown_head_dim_does_not_block_construction(tmp_path: Path):
     """
     _write_config(tmp_path, max_position_embeddings=512)
     SGLangBackend(tmp_path, sgl_module=_FakeSGLModule())
+
+
+def test_max_prompt_len_reports_sglangs_real_input_ceiling(tmp_path: Path):
+    """The advertised ceiling is ``context_len - 7``, matching SGLang's own arithmetic.
+
+    ``max_req_input_len = min(context_len - 1, kv_pool - 1) - 5`` and the length check is ``>=``,
+    so the longest prompt read in full is ``context_len - 7``. Verified against a live engine:
+    on a 16-position model a 9-token prompt is honored and a 10-token prompt is truncated.
+    """
+    backend, _ = _make_backend_with_context(tmp_path, context_len=16)
+    assert backend.max_prompt_len == 16 - _SGLANG_INPUT_RESERVE == 9
+
+
+def test_max_prompt_len_is_none_when_context_is_unknown(tmp_path: Path):
+    """Without a readable context length we must not invent a ceiling."""
+    fake = _FakeSGLModule()
+    backend = SGLangBackend(tmp_path, sgl_module=fake)  # no config.json written
+    assert backend.max_prompt_len is None
+
+
+def test_prompt_over_the_input_ceiling_raises_instead_of_being_truncated(tmp_path: Path):
+    """The reported defect (#171): SGLang silently drops the prompt tail past its input cap.
+
+    It does not reject the request and the returned shape looks correct, so the corruption is
+    invisible -- it surfaced only as grammar-invalid trajectories. Refuse loudly instead.
+    """
+    backend, fake = _make_backend_with_context(tmp_path, context_len=16)
+    with pytest.raises(ValueError, match="silently truncate"):
+        _one_row_call(backend, fake, prompt_len=10, max_new_tokens=1)
+
+
+def test_prompt_at_the_input_ceiling_is_accepted(tmp_path: Path):
+    """The boundary itself must still work -- the cap is inclusive of ``context_len - 7``."""
+    backend, fake = _make_backend_with_context(tmp_path, context_len=16)
+    sp = _one_row_call(backend, fake, prompt_len=9, max_new_tokens=1)
+    assert sp["max_new_tokens"] == 1
+
+
+def test_input_ceiling_is_checked_against_the_longest_prompt_in_the_batch(tmp_path: Path):
+    """``max_new_tokens`` is shared across the call, and so is the input ceiling check."""
+    backend, fake = _make_backend_with_context(tmp_path, context_len=16)
+    ids = torch.zeros((2, 12), dtype=torch.long)
+    mask = torch.zeros((2, 12), dtype=torch.bool)
+    mask[0, -4:] = True  # 4 real tokens: fine
+    mask[1, -11:] = True  # 11 real tokens: over the ceiling
+    fake.last_engine = None
+    with pytest.raises(ValueError, match="11-token prompt"):
+        backend.generate_chunk(
+            ids,
+            attention_mask=mask,
+            generation_config=GenerationConfig(
+                max_new_tokens=1, do_sample=False, pad_token_id=0, eos_token_id=99
+            ),
+        )
