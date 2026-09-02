@@ -29,6 +29,7 @@ from meds import held_out_split, train_split, tuning_split
 from meds_torchdata import MEDSTorchBatch, MEDSTorchDataConfig
 from polars.testing import assert_frame_equal
 
+from conftest import run_and_check
 from MEDS_EIC_AR.model.model import Model
 
 
@@ -64,6 +65,77 @@ def test_generate_trajectories_runs(generated_trajectories: Path):
 
         subjects = {samp: set(df["subject_id"]) for samp, df in samps.items()}
         assert subjects["0"] == subjects["1"], f"Subjects in samples for split {sp} do not match!"
+
+
+@pytest.fixture(scope="session")
+def held_out_only_task_labels(
+    preprocessed_dataset_with_task: tuple[Path, Path, str],
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """A task-labels directory whose labels cover only held-out subjects.
+
+    A task defined purely for inference — over tuning and/or held-out subjects, with nothing in train — is an
+    ordinary thing to have, and produces a zero-length train dataset. This fixture builds one by filtering the
+    shared task fixture's labels down to the subjects that landed in the held-out split of the preprocessed
+    cohort.
+    """
+    cohort_dir, task_root_dir, task_name = preprocessed_dataset_with_task
+
+    held_out_schemas = sorted((cohort_dir / "tokenization" / "schemas" / held_out_split).glob("*.parquet"))
+    held_out_subjects = pl.concat([pl.read_parquet(fp).select("subject_id") for fp in held_out_schemas])
+
+    labels = pl.concat([pl.read_parquet(fp) for fp in sorted((task_root_dir / task_name).glob("*.parquet"))])
+    held_out_labels = labels.join(held_out_subjects.unique(), on="subject_id", how="semi")
+    assert not held_out_labels.is_empty(), (
+        "The shared task fixture has no labels on held-out subjects, so this fixture cannot build a "
+        "cohort that is non-empty on held_out and empty on train."
+    )
+
+    out_dir = tmp_path_factory.mktemp("held_out_only_task_labels") / task_name
+    out_dir.mkdir(parents=True)
+    held_out_labels.write_parquet(out_dir / "labels.parquet")
+    return out_dir
+
+
+def test_generate_trajectories_runs_with_no_train_split_labels(
+    pretrained_model: Path,
+    preprocessed_dataset_with_task: tuple[Path, Path, str],
+    held_out_only_task_labels: Path,
+    tmp_path: Path,
+):
+    """Generation must run on a task cohort that has no train-split labels.
+
+    The startup-time ``TIMELINE//DELTA`` bin check only needs the dataset object, so that it can
+    read cohort-level code metadata off ``dataset.config``. Reaching that object through
+    ``train_dataloader()`` also builds a ``RandomSampler``, which rejects a zero-length dataset with
+    ``num_samples should be a positive integer value, but got num_samples=0`` — refusing the whole
+    run over a split it was never going to generate for. Taking ``train_dataset`` directly avoids
+    the sampler entirely while validating exactly the same metadata.
+
+    Asserting on output rather than merely on "the CLI exited 0" matters here: a regression that
+    skipped the validation instead of fixing the access path would also exit 0.
+    """
+    cohort_dir, _, _ = preprocessed_dataset_with_task
+    output_dir = tmp_path / "generated"
+
+    run_and_check(
+        [
+            "MEICAR_generate_trajectories",
+            "--config-name=_demo_generate_trajectories",
+            f"output_dir={output_dir!s}",
+            f"model_initialization_dir={pretrained_model!s}",
+            f"datamodule.config.tensorized_cohort_dir={cohort_dir!s}",
+            f"datamodule.config.task_labels_dir={held_out_only_task_labels!s}",
+            "datamodule.batch_size=2",
+            "trainer=demo",
+            f"inference.generate_for_splits=[{held_out_split}]",
+        ]
+    )
+
+    written = sorted((output_dir / held_out_split).glob("*.parquet"))
+    assert written, f"No trajectories written under {output_dir / held_out_split}."
+    for fp in written:
+        assert len(pl.read_parquet(fp, use_pyarrow=True)) > 0, f"Trajectory file {fp} is empty."
 
 
 def test_generate_trajectories_rolling_runs(
