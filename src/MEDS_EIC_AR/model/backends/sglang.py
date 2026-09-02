@@ -93,59 +93,127 @@ _SGLANG_OUTPUT_KEYS: tuple[str, ...] = ("output_ids", "token_ids")
 _SGLANG_CONTEXT_RESERVE = 2
 
 
-def _read_context_length(hf_model_dir: Path | str) -> int | None:
-    """Read ``max_position_embeddings`` from an HF model directory's ``config.json``.
+#: Smallest attention head dimension SGLang's default FlashInfer attention backend can dispatch.
+#: Below this it aborts the scheduler subprocess with ``FlashInfer Internal Error: Invalid
+#: configuration``, which reaches the parent as SIGQUIT / exit ``-9`` — indistinguishable at a
+#: glance from an out-of-memory kill, and so a genuinely expensive thing to debug. Measured against
+#: ``sglang==0.5.9``: ``head_dim=32`` aborts, ``head_dim=64`` works. The ``triton`` attention
+#: backend has no such floor.
+_FLASHINFER_MIN_HEAD_DIM = 64
 
-    This is the number SGLang derives its own context length from when it loads the directory, so
-    reading it here lets the adapter apply SGLang's ceiling before the call instead of discovering
-    it as a silent clamp afterwards.
 
-    Returns ``None`` rather than raising if the file is missing, unreadable, or has no
-    ``max_position_embeddings`` — a backend that cannot determine the ceiling falls back to the
-    engine's own ``allow_auto_truncate`` behavior, which is what it did before. Losing the
-    proactive cap is worth strictly less than refusing to construct the backend at all.
+def _read_hf_config(hf_model_dir: Path | str) -> dict:
+    """Parse an HF model directory's ``config.json``, or return ``{}`` if it can't be read.
+
+    Degrading to an empty dict rather than raising is deliberate: every use of this config is a
+    pre-flight check that improves diagnostics, and none of them is worth refusing to construct
+    the backend over. A missing config costs the checks, not the run.
 
     Examples:
         >>> import json, tempfile
         >>> from pathlib import Path
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     _ = (Path(d) / "config.json").write_text(json.dumps({"max_position_embeddings": 512}))
-        ...     _read_context_length(d)
-        512
+        ...     _ = (Path(d) / "config.json").write_text(json.dumps({"head_dim": 64}))
+        ...     _read_hf_config(d)
+        {'head_dim': 64}
 
-        Missing or malformed configs degrade to ``None``:
+        Missing and malformed configs both degrade to ``{}``:
 
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     print(_read_context_length(d))
-        None
+        ...     _read_hf_config(d)
+        {}
         >>> with tempfile.TemporaryDirectory() as d:
         ...     _ = (Path(d) / "config.json").write_text("{not json")
-        ...     print(_read_context_length(d))
-        None
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     _ = (Path(d) / "config.json").write_text(json.dumps({"vocab_size": 40}))
-        ...     print(_read_context_length(d))
-        None
+        ...     _read_hf_config(d)
+        {}
     """
     config_fp = Path(hf_model_dir) / "config.json"
     try:
         config = json.loads(config_fp.read_text())
     except (OSError, ValueError) as e:
         logger.warning(
-            f"Could not read {config_fp} to determine the model's context length "
-            f"({type(e).__name__}: {e}). SGLang's own auto-truncation will apply instead, which "
-            "clamps silently."
+            f"Could not read {config_fp} ({type(e).__name__}: {e}). The SGLang backend's "
+            "pre-flight checks on context length and attention head dimension will be skipped."
         )
-        return None
+        return {}
+    return config if isinstance(config, dict) else {}
 
-    context_len = config.get("max_position_embeddings")
-    if not isinstance(context_len, int):
-        logger.warning(
-            f"{config_fp} has no integer ``max_position_embeddings`` (got {context_len!r}); "
-            "SGLang's own auto-truncation will apply instead, which clamps silently."
-        )
+
+def _config_int(config: dict, key: str) -> int | None:
+    """Pull an integer field out of a parsed HF config, or ``None`` if it isn't there.
+
+    Examples:
+        >>> _config_int({"head_dim": 64}, "head_dim")
+        64
+        >>> print(_config_int({}, "head_dim"))
+        None
+        >>> print(_config_int({"head_dim": None}, "head_dim"))
+        None
+        >>> print(_config_int({"head_dim": "64"}, "head_dim"))
+        None
+
+        ``bool`` is a subclass of ``int`` but never a valid answer here:
+
+        >>> print(_config_int({"head_dim": True}, "head_dim"))
+        None
+    """
+    value = config.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
-    return context_len
+    return value
+
+
+def _check_head_dim_against_attention_backend(head_dim: int | None, engine_kwargs: dict) -> None:
+    """Refuse to start SGLang on a default attention backend that cannot dispatch this head dim.
+
+    SGLang defaults to FlashInfer, which aborts on ``head_dim`` below
+    :data:`_FLASHINFER_MIN_HEAD_DIM`. The abort kills the scheduler subprocess and surfaces in the
+    parent as SIGQUIT / exit ``-9``, so what is really a shape constraint reads as an
+    out-of-memory kill — the single most misleading failure this backend can produce. Catching it
+    here costs nothing and names both remedies.
+
+    The check only fires when ``attention_backend`` is left unset, i.e. when *we* are the ones
+    letting SGLang pick FlashInfer. A caller who names a backend explicitly has made a choice and
+    is trusted with it, which also means this cannot wrongly block a future FlashInfer that lifts
+    the floor.
+
+    Args:
+        head_dim: The model's attention head dimension, or ``None`` if it could not be read (in
+            which case there is nothing to check).
+        engine_kwargs: The kwargs about to be passed to ``sglang.Engine``.
+
+    Raises:
+        ValueError: If the head dimension is below the FlashInfer floor and no attention backend
+            was named.
+
+    Examples:
+        Fine: head dim at or above the floor, or unknown, or a backend named explicitly.
+
+        >>> _check_head_dim_against_attention_backend(64, {})
+        >>> _check_head_dim_against_attention_backend(None, {})
+        >>> _check_head_dim_against_attention_backend(32, {"attention_backend": "triton"})
+
+        Refused: below the floor with the backend left to SGLang's default.
+
+        >>> _check_head_dim_against_attention_backend(32, {})
+        Traceback (most recent call last):
+            ...
+        ValueError: SGLang's default FlashInfer attention backend cannot dispatch
+        attention_head_dim=32 ...
+    """
+    if head_dim is None or head_dim >= _FLASHINFER_MIN_HEAD_DIM:
+        return
+    if engine_kwargs.get("attention_backend") is not None:
+        return
+    raise ValueError(
+        f"SGLang's default FlashInfer attention backend cannot dispatch attention_head_dim="
+        f"{head_dim} (its floor is {_FLASHINFER_MIN_HEAD_DIM}). It would abort the scheduler "
+        "subprocess with 'FlashInfer Internal Error: Invalid configuration', which reaches this "
+        "process as SIGQUIT / exit -9 and looks like an out-of-memory kill rather than a shape "
+        "error. Either train with lightning_module.model.gpt_kwargs.attention_head_dim>="
+        f"{_FLASHINFER_MIN_HEAD_DIM}, or select an attention backend that has no such floor with "
+        "backend.engine_kwargs.attention_backend=triton."
+    )
 
 
 def _strip_padding_to_lists(input_ids: torch.Tensor, attention_mask: torch.Tensor | None) -> list[list[int]]:
@@ -285,7 +353,14 @@ class SGLangBackend:
         # alive. Non-overridable for the same reason as ``skip_tokenizer_init``: disabling it
         # converts that residual mismatch from a shortfall into a crash mid-run.
         self._engine_kwargs["allow_auto_truncate"] = True
-        self._context_len = _read_context_length(hf_model_dir)
+        hf_config = _read_hf_config(hf_model_dir)
+        self._context_len = _config_int(hf_config, "max_position_embeddings")
+        if self._context_len is None:
+            logger.warning(
+                f"No integer ``max_position_embeddings`` in {Path(hf_model_dir) / 'config.json'}; "
+                "SGLang's own auto-truncation will apply instead, which clamps silently."
+            )
+        _check_head_dim_against_attention_backend(_config_int(hf_config, "head_dim"), self._engine_kwargs)
         # Log the ceiling once at construction rather than per call — the rolling loop calls
         # ``generate_chunk`` many times with the same shape, and a per-call warning would bury
         # the run's real output.

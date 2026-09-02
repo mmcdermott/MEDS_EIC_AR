@@ -11,8 +11,15 @@ _target_: MEDS_EIC_AR.model.backends.build_sglang_backend
 
 # Kwargs forwarded verbatim to ``sglang.Engine(...)``. Override from the CLI with
 # ``backend.engine_kwargs.<key>=<val>``.
-#  - ``mem_fraction_static``: fraction of GPU memory SGLang keeps for KV cache. 0.85 leaves
-#    ~15% free for the Lightning backbone copy and other GPU consumers.
+#  - ``mem_fraction_static``: fraction of *total* device memory SGLang reserves up front for the
+#    KV cache. 0.85 leaves ~15% free for the Lightning backbone copy and other GPU consumers,
+#    which is right for a dedicated GPU. **Lower it substantially on unified-memory hosts**,
+#    where CPU and GPU share one pool: on a DGX Spark's 128 GB, 0.85 reserves ~109 GB and leaves
+#    the host a couple of GB, which invites the OOM killer. 0.2–0.4 is ample for a small model.
+#  - ``attention_backend``: left unset, so SGLang picks FlashInfer. That backend cannot dispatch
+#    attention head dimensions below 64; ``SGLangBackend`` refuses to start rather than let it
+#    abort the scheduler subprocess in a way that looks like an OOM. Set ``triton`` for narrow
+#    models.
 #  - ``max_running_requests``: cap on concurrent in-flight requests. 256 is plenty for
 #    typical batch-generation workloads; raise if you're saturating it.
 #  - ``tp_size``: tensor-parallel degree. 1 for single-GPU; set higher for multi-GPU
