@@ -406,8 +406,8 @@ def test_collate_with_meta_round_trip_through_dataloader():
 def test_rolling_context_size_above_the_model_window_is_rejected(rolling_model: Model, rolling_batch):
     """An explicitly-set window larger than the model can hold is a config error, not a hint.
 
-    Silently shrinking it would mean the run conditions on less history than it was told to,
-    with nothing in the output to say so.
+    Silently shrinking it would mean the run conditions on less history than it was told to, with nothing in
+    the output to say so.
     """
     with pytest.raises(ValueError, match="exceeds what is usable"):
         _run_rolling(
