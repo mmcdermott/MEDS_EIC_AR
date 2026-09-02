@@ -750,3 +750,24 @@ def test_input_ceiling_is_checked_against_the_longest_prompt_in_the_batch(tmp_pa
                 max_new_tokens=1, do_sample=False, pad_token_id=0, eos_token_id=99
             ),
         )
+
+
+def test_max_prompt_len_prefers_the_engines_reported_ceiling(tmp_path: Path):
+    """When the engine reports ``max_req_input_len``, that wins over the derived fallback.
+
+    The reported value tracks SGLang's own rule across versions and covers the case where the
+    KV pool binds rather than the context length. Minus one because the check is ``>=``.
+    """
+    fake = _FakeSGLModule()
+    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": 512}))
+    backend = SGLangBackend(tmp_path, sgl_module=fake)
+    fake.last_engine.scheduler_info = {"status": "ready", "max_req_input_len": 64}
+    backend._max_prompt_len = backend._resolve_max_prompt_len()
+
+    assert backend.max_prompt_len == 63, "Engine-reported ceiling should win over 512 - 7."
+
+
+def test_max_prompt_len_falls_back_when_the_engine_reports_nothing(tmp_path: Path):
+    """Engines that don't expose ``scheduler_info`` fall back to the documented arithmetic."""
+    backend, _ = _make_backend_with_context(tmp_path, context_len=512)
+    assert backend.max_prompt_len == 512 - _SGLANG_INPUT_RESERVE

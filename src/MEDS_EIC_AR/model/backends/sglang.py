@@ -109,30 +109,22 @@ _SGLANG_OUTPUT_KEYS: tuple[str, ...] = ("output_ids", "token_ids")
 _SGLANG_CONTEXT_RESERVE = 2
 
 
-#: Positions SGLang holds back from the *input* side of the context window.
+#: Fallback for SGLang's input ceiling when the engine doesn't report one.
 #:
-#: Distinct from :data:`_SGLANG_CONTEXT_RESERVE`, which bounds how many tokens SGLang will
-#: *emit*. This one bounds how many prompt tokens it will actually *read*, and exceeding it is
-#: far more damaging: SGLang does not refuse the request, it silently drops the tail of the
-#: prompt and generates from the truncated prefix, so the model is conditioned on something the
-#: caller never asked for. Derivation, from ``sglang==0.5.9``::
+#: SGLang bounds how many prompt tokens it will *read*, separately from how many it will emit
+#: (:data:`_SGLANG_CONTEXT_RESERVE`). Exceeding it is silent and destructive: the engine keeps
+#: the *oldest* tokens, discards the tail, and generates from that stale prefix, so the model is
+#: conditioned on something the caller never sent. From ``sglang==0.5.9``::
 #:
-#:     max_req_len       = min(context_len - 1, max_token_pool_size - 1)   # tp_worker.py
-#:     max_req_input_len = max_req_len - 5                                 # tp_worker.py
-#:     if len(input_ids) >= max_req_input_len: truncate or reject          # managers/utils.py
+#:     max_req_len       = min(context_len - 1, kv_pool_size - 1)   # managers/tp_worker.py
+#:     max_req_input_len = max_req_len - 5                          # managers/tp_worker.py
+#:     if len(input_ids) >= max_req_input_len: truncate             # managers/utils.py
 #:
-#: The comparison is ``>=``, so the longest prompt SGLang reads in full is
-#: ``max_req_input_len - 1``, i.e. ``context_len - 7`` whenever the context length is the
-#: binding term. Measured against a 16-position model: a 9-token prompt is honored, a 10-token
-#: prompt is already truncated.
-#:
-#: Why this is not merely SGLang's business: ``allow_auto_truncate=True`` (set unconditionally
-#: below) is what turns the rejection into a silent truncation, and SGLang's own truncation
-#: warning is emitted through a logger its engine init has already set to ERROR, so nothing
-#: surfaces. Left unchecked, ``Model._rolling_generate``'s default ``rolling_context_size`` of
-#: ``max_seq_len - 1`` sits far above this ceiling and every rolling chunk loses its prompt
-#: tail — which is exactly how SGLang came to emit grammar-invalid trajectories where the HF
-#: backend emitted valid ones (issue #171).
+#: The comparison is ``>=``, so the longest prompt read in full is ``max_req_input_len - 1``,
+#: i.e. ``context_len - 7`` when the context length is the binding term. Prefer the engine's own
+#: ``scheduler_info["max_req_input_len"]`` (see :meth:`SGLangBackend._resolve_max_prompt_len`),
+#: which also covers the case where the KV pool binds instead of the context; this constant is
+#: only the fallback for engines that don't report it.
 _SGLANG_INPUT_RESERVE = 7
 
 
@@ -409,22 +401,39 @@ class SGLangBackend:
         self._logged_context_clamp = False
         self._logged_prompt_ceiling = False
         self._engine = sgl_module.Engine(model_path=str(hf_model_dir), **self._engine_kwargs)
+        self._max_prompt_len = self._resolve_max_prompt_len()
         self._is_shutdown = False
         atexit.register(self.shutdown)
 
-    @property
-    def max_prompt_len(self) -> int | None:
-        """Longest prompt SGLang will read in full, or ``None`` if the context length is unknown.
+    def _resolve_max_prompt_len(self) -> int | None:
+        """Longest prompt this engine will read in full, or ``None`` if it can't be determined.
 
-        Prompts longer than this are silently truncated by the engine rather than rejected (see
-        :data:`_SGLANG_INPUT_RESERVE`), so callers that build their own prompt windows -- notably
-        :meth:`MEDS_EIC_AR.model.model.Model._rolling_generate` -- must clamp to this rather than
-        to the model's raw context length. ``None`` means "unknown, don't clamp", which restores
-        the pre-fix behavior rather than guessing a ceiling that might be wrong.
+        Asks the engine rather than re-deriving the arithmetic: ``scheduler_info`` carries the
+        ``max_req_input_len`` the scheduler actually enforces, so this tracks SGLang's own rule
+        across versions and accounts for the KV pool binding instead of the context length.
+        Subtracts one because SGLang's length check is ``>=``, not ``>``.
+
+        Falls back to :data:`_SGLANG_INPUT_RESERVE` against the model's context length when the
+        engine reports nothing (older SGLang, or a test double).
         """
+        info = getattr(self._engine, "scheduler_info", None)
+        reported = info.get("max_req_input_len") if isinstance(info, dict) else None
+        if isinstance(reported, int) and not isinstance(reported, bool) and reported > 0:
+            return reported - 1
         if self._context_len is None:
             return None
         return max(self._context_len - _SGLANG_INPUT_RESERVE, 0)
+
+    @property
+    def max_prompt_len(self) -> int | None:
+        """Longest prompt SGLang will read in full, or ``None`` if it could not be determined.
+
+        Prompts longer than this are silently truncated by the engine rather than rejected, so
+        callers that build their own prompt windows -- notably
+        :meth:`MEDS_EIC_AR.model.model.Model._rolling_generate` -- must size them against this
+        rather than the model's raw context length. ``None`` means "unknown, don't clamp".
+        """
+        return self._max_prompt_len
 
     def _check_prompt_len(self, prompt_len: int) -> None:
         """Refuse a prompt SGLang would silently truncate.

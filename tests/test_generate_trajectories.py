@@ -401,3 +401,38 @@ def test_collate_with_meta_round_trip_through_dataloader():
     assert all_dataset_row_idxs == expected_dataset_row_idxs
     assert all_trajectory_idxs == expected_trajectory_idxs
     assert all_first_codes == expected_dataset_row_idxs
+
+
+def test_rolling_context_size_above_the_model_window_is_rejected(rolling_model: Model, rolling_batch):
+    """An explicitly-set window larger than the model can hold is a config error, not a hint.
+
+    Silently shrinking it would mean the run conditions on less history than it was told to,
+    with nothing in the output to say so.
+    """
+    with pytest.raises(ValueError, match="exceeds what is usable"):
+        _run_rolling(
+            rolling_model,
+            rolling_batch,
+            max_new_tokens=10,
+            rolling_context_size=rolling_model.max_seq_len + 5,
+        )
+
+
+def test_rolling_context_size_above_a_backend_ceiling_is_rejected(rolling_model: Model, rolling_batch):
+    """Same rule when the binding limit is the backend's, not the model's.
+
+    The error must name the backend, since the model's own context window would have allowed it.
+    """
+
+    class _CappedBackend:
+        max_prompt_len = 4
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def generate_chunk(self, *args, **kwargs):  # pragma: no cover - never reached
+            return self._inner.generate_chunk(*args, **kwargs)
+
+    rolling_model._backend = _CappedBackend(rolling_model._backend)
+    with pytest.raises(ValueError, match="_CappedBackend"):
+        _run_rolling(rolling_model, rolling_batch, max_new_tokens=10, rolling_context_size=8)
