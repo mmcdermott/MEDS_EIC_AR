@@ -1002,6 +1002,14 @@ class Model(torch.nn.Module):
         explicitly. ``eos_token_id`` is read from ``self.HF_model.config.eos_token_id`` rather than
         passed in, since both callers always want the model's configured EOS.
 
+        **Sampling law.** Untruncated ancestral sampling is the only sampling mode this model
+        supports: when ``do_sample`` is true, generation draws from the model's full next-token
+        distribution under ``temperature=1.0``, ``top_k=0``, ``top_p=1.0``, ``num_beams=1``. Every
+        one of those is set explicitly, including the ones that merely restate a HF default,
+        because the failure mode being guarded against is an inherited default silently changing
+        the distribution being sampled. Trajectories from this path are therefore usable as Monte
+        Carlo draws from the model. ``tests/calibration/`` holds that property under regression.
+
         Args:
             input_ids: ``[B, L_in]`` tensor of prompt tokens.
             attention_mask: Optional ``[B, L_in]`` attention mask (``True`` for real tokens).
@@ -1018,6 +1026,17 @@ class Model(torch.nn.Module):
             do_sample=do_sample,
             num_beams=1,
             temperature=1.0,
+            # ``top_k`` and ``top_p`` are pinned to their no-op values rather than left to HF's
+            # ``GenerationConfig`` class defaults. HF defaults ``top_k`` to **50**, which silently
+            # installs a ``TopKLogitsWarper`` and turns every sampled trajectory into a draw from
+            # the renormalized top-50 head of the vocabulary — a mode-seeking bias, not ancestral
+            # sampling, that invalidates anything downstream treating trajectories as Monte Carlo
+            # draws from the model (calibration, risk estimates, trajectory-ensemble predictions).
+            # ``top_k=0`` disables the warper entirely; ``top_p=1.0`` merely restates a HF default
+            # but is written out anyway so the entire sampling law is legible here instead of
+            # split between this file and ``transformers``' class defaults.
+            top_k=0,
+            top_p=1.0,
             pad_token_id=pad_id,
             bos_token_id=None,
             eos_token_id=self.HF_model.config.eos_token_id,
