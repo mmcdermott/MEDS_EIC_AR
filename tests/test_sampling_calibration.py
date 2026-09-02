@@ -16,28 +16,32 @@ straight off a forward pass, draw many single-token continuations from the same 
 generative process needs to sit in between: what makes a sample calibrated is agreement with the
 model, and the model's distribution is right there to be read.
 
-Four tests:
+Three tests:
 
 1. :func:`test_generate_chunk_requests_untruncated_sampling` — inspects the ``GenerationConfig``
    that reaches the backend, on both generation paths. Sub-second; this is the test that will name
    the problem if the explicit ``top_k=0`` is ever dropped.
-2. :func:`test_generation_config_default_top_k_is_still_the_hazard` — guards the premise that HF's
-   default is still truncating, so the tests here can't quietly stop testing anything.
-3. :func:`test_sampled_tokens_match_the_models_own_distribution` — the behavioral check described
+2. :func:`test_sampled_tokens_match_the_models_own_distribution` — the behavioral check described
    above.
-4. :func:`test_probe_detects_top_k_truncation` — the negative control for (3), which re-runs the
-   same probe against a fault-injected backend that reinstates ``top_k=50``.
+3. :func:`test_probe_detects_top_k_truncation` — the negative control for (2), which re-runs the
+   same probe against a fault-injected backend that reinstates ``top_k=50`` and asserts the probe
+   rejects it. Nothing here asserts anything about what HF's defaults happen to be: the property
+   under test is our own sampling law, and this control keeps the probe honest without reaching
+   for a third-party default to do it.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import pytest
 import torch
-from transformers import GenerationConfig
 
 from MEDS_EIC_AR.model.model import Model
+
+if TYPE_CHECKING:
+    from transformers import GenerationConfig
 
 PAD = 0
 
@@ -209,21 +213,6 @@ def test_generate_chunk_requests_untruncated_sampling(rolling: bool):
         assert cfg.top_p == 1.0, f"GenerationConfig.top_p is {cfg.top_p!r}, not 1.0 (no nucleus truncation)."
         assert cfg.temperature == 1.0, f"GenerationConfig.temperature is {cfg.temperature!r}, not 1.0."
         assert cfg.num_beams == 1, f"GenerationConfig.num_beams is {cfg.num_beams!r}, not 1."
-
-
-def test_generation_config_default_top_k_is_still_the_hazard():
-    """Guard the *premise* of this module: HF's default ``top_k`` really is truncating.
-
-    If a future ``transformers`` release changed ``GenerationConfig().top_k`` to ``0`` or ``None``,
-    the tests here would keep passing while no longer testing anything, and the explicit
-    ``top_k=0`` in ``_generate_chunk`` would read as dead code to the next person through. This
-    fails loudly in that case so the situation gets re-evaluated rather than quietly forgotten.
-    """
-    assert GenerationConfig().top_k == 50, (
-        "transformers' GenerationConfig no longer defaults top_k to 50. The explicit top_k=0 in "
-        "Model._generate_chunk may no longer be load-bearing — re-read the HF defaults and update "
-        "this module's rationale accordingly."
-    )
 
 
 # ---------------------------------------------------------------------------
