@@ -903,41 +903,32 @@ class Model(torch.nn.Module):
         # shortening it. Backends advertise that limit via an optional ``max_prompt_len``;
         # ``None`` (the HF backend, which has no such limit) means the model context is the only
         # bound.
-        ctx_cap = self.max_seq_len - 1
         backend_cap = getattr(self._backend, "max_prompt_len", None)
-        if backend_cap is not None:
-            if backend_cap <= 0:
-                raise ValueError(
-                    f"Backend {type(self._backend).__name__} reports max_prompt_len="
-                    f"{backend_cap}; it cannot accept any prompt for a model with "
-                    f"max_seq_len={self.max_seq_len}."
-                )
-            ctx_cap = min(ctx_cap, backend_cap)
+        ctx_cap = self.max_seq_len - 1 if backend_cap is None else min(self.max_seq_len - 1, backend_cap)
 
         if rolling_context_size is None:
             # Unspecified: take the largest window everything involved can honor.
-            ctx_size = ctx_cap
-        else:
-            # Specified: refuse anything unattainable rather than quietly shrinking it, so a run
-            # never conditions on less history than it was told to.
-            if rolling_context_size <= 0:
-                raise ValueError(f"rolling_context_size must be positive; got {rolling_context_size}.")
-            if rolling_context_size > ctx_cap:
-                bound = (
-                    f"the model's context window (max_seq_len={self.max_seq_len}, so at most "
-                    f"{self.max_seq_len - 1})"
-                    if ctx_cap == self.max_seq_len - 1
-                    else (
-                        f"{type(self._backend).__name__}, which reads at most {backend_cap} prompt "
-                        "tokens and silently discards the rest"
-                    )
+            rolling_context_size = ctx_cap
+        elif rolling_context_size <= 0:
+            raise ValueError(f"rolling_context_size must be positive; got {rolling_context_size}.")
+        elif rolling_context_size > ctx_cap:
+            # Refuse anything unattainable rather than quietly shrinking it, so a run never
+            # conditions on less history than it was told to.
+            bound = (
+                f"the model's context window (max_seq_len={self.max_seq_len}, so at most "
+                f"{self.max_seq_len - 1})"
+                if ctx_cap == self.max_seq_len - 1
+                else (
+                    f"{type(self._backend).__name__}, which reads at most {backend_cap} prompt "
+                    "tokens and silently discards the rest"
                 )
-                raise ValueError(
-                    f"rolling_context_size={rolling_context_size} exceeds what is usable here: "
-                    f"{bound}. Lower it to at most {ctx_cap}, or leave it unset to use the "
-                    "largest usable window automatically."
-                )
-            ctx_size = rolling_context_size
+            )
+            raise ValueError(
+                f"rolling_context_size={rolling_context_size} exceeds what is usable here: "
+                f"{bound}. Lower it to at most {ctx_cap}, or leave it unset to use the "
+                "largest usable window automatically."
+            )
+        ctx_size = rolling_context_size
 
         input_ids = batch.code
         pad_id = batch.PAD_INDEX
