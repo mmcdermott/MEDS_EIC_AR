@@ -210,12 +210,11 @@ def _check_attention_backend(head_dim: int | None, engine_kwargs: dict) -> None:
             ...
         ValueError: SGLang's FlashInfer attention backend cannot dispatch attention_head_dim=32 ...
 
-        An unrecognized name is refused regardless of head dim:
-
-        >>> _check_attention_backend(128, {"attention_backend": "flashinfer_typo"})
-        Traceback (most recent call last):
-            ...
-        ValueError: Unknown SGLang attention_backend 'flashinfer_typo'. Valid choices: ...
+        An unrecognized name is also refused, regardless of head dim -- but only when ``sglang``
+        is installed, since its ``ATTENTION_BACKEND_CHOICES`` is what defines "recognized". With
+        the package absent (the backend is reachable in that state only via an injected
+        ``sgl_module``) the name check is skipped rather than guessing at a hard-coded list. See
+        ``test_unknown_attention_backend_is_refused``.
     """
     requested = engine_kwargs.get("attention_backend")
 

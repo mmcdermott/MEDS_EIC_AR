@@ -17,6 +17,7 @@ What's deliberately NOT tested here:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -814,6 +815,11 @@ def test_explicit_flashinfer_below_the_floor_is_refused(tmp_path: Path):
         )
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("sglang") is None,
+    reason="Name validation is defined by sglang's own ATTENTION_BACKEND_CHOICES; without the "
+    "package installed there is no list to validate against and the check is skipped by design.",
+)
 def test_unknown_attention_backend_is_refused(tmp_path: Path):
     """A misspelled backend should fail here, naming the valid choices."""
     _write_config(tmp_path, max_position_embeddings=512, head_dim=128)
