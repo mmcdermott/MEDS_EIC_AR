@@ -101,11 +101,13 @@ Three further runtime requirements on this hardware:
 shares one 128 GB pool between CPU and GPU, so `0.85` reserves ~109 GB and leaves the host close to the
 OOM killer. `sglang_demo.yaml` uses `0.3`; lower `sglang.yaml` to `0.2`–`0.4` as well when running there.
 
-> [!NOTE]
-> `uv sync --frozen` currently fails on aarch64 hosts: `uv.lock`'s `av` entry records no wheel or sdist,
-> because it was resolved on x86_64 where `av`'s aarch64-only marker is false. Use `uv pip install -e .`
-> until the lockfile is regenerated with an aarch64 resolution environment. See
-> [#161](https://github.com/mmcdermott/MEDS_EIC_AR/issues/161).
+`uv sync --frozen` works on aarch64 hosts because `pyproject.toml` declares
+`tool.uv.required-environments` with the Linux ARM branch, which forces `uv.lock` to carry
+distributions for it. **Keep that setting if you re-lock.** Without it, a dependency reachable only
+under an ARM marker — `av`, pulled in by the `sglang` extra — gets a lock entry with no wheel and no
+sdist, since the resolver never explores that branch on an x86_64 host. `uv sync` on ARM then fails
+with "can't be installed because it doesn't have a source distribution or wheel for the current
+platform".
 
 ## Usage
 
