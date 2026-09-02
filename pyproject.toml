@@ -139,3 +139,21 @@ select = [
 
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = ["*MEDS*", "F", "L", "M", "D", "LR_*", "*GPT*"]  # Ignore MEDS in variable names
+
+[tool.uv]
+# Force the lock to carry distributions for ARM64 as well as the x86_64 host it is usually
+# resolved on. Without this, a dependency reachable *only* under an ARM marker gets a package
+# stanza with no `sdist` and no `wheels` at all: the resolver never explored that branch, so it
+# recorded nothing to install, and `uv sync` on an ARM host fails with "can't be installed because
+# it doesn't have a source distribution or wheel for the current platform". `av`, pulled in by the
+# `sglang` extra under an aarch64-only marker, hit exactly that on a DGX Spark.
+#
+# `required-environments` rather than `environments`: the latter would *restrict* resolution to the
+# listed set and silently drop support for anything not enumerated (Windows, for one). This only
+# widens what the lock must cover.
+#
+# Only the Linux ARM branch is listed. Adding macOS ARM was tried and rejected: `sglang` publishes
+# no macOS ARM wheels at 0.5.9, so requiring coverage there forks the resolution back to 0.5.2 and
+# drops `mlx-lm`/`mlx-metal` — a 250-line lock churn and a downgrade of the pin this branch's
+# install recipe is written against, to cover a platform the `sglang` extra cannot run on anyway.
+required-environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
