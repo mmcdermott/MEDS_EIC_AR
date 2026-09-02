@@ -670,6 +670,17 @@ def test_small_head_dim_is_allowed_when_an_attention_backend_is_named(tmp_path: 
     assert fake.last_engine.engine_kwargs["attention_backend"] == "triton"
 
 
+def test_explicit_null_attention_backend_still_triggers_the_check(tmp_path: Path):
+    """``attention_backend: null`` is "let SGLang choose", not a choice, so the check must still fire.
+
+    ``sglang.yaml`` carries the key explicitly at ``null`` so it can be overridden without Hydra's
+    ``+`` syntax. That must not be mistaken for the caller having selected a backend.
+    """
+    _write_config(tmp_path, max_position_embeddings=512, head_dim=32)
+    with pytest.raises(ValueError, match="FlashInfer"):
+        SGLangBackend(tmp_path, engine_kwargs={"attention_backend": None}, sgl_module=_FakeSGLModule())
+
+
 def test_head_dim_at_the_floor_is_allowed_on_the_default_attention_backend(tmp_path: Path):
     """The floor is inclusive — a model exactly at it must construct without complaint."""
     _write_config(tmp_path, max_position_embeddings=512, head_dim=_FLASHINFER_MIN_HEAD_DIM)

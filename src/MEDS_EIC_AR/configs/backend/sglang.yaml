@@ -31,3 +31,8 @@ engine_kwargs:
   mem_fraction_static: 0.85
   max_running_requests: 256
   tp_size: 1
+  # ``null`` means "let SGLang choose", which is FlashInfer. The key is present rather than
+  # omitted so it can be overridden as ``backend.engine_kwargs.attention_backend=triton`` without
+  # Hydra's ``+`` append syntax. ``SGLangBackend`` treats an explicit ``null`` the same as an
+  # absent key: it is not a choice, so the head-dim floor check still applies.
+  attention_backend: null
