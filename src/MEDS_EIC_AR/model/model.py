@@ -1002,13 +1002,14 @@ class Model(torch.nn.Module):
         explicitly. ``eos_token_id`` is read from ``self.HF_model.config.eos_token_id`` rather than
         passed in, since both callers always want the model's configured EOS.
 
-        **Sampling law.** Untruncated ancestral sampling is the only sampling mode this model
-        supports: when ``do_sample`` is true, generation draws from the model's full next-token
-        distribution under ``temperature=1.0``, ``top_k=0``, ``top_p=1.0``, ``num_beams=1``. Every
-        one of those is set explicitly, including the ones that merely restate a HF default,
-        because the failure mode being guarded against is an inherited default silently changing
-        the distribution being sampled. Trajectories from this path are therefore usable as Monte
-        Carlo draws from the model. ``tests/calibration/`` holds that property under regression.
+        **Sampling law.** ``do_sample`` picks between the two decoding modes there are: ``False``
+        greedy-decodes, ``True`` samples. There is exactly one sampling mode, and it is untruncated
+        ancestral sampling — ``temperature=1.0``, ``top_k=0``, ``top_p=1.0``, ``num_beams=1`` — so a
+        sampled token is a draw from the model's full next-token distribution and nothing narrower.
+        Truncated sampling is not offered. Every one of those four fields is set explicitly,
+        including the ones that merely restate a HF default, because the failure mode being guarded
+        against is an inherited default silently changing the distribution being sampled.
+        ``tests/test_sampling_calibration.py`` holds that property under regression.
 
         Args:
             input_ids: ``[B, L_in]`` tensor of prompt tokens.
