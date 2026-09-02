@@ -80,16 +80,32 @@ _HF_ONLY_KWARGS: frozenset[str] = frozenset(
 #: if neither key is found we raise loudly (see ``generate_chunk``).
 _SGLANG_OUTPUT_KEYS: tuple[str, ...] = ("output_ids", "token_ids")
 
-#: Positions SGLang's tokenizer-manager validator holds back from the model's context window.
-#: The validator rejects a request outright once ``input_len + max_new_tokens`` reaches the
-#: context length, and the usable ceiling measured against ``sglang==0.5.9`` is
-#: ``context_len - 2`` total positions, not ``context_len - 1``: with a 512-position model and a
-#: 128-token prompt, 382 new tokens is the largest request that comes back at full length, while
-#: 383 and 384 both come back as 382. HF's ``generate``, by contrast, allows the full
-#: ``context_len``. So an SGLang chunk is inherently up to two tokens shorter than the HF chunk
-#: the shared rolling loop asks for, and this backend subtracts that itself rather than letting
-#: the engine clamp silently. The constant is empirical and version-sensitive; if a future SGLang
-#: changes the validator, this is the number to re-measure.
+#: Positions SGLang holds back from the model's context window, on top of the prompt.
+#:
+#: Two layers are involved and only the second costs tokens. The tokenizer manager checks
+#: ``len(input) + max_new_tokens >= context_len`` and either raises or, under
+#: ``allow_auto_truncate``, clamps to ``context_len - len(input)`` — a no-op at exactly the
+#: boundary. The *scheduler* is what actually trims, in ``init_req_max_new_tokens``::
+#:
+#:     max_req_len    = min(context_len - 1, max_token_pool_size - 1)   # tp_worker
+#:     max_new_tokens = min(requested, max_req_len - len(input) - 1)    # scheduler
+#:
+#: which is ``context_len - len(input) - 2`` whenever the context length is the binding term.
+#: That ``min`` is unconditional: no warning, and not gated on ``allow_auto_truncate``. HF's
+#: ``generate``, by contrast, will fill the window exactly. Matches the measurement it was
+#: derived from — on a 512-position model with a 128-token prompt, 382 new tokens is the largest
+#: request honored in full, while 383 and 384 both come back as 382.
+#:
+#: **Two is a floor, not a guarantee.** When the KV pool is the binding term instead — a large
+#: model, or a small ``mem_fraction_static`` — ``max_req_len`` is smaller than ``context_len - 1``
+#: and the shortfall grows. Capping by this constant keeps the common case honest; the residual is
+#: what ``allow_auto_truncate`` is left on to absorb.
+#:
+#: The subtraction also goes negative: at ``len(input) == context_len - 1`` the scheduler's cap is
+#: ``-1``, and ``Req.check_finished`` stops on ``len(output_ids) >= max_new_tokens``, which holds
+#: at zero output tokens. The request completes having generated nothing — which is why
+#: :meth:`SGLangBackend._cap_max_new_tokens` raises rather than letting the rolling loop receive an
+#: empty chunk it would spin on.
 _SGLANG_CONTEXT_RESERVE = 2
 
 
@@ -339,19 +355,18 @@ class SGLangBackend:
         # this cannot be overridden, and a caller passing ``engine_kwargs={"skip_tokenizer_init":
         # False}`` would otherwise silently break the pipeline.
         self._engine_kwargs["skip_tokenizer_init"] = True
-        # ``allow_auto_truncate`` is a safety net, not the mechanism. The rolling loop in
+        # ``allow_auto_truncate`` keeps window-saturating requests from being *rejected*; it is
+        # not what costs tokens. The rolling loop in
         # :meth:`MEDS_EIC_AR.model.Model._rolling_generate` sets
         # ``chunk_budget = max_seq_len - prompt_len`` per call — total positions requested =
         # ``max_context_length`` exactly. HF's ``generate`` accepts that boundary (positions
-        # ``0..max_pos-1`` inclusive); SGLang's validator rejects it, and without auto-truncate
-        # every window-saturating call would raise ``ValueError("Requested token count
-        # exceeds...")``. But auto-truncate on its own turns the rejection into a *silent* clamp
-        # that returns up to ``_SGLANG_CONTEXT_RESERVE`` fewer tokens than asked for, which is
-        # not parity with HF however it is described. :meth:`generate_chunk` therefore applies
-        # the ceiling itself, visibly, and this flag only catches a residual mismatch (a SGLang
-        # version whose reserve differs from ours) rather than being the thing that keeps runs
-        # alive. Non-overridable for the same reason as ``skip_tokenizer_init``: disabling it
-        # converts that residual mismatch from a shortfall into a crash mid-run.
+        # ``0..max_pos-1`` inclusive); SGLang's tokenizer manager raises on it unless this flag is
+        # set. The token loss happens further in, in the scheduler, and happens either way — see
+        # ``_SGLANG_CONTEXT_RESERVE``. So this flag is what keeps boundary requests alive, and
+        # :meth:`generate_chunk` is what makes the resulting shortfall visible instead of leaving
+        # it to be discovered in the output shape. Non-overridable for the same reason as
+        # ``skip_tokenizer_init``: turning it off converts every window-saturating chunk from a
+        # shortfall into a crash mid-run.
         self._engine_kwargs["allow_auto_truncate"] = True
         hf_config = _read_hf_config(hf_model_dir)
         self._context_len = _config_int(hf_config, "max_position_embeddings")
@@ -393,10 +408,12 @@ class SGLangBackend:
         if allowed <= 0:
             raise ValueError(
                 f"SGLang cannot generate any new tokens for a {prompt_len}-token prompt against a "
-                f"{self._context_len}-position context window: its validator reserves "
-                f"{_SGLANG_CONTEXT_RESERVE} positions, leaving {allowed}. HF's generate accepts "
-                "this prompt, so this is an SGLang-specific ceiling. When generating with the "
-                "rolling loop, set rolling_generation.rolling_context_size to at most "
+                f"{self._context_len}-position context window: its scheduler caps max_new_tokens "
+                f"at max_req_len - len(input) - 1, which holds back {_SGLANG_CONTEXT_RESERVE} "
+                f"positions and leaves {allowed} here. At or past this point SGLang returns an "
+                "empty completion rather than an error, which the rolling loop would read as no "
+                "progress and spin on. HF's generate accepts this prompt, so the ceiling is "
+                "SGLang-specific. Set rolling_generation.rolling_context_size to at most "
                 f"{self._context_len - _SGLANG_CONTEXT_RESERVE - 1} so every chunk has room for at "
                 "least one new token."
             )
@@ -405,10 +422,11 @@ class SGLangBackend:
             self._logged_context_clamp = True
             logger.warning(
                 f"SGLang chunk budget clamped from {requested} to {allowed} new tokens for a "
-                f"{prompt_len}-token prompt: its validator reserves {_SGLANG_CONTEXT_RESERVE} of "
-                f"the model's {self._context_len} positions, where HF's generate would use the "
-                "full window. Generated trajectories will be correspondingly shorter than the HF "
-                "backend's on window-saturating chunks. Logged once per backend instance."
+                f"{prompt_len}-token prompt: its scheduler holds back "
+                f"{_SGLANG_CONTEXT_RESERVE} of the model's {self._context_len} positions, where "
+                "HF's generate would use the full window. Generated trajectories will be "
+                "correspondingly shorter than the HF backend's on window-saturating chunks. "
+                "Logged once per backend instance."
             )
         return allowed
 
