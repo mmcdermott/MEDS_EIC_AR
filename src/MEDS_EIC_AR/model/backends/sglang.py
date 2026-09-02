@@ -431,9 +431,14 @@ class SGLangBackend:
         #     ``do_sample=False``.
         #   - ``eos_token_id`` → ``stop_token_ids=[eos]``. SGLang supports a list; we pass a
         #     single-element list to mirror HF's single-eos semantics here.
-        # ``top_p``/``top_k`` are deliberately not translated yet — none of today's callers
-        # set them (see ``Model._generate_chunk`` — the only call site), and translating them
-        # is properly part of #82's logits-processor work.
+        #   - ``top_k`` / ``top_p`` are not translated, and that is now a *deliberate no-op
+        #     rather than a gap*. ``Model._generate_chunk`` (the only call site) pins them to
+        #     ``top_k=0`` / ``top_p=1.0``, i.e. no truncation, because untruncated ancestral
+        #     sampling is the only sampling mode this repo supports. SGLang's own defaults
+        #     (``top_k=1073741824``, ``top_p=1.0``) are likewise non-truncating, so both
+        #     backends already sample from the same law and forwarding the fields would change
+        #     nothing. If a truncated mode is ever introduced, it must be plumbed through here
+        #     at the same time — otherwise the two backends would silently disagree.
         #
         # Pass a plain ``dict`` (rather than ``sglang.SamplingParams``) because the stable
         # public shape of ``Engine.generate(sampling_params=...)`` is ``Dict | List[Dict]``

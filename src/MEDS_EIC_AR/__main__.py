@@ -183,7 +183,16 @@ def generate_trajectories(cfg: DictConfig):
     # blowing up partway through hours of generation — and even a "saturating" decode of such
     # a bin would yield an uninterpretable trajectory, so refusing to start is the right
     # behavior. The fix lives upstream in the bin-reduction stage; this is the downstream guard.
-    validate_timeline_delta_bins_in_int64_range(get_code_metadata(D.train_dataloader().dataset))
+    #
+    # Read the dataset off the datamodule directly rather than via ``D.train_dataloader().dataset``.
+    # All that is wanted here is the dataset object, so ``get_code_metadata`` can reach
+    # ``dataset.config.code_metadata_fp`` — cohort-level metadata that is identical across splits.
+    # Building the *dataloader* additionally constructs a ``RandomSampler`` (``shuffle=True``),
+    # which rejects a zero-length dataset with ``num_samples should be a positive integer value``.
+    # Task cohorts defined only over tuning/held-out subjects have an empty train split and are a
+    # perfectly ordinary thing to run inference on, so going through the dataloader would refuse
+    # them for a reason unrelated to what is being validated.
+    validate_timeline_delta_bins_in_int64_range(get_code_metadata(D.train_dataset))
 
     # Validate rolling-generation config early — before loading the checkpoint and before running any
     # batches — so bad values (zero or negative budgets) fail fast with a clear message instead of
