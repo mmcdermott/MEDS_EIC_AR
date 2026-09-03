@@ -36,29 +36,39 @@ before producing output, or (b) produced output that violated the strict grammar
 The script does not make cross-backend claims about throughput or speed; it only reports
 per-backend wall-clock of whatever ran.
 
-Status / caveats
-----------------
+Status
+------
 
-The SGLang path is not known to complete successfully on any hardware through this PR's
-code — see the PR #117 description for the current blocking issue (``sgl_kernel==0.3.21``
-lacks SM 12.1 kernel images; the failure is inside SGLang's first RMSNorm call, below
-anything this repo owns). Running this script with ``--backends sglang_demo`` on a host
-where SGLang actually executes is the missing validation step; the script's output is the
-evidence that step would produce.
+The SGLang path completes end to end and its greedy output is byte-identical to the HF
+backend's on the grammar fixture. That was verified on a DGX Spark (GB10, SM 12.1) with
+``sglang==0.5.9`` / ``sgl-kernel==0.3.21+cu130`` / ``torch==2.9.1+cu129``, where
+``tests/grammar/test_cli_sglang.py`` passes under default settings. Reaching that took three
+fixes worth knowing about if something regresses: the SM 12.1 kernel images (#163), SGLang's
+silent prompt truncation past ``context_len - 7`` (#171), and its output-side ceiling (#162).
 
-DGX Spark environment notes (install-time workarounds, **not** baked into pyproject.toml
-because they'd regress other hardware):
+Environment notes for this hardware
+-----------------------------------
 
-- ``uv sync --extra sglang --prerelease=allow`` resolves CPU-only torch on aarch64. For
-  CUDA torch: ``uv pip install --torch-backend=cu129 --reinstall torch==2.9.1
-  torchvision==0.24.1 torchaudio==2.9.1``. ``torch==2.11+cu130`` ABI-mismatches
-  ``sgl_kernel==0.3.21``. Invoke CLIs via ``.venv/bin/python`` directly; ``uv run``
-  re-syncs to the CPU lockfile pin.
-- ``TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`` to override torch 2.9.1's bundled
-  CUDA 12.8 ptxas, which doesn't know ``sm_121a``.
-- Uninstall ``flash-attn-4`` from the venv — it provides the ``flash_attn`` module
-  namespace but no dist metadata, and ``MEICAR_pretrain``'s ``importlib.metadata.version
-  ("flash_attn")`` path trips on that. The repo cleanly falls back to SDPA without it.
+See README.md ("Running SGLang on Blackwell SM 12.1") for the authoritative recipe; the
+essentials are:
+
+- ``sgl-kernel`` must come from SGLang's CUDA-13 index. The PyPI wheels carry kernel images
+  only up to ``sm_120a``, which is not forward-compatible with SM 12.1, so the first RMSNorm
+  fails with ``no kernel image is available for execution on the device``::
+
+      uv pip install --index-url https://docs.sglang.ai/whl/cu130/ "sgl-kernel==0.3.21+cu130"
+
+- ``TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`` to override torch 2.9.1's bundled CUDA 12.8
+  ptxas, which doesn't know ``sm_121a``.
+- Put ``.venv/bin`` on ``PATH``. SGLang JIT-compiles kernels at engine startup and shells out
+  to ``ninja``, which is installed as a venv console script.
+- ``uv sync`` on aarch64 installs a CPU-only torch, because PyPI publishes no CUDA ARM wheel
+  for torch 2.9.1. Install CUDA torch explicitly (``uv pip install --torch-backend=auto ...``)
+  and invoke CLIs via ``.venv/bin/...`` directly rather than ``uv run``, which re-syncs to the
+  lockfile pin.
+- Uninstall ``flash-attn-4`` from the venv — it provides the ``flash_attn`` module namespace
+  but no dist metadata, and ``MEICAR_pretrain``'s ``importlib.metadata.version("flash_attn")``
+  path trips on that. The repo cleanly falls back to SDPA without it.
 """
 
 from __future__ import annotations
