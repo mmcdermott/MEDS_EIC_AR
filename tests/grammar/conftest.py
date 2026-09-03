@@ -54,7 +54,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("grammar", "End-to-end grammar-test fixture controls (see tests/grammar/)")
     group.addoption("--grammar-max-seq-len", type=int, default=16)
     group.addoption("--grammar-model-heads", type=int, default=4)
-    group.addoption("--grammar-model-head-dim", type=int, default=32)
+    group.addoption(
+        "--grammar-model-head-dim",
+        type=int,
+        default=32,
+        help=(
+            "Kept at 32 rather than raised to 64 for SGLang's sake: SGLang's default FlashInfer "
+            "attention backend cannot dispatch head dims below 64, but ``sglang_demo.yaml`` "
+            "selects the triton backend instead, which has no such floor. Widening the model here "
+            "would multiply the CPU pretrain cost of every grammar test to accommodate a backend "
+            "only one gated GPU test uses."
+        ),
+    )
     group.addoption("--grammar-pretrain-epochs", type=int, default=400)
     group.addoption("--grammar-pretrain-batch-size", type=int, default=32)
     group.addoption("--grammar-n-trajectories", type=int, default=8)

@@ -88,16 +88,18 @@ Three further runtime requirements on this hardware:
 - **Put `.venv/bin` on `PATH`.** SGLang JIT-compiles some kernels at engine startup and shells out to
     `ninja`, which is installed as a venv console script; without it the engine dies with
     `FileNotFoundError: [Errno 2] No such file or directory: 'ninja'`.
-- Use `attention_head_dim >= 64`, or pass `+backend.engine_kwargs.attention_backend=triton`. SGLang's
+- Use `attention_head_dim >= 64`, or pass `backend.engine_kwargs.attention_backend=triton`. SGLang's
     default FlashInfer attention backend rejects small head dims with
     `FlashInfer Internal Error: Invalid configuration ... BatchPrefillWithRaggedKVCacheDispatched`.
     The failure kills the scheduler subprocess and surfaces in the parent as exit `-9`, which looks
-    like an OOM rather than a shape error. See
-    [#163](https://github.com/mmcdermott/MEDS_EIC_AR/issues/163).
+    like an OOM rather than a shape error. `SGLangBackend` now refuses to start in that configuration
+    with an error naming both remedies, and `sglang_demo.yaml` selects `triton` so the small models it
+    targets work as-is.
 
-Note also that `sglang_demo.yaml` sets `mem_fraction_static: 0.85`, a fraction of *total* memory. DGX
-Spark shares one 128 GB pool between CPU and GPU, so that reserves ~109 GB and leaves the host close to
-the OOM killer; `0.2`–`0.4` is ample for small models.
+`mem_fraction_static` is a fraction of *total* device memory, reserved up front for the KV cache.
+`sglang.yaml` keeps `0.85`, which suits a dedicated GPU. On a unified-memory host it does not: DGX Spark
+shares one 128 GB pool between CPU and GPU, so `0.85` reserves ~109 GB and leaves the host close to the
+OOM killer. `sglang_demo.yaml` uses `0.3`; lower `sglang.yaml` to `0.2`–`0.4` as well when running there.
 
 `uv sync --frozen` works on aarch64 hosts because `pyproject.toml` declares
 `tool.uv.required-environments` with the Linux ARM branch, which forces `uv.lock` to carry

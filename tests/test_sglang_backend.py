@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 from MEDS_EIC_AR.model.backends import GenerationBackend, SGLangBackend
 from MEDS_EIC_AR.model.backends.sglang import (
+    _FLASHINFER_MIN_HEAD_DIM,
     _SGLANG_CONTEXT_RESERVE,
     _pad_right_to_tensor,
     _strip_padding_to_lists,
@@ -633,3 +634,64 @@ def test_unreadable_config_leaves_the_budget_alone(tmp_path: Path):
     backend = SGLangBackend(tmp_path, sgl_module=fake)  # empty dir: no config.json
     assert backend._context_len is None
     assert _one_row_call(backend, fake, prompt_len=128, max_new_tokens=100_000)["max_new_tokens"] == 100_000
+
+
+# ---------------------------------------------------------------------------
+# Attention-backend / head-dim pre-flight
+# ---------------------------------------------------------------------------
+
+
+def _write_config(tmp_path: Path, **fields: Any) -> Path:
+    (tmp_path / "config.json").write_text(json.dumps(fields))
+    return tmp_path
+
+
+def test_small_head_dim_on_the_default_attention_backend_is_refused(tmp_path: Path):
+    """Constructing over a narrow model without naming an attention backend must raise.
+
+    SGLang would otherwise pick FlashInfer, which aborts the scheduler subprocess on head dims below its
+    floor. That abort reaches the parent as SIGQUIT / exit -9, so a shape constraint presents as an out-of-
+    memory kill — the error here exists to keep anyone from chasing memory.
+    """
+    _write_config(tmp_path, max_position_embeddings=512, head_dim=32)
+    with pytest.raises(ValueError, match="FlashInfer"):
+        SGLangBackend(tmp_path, sgl_module=_FakeSGLModule())
+
+
+def test_small_head_dim_is_allowed_when_an_attention_backend_is_named(tmp_path: Path):
+    """Naming ``attention_backend`` explicitly is a deliberate choice and must be honored.
+
+    This is both the documented remedy (``sglang_demo.yaml`` sets ``triton`` for exactly this
+    reason) and the reason the check can't wrongly block a future FlashInfer that lifts the floor.
+    """
+    _write_config(tmp_path, max_position_embeddings=512, head_dim=32)
+    fake = _FakeSGLModule()
+    SGLangBackend(tmp_path, engine_kwargs={"attention_backend": "triton"}, sgl_module=fake)
+    assert fake.last_engine.engine_kwargs["attention_backend"] == "triton"
+
+
+def test_explicit_null_attention_backend_still_triggers_the_check(tmp_path: Path):
+    """``attention_backend: null`` is "let SGLang choose", not a choice, so the check must still fire.
+
+    ``sglang.yaml`` carries the key explicitly at ``null`` so it can be overridden without Hydra's
+    ``+`` syntax. That must not be mistaken for the caller having selected a backend.
+    """
+    _write_config(tmp_path, max_position_embeddings=512, head_dim=32)
+    with pytest.raises(ValueError, match="FlashInfer"):
+        SGLangBackend(tmp_path, engine_kwargs={"attention_backend": None}, sgl_module=_FakeSGLModule())
+
+
+def test_head_dim_at_the_floor_is_allowed_on_the_default_attention_backend(tmp_path: Path):
+    """The floor is inclusive — a model exactly at it must construct without complaint."""
+    _write_config(tmp_path, max_position_embeddings=512, head_dim=_FLASHINFER_MIN_HEAD_DIM)
+    SGLangBackend(tmp_path, sgl_module=_FakeSGLModule())
+
+
+def test_unknown_head_dim_does_not_block_construction(tmp_path: Path):
+    """A config without ``head_dim`` leaves nothing to check, and must not be treated as a failure.
+
+    Same principle as the unreadable-config case for the context ceiling: these are pre-flight
+    diagnostics, and none of them is worth refusing to construct the backend over.
+    """
+    _write_config(tmp_path, max_position_embeddings=512)
+    SGLangBackend(tmp_path, sgl_module=_FakeSGLModule())
