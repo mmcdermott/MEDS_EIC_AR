@@ -46,6 +46,31 @@ dev = ["pre-commit<4", "ruff", "pytest-cov", "pretty_print_directory>=0.1.2", "y
 # Extensions
 wandb = ["wandb"]
 mlflow = ["mlflow", "psutil", "pynvml"]
+# Inference backend — lazy-imported inside ``MEDS_EIC_AR.model.backends.sglang``, only
+# needed for ``backend=sglang`` generation runs. See issues #88 and #109 for context.
+#
+# Installation note: the bound is deliberately loose. On Python 3.11 a fresh resolve of
+# ``sglang>=0.4`` selects ``sglang==0.5.9``, whose own pins (``torch==2.9.1``,
+# ``transformers==4.57.1``, ``sgl-kernel==0.3.21``) already agree with this project's
+# ``uv.lock``; pinning here would instead force the default resolve to re-check the pin
+# against the other extras' envelopes on every sync. Pin in your deployment lockfile if you
+# need reproducibility; the ``GenerationBackend`` protocol isolates us from API churn.
+#
+# ``--prerelease=allow`` is *not* required for ``sglang==0.5.9``. It was needed only for
+# ``0.5.10.post1``, which pulled a pre-release ``flash-attn-4``. Note that ``flash-attn-4``
+# provides the ``flash_attn`` module namespace without matching distribution metadata, which
+# breaks ``importlib.metadata.version("flash_attn")`` callers — this project falls back to
+# SDPA cleanly when it is absent, so prefer leaving it uninstalled.
+#
+# GPU wheels are *not* fully expressible here. ``sgl-kernel`` on PyPI ships CUDA kernel images
+# only up to ``sm_120a``, so it raises ``no kernel image is available for execution on the
+# device`` on Blackwell parts at compute capability 12.1 (e.g. GB10 / DGX Spark). Those hosts
+# need the CUDA-13 build from SGLang's own index, which pip/uv cannot select from an extra:
+#
+#     uv pip install --index-url https://docs.sglang.ai/whl/cu130/ "sgl-kernel==0.3.21+cu130"
+#
+# See ``README.md`` ("Running SGLang on Blackwell SM 12.1") for the full recipe, and issue #163.
+sglang = ["sglang>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_EIC_AR"
@@ -114,3 +139,21 @@ select = [
 
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = ["*MEDS*", "F", "L", "M", "D", "LR_*", "*GPT*"]  # Ignore MEDS in variable names
+
+[tool.uv]
+# Force the lock to carry distributions for ARM64 as well as the x86_64 host it is usually
+# resolved on. Without this, a dependency reachable *only* under an ARM marker gets a package
+# stanza with no `sdist` and no `wheels` at all: the resolver never explored that branch, so it
+# recorded nothing to install, and `uv sync` on an ARM host fails with "can't be installed because
+# it doesn't have a source distribution or wheel for the current platform". `av`, pulled in by the
+# `sglang` extra under an aarch64-only marker, hit exactly that on a DGX Spark.
+#
+# `required-environments` rather than `environments`: the latter would *restrict* resolution to the
+# listed set and silently drop support for anything not enumerated (Windows, for one). This only
+# widens what the lock must cover.
+#
+# Only the Linux ARM branch is listed. Adding macOS ARM was tried and rejected: `sglang` publishes
+# no macOS ARM wheels at 0.5.9, so requiring coverage there forks the resolution back to 0.5.2 and
+# drops `mlx-lm`/`mlx-metal` — a 250-line lock churn and a downgrade of the pin this branch's
+# install recipe is written against, to cover a platform the `sglang` extra cannot run on anyway.
+required-environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
