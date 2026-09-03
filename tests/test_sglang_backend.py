@@ -17,14 +17,22 @@ What's deliberately NOT tested here:
 
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
 from transformers import GenerationConfig
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 from MEDS_EIC_AR.model.backends import GenerationBackend, SGLangBackend
-from MEDS_EIC_AR.model.backends.sglang import _pad_right_to_tensor, _strip_padding_to_lists
+from MEDS_EIC_AR.model.backends.sglang import (
+    _SGLANG_CONTEXT_RESERVE,
+    _pad_right_to_tensor,
+    _strip_padding_to_lists,
+)
 
 
 class _FakeEngine:
@@ -84,6 +92,30 @@ def _make_backend() -> tuple[SGLangBackend, _FakeSGLModule]:
     return backend, fake
 
 
+def _make_backend_with_context(tmp_path: Path, context_len: int) -> tuple[SGLangBackend, _FakeSGLModule]:
+    """Build a backend over an HF directory whose ``config.json`` declares ``context_len`` positions.
+
+    The plain :func:`_make_backend` points at a path with no ``config.json``, so the backend cannot
+    determine a ceiling and leaves budgets alone — which is what keeps the older tests here
+    unaffected by the context-window clamp. Tests that exercise the clamp need a readable config.
+    """
+    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": context_len}))
+    fake = _FakeSGLModule()
+    backend = SGLangBackend(tmp_path, sgl_module=fake)
+    return backend, fake
+
+
+def _one_row_call(backend: SGLangBackend, fake: _FakeSGLModule, prompt_len: int, max_new_tokens: int):
+    """Run one ``generate_chunk`` with a ``prompt_len``-token prompt; return the sampling params sent."""
+    input_ids = torch.arange(1, prompt_len + 1, dtype=torch.long).unsqueeze(0)
+    fake.last_engine.set_next_outputs([{"output_ids": [7]}])
+    cfg = GenerationConfig(max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=0, eos_token_id=99)
+    backend.generate_chunk(
+        input_ids, attention_mask=torch.ones_like(input_ids, dtype=torch.bool), generation_config=cfg
+    )
+    return fake.last_engine.generate_calls[-1]["sampling_params"]
+
+
 # ---------------------------------------------------------------------------
 # Protocol / structural contract
 # ---------------------------------------------------------------------------
@@ -135,8 +167,11 @@ def test_engine_receives_allow_auto_truncate_by_default():
     prompt_len`` on each chunk, so ``input_len + max_new_tokens == max_context_length`` on
     boundary prompts. HF accepts this (positions are inclusive), SGLang rejects it by default
     (``input + max_new >= max_context`` is a hard failure in the tokenizer-manager validator).
-    ``allow_auto_truncate=True`` silently clamps to match HF, which is what cross-backend
-    parity requires. Losing this would break the first chunk of every rolling run.
+
+    The backend now applies that ceiling itself, visibly, so this flag is a safety net rather
+    than the mechanism: it catches a residual mismatch (a SGLang whose reserve differs from the
+    one we subtract) as a shortfall instead of a crash mid-run. It is *not* parity with HF —
+    the clamp costs real tokens, which is why the clamp is logged where it happens.
     """
     _, fake = _make_backend()
     assert fake.last_engine is not None
@@ -146,9 +181,10 @@ def test_engine_receives_allow_auto_truncate_by_default():
 def test_allow_auto_truncate_cannot_be_overridden_by_caller():
     """A caller passing ``allow_auto_truncate=False`` in ``engine_kwargs`` must be ignored.
 
-    Same reasoning as ``skip_tokenizer_init`` — disabling it silently re-breaks every rolling
-    run's first chunk at the HF/SGLang boundary-semantics mismatch. The class docstring
-    promises this invariant is non-overridable.
+    Same reasoning as ``skip_tokenizer_init``: with it off, any residual mismatch between the
+    reserve this backend subtracts and the one the installed SGLang enforces turns from a
+    shortfall into a hard failure partway through a run. The class docstring promises this
+    invariant is non-overridable.
     """
     fake = _FakeSGLModule()
     backend = SGLangBackend(
@@ -487,3 +523,113 @@ def test_missing_sglang_raises_clear_error(monkeypatch):
 
     with pytest.raises(ImportError, match="pip install MEDS_EIC_AR\\[sglang\\]"):
         SGLangBackend("/tmp/ignored")
+
+
+# ---------------------------------------------------------------------------
+# Context-window ceiling
+# ---------------------------------------------------------------------------
+
+
+def test_budget_below_the_ceiling_is_passed_through_unchanged(tmp_path: Path):
+    """A request that comfortably fits must reach the engine exactly as asked.
+
+    Guards against a clamp that fires unconditionally and silently shortens every chunk, which would be a
+    worse bug than the one being fixed.
+    """
+    backend, fake = _make_backend_with_context(tmp_path, context_len=512)
+    sp = _one_row_call(backend, fake, prompt_len=128, max_new_tokens=256)
+    assert sp["max_new_tokens"] == 256
+
+
+def test_budget_at_the_ceiling_is_passed_through_unchanged(tmp_path: Path):
+    """The largest request SGLang honors in full must not be clamped.
+
+    ``context_len - prompt_len - reserve`` is the boundary; one token below it and at it are the
+    two cases an off-by-one in the cap would get wrong.
+    """
+    backend, fake = _make_backend_with_context(tmp_path, context_len=512)
+    ceiling = 512 - 128 - _SGLANG_CONTEXT_RESERVE
+    assert _one_row_call(backend, fake, prompt_len=128, max_new_tokens=ceiling - 1)["max_new_tokens"] == (
+        ceiling - 1
+    )
+    assert _one_row_call(backend, fake, prompt_len=128, max_new_tokens=ceiling)["max_new_tokens"] == ceiling
+
+
+def test_budget_over_the_ceiling_is_clamped_and_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    """A window-saturating request must be cut to the ceiling *by us*, visibly.
+
+    This is the reported defect: the shared rolling loop asks for ``max_seq_len - prompt_len``,
+    i.e. the full window, and SGLang's ``allow_auto_truncate`` used to swallow the excess without
+    a word. The clamp is now applied here and announced.
+    """
+    backend, fake = _make_backend_with_context(tmp_path, context_len=512)
+    ceiling = 512 - 128 - _SGLANG_CONTEXT_RESERVE
+
+    with caplog.at_level("WARNING"):
+        sp = _one_row_call(backend, fake, prompt_len=128, max_new_tokens=384)
+
+    assert sp["max_new_tokens"] == ceiling
+    assert any("clamped from 384" in r.getMessage() for r in caplog.records), (
+        f"Expected a warning naming the clamp; got {[r.getMessage() for r in caplog.records]}."
+    )
+
+
+def test_clamp_warning_is_logged_only_once_per_backend(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    """The rolling loop calls ``generate_chunk`` once per chunk, all with the same saturating shape.
+
+    Warning every time would bury the run's real output under hundreds of identical lines, so the message is
+    emitted once per backend instance.
+    """
+    backend, fake = _make_backend_with_context(tmp_path, context_len=512)
+    with caplog.at_level("WARNING"):
+        for _ in range(5):
+            _one_row_call(backend, fake, prompt_len=128, max_new_tokens=384)
+
+    clamp_warnings = [r for r in caplog.records if "clamped from" in r.getMessage()]
+    assert len(clamp_warnings) == 1, f"Expected exactly one clamp warning, got {len(clamp_warnings)}."
+
+
+def test_prompt_leaving_no_room_raises_rather_than_returning_an_empty_chunk(tmp_path: Path):
+    """A prompt at ``context_len - 1`` must raise, not return zero tokens.
+
+    This is exactly what the rolling loop's default ``rolling_context_size = max_seq_len - 1``
+    produces once the window saturates: a prompt one position short of the window, leaving room for
+    one new token where SGLang needs the reserve to fit too. ``_rolling_generate`` advances by the
+    number of tokens a chunk returns and loops until its budget is met, so an empty chunk would
+    make it spin forever. The error names the knob to change.
+    """
+    backend, fake = _make_backend_with_context(tmp_path, context_len=512)
+    with pytest.raises(ValueError, match="rolling_context_size"):
+        _one_row_call(backend, fake, prompt_len=511, max_new_tokens=1)
+
+
+def test_ceiling_uses_the_longest_prompt_in_the_batch(tmp_path: Path):
+    """``max_new_tokens`` is shared across the batch, so the longest prompt is the binding one.
+
+    Rolling chunks are ragged after post-EOS padding is stripped: rows that finished earlier come
+    through shorter. Sizing the budget off a short row would let the longest row exceed the window.
+    """
+    backend, fake = _make_backend_with_context(tmp_path, context_len=64)
+    # Row 0 is 8 real tokens, row 1 is 40 — left-padded to a common width, as the rolling loop emits.
+    input_ids = torch.arange(1, 41, dtype=torch.long).repeat(2, 1)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    attention_mask[0, :32] = False
+
+    fake.last_engine.set_next_outputs([{"output_ids": [7]}, {"output_ids": [7]}])
+    cfg = GenerationConfig(max_new_tokens=40, do_sample=False, pad_token_id=0, eos_token_id=99)
+    backend.generate_chunk(input_ids, attention_mask=attention_mask, generation_config=cfg)
+
+    sp = fake.last_engine.generate_calls[-1]["sampling_params"]
+    assert sp["max_new_tokens"] == 64 - 40 - _SGLANG_CONTEXT_RESERVE
+
+
+def test_unreadable_config_leaves_the_budget_alone(tmp_path: Path):
+    """With no readable ``config.json`` the ceiling is unknown, so the request must pass through.
+
+    Falling back to the engine's own ``allow_auto_truncate`` is worse than capping proactively, but
+    much better than refusing to construct the backend or guessing a context length.
+    """
+    fake = _FakeSGLModule()
+    backend = SGLangBackend(tmp_path, sgl_module=fake)  # empty dir: no config.json
+    assert backend._context_len is None
+    assert _one_row_call(backend, fake, prompt_len=128, max_new_tokens=100_000)["max_new_tokens"] == 100_000
