@@ -54,6 +54,61 @@ pip install flash-attn --no-build-isolation
 If you encounter errors, see the [flash-attn](https://github.com/Dao-AILab/flash-attention) package
 documentation.
 
+#### Running SGLang on Blackwell SM 12.1 (GB10 / DGX Spark)
+
+The `sglang` extra (`uv sync --extra sglang`) installs a working SGLang on most hosts, but **not** on
+Blackwell parts at compute capability 12.1. The `sgl-kernel` wheels published to PyPI carry CUDA kernel
+images only up to `sm_120a`, and `sm_120a` is not forward-compatible with SM 12.1, so the first RMSNorm
+call fails with:
+
+```
+RuntimeError: RMSNorm failed with error code no kernel image is available for execution on the device
+```
+
+The fix is to take `sgl-kernel` from SGLang's CUDA-13 wheel index, whose builds do contain `sm_121a`:
+
+```bash
+uv pip install -e .                       # keeps an already-installed CUDA torch in place
+uv pip install --index-url https://docs.sglang.ai/whl/cu130/ "sgl-kernel==0.3.21+cu130"
+```
+
+`0.3.21` is the version `sglang==0.5.9` pins, and a `+cu130` kernel build is compatible with a
+`torch==2.9.1+cu129` runtime — the ABI that matters is the torch version, not the CUDA variant. To
+confirm a candidate wheel actually covers your device:
+
+```bash
+cuobjdump --list-elf .venv/lib/python3.*/site-packages/sgl_kernel/sm100/common_ops.abi3.so \
+  | grep -o 'sm_[0-9]*[a-z]*' | sort -u        # must list sm_121a
+```
+
+Three further runtime requirements on this hardware:
+
+- `export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas` — the CUDA 12.8 `ptxas` bundled with torch 2.9.1
+    does not know `sm_121a`.
+- **Put `.venv/bin` on `PATH`.** SGLang JIT-compiles some kernels at engine startup and shells out to
+    `ninja`, which is installed as a venv console script; without it the engine dies with
+    `FileNotFoundError: [Errno 2] No such file or directory: 'ninja'`.
+- Use `attention_head_dim >= 64`, or pass `backend.engine_kwargs.attention_backend=triton`. SGLang's
+    default FlashInfer attention backend rejects small head dims with
+    `FlashInfer Internal Error: Invalid configuration ... BatchPrefillWithRaggedKVCacheDispatched`.
+    The failure kills the scheduler subprocess and surfaces in the parent as exit `-9`, which looks
+    like an OOM rather than a shape error. `SGLangBackend` now refuses to start in that configuration
+    with an error naming both remedies, and `sglang_demo.yaml` selects `triton` so the small models it
+    targets work as-is.
+
+`mem_fraction_static` is a fraction of *total* device memory, reserved up front for the KV cache.
+`sglang.yaml` keeps `0.85`, which suits a dedicated GPU. On a unified-memory host it does not: DGX Spark
+shares one 128 GB pool between CPU and GPU, so `0.85` reserves ~109 GB and leaves the host close to the
+OOM killer. `sglang_demo.yaml` uses `0.3`; lower `sglang.yaml` to `0.2`–`0.4` as well when running there.
+
+`uv sync --frozen` works on aarch64 hosts because `pyproject.toml` declares
+`tool.uv.required-environments` with the Linux ARM branch, which forces `uv.lock` to carry
+distributions for it. **Keep that setting if you re-lock.** Without it, a dependency reachable only
+under an ARM marker — `av`, pulled in by the `sglang` extra — gets a lock entry with no wheel and no
+sdist, since the resolver never explores that branch on an x86_64 host. `uv sync` on ARM then fails
+with "can't be installed because it doesn't have a source distribution or wheel for the current
+platform".
+
 ## Usage
 
 ### 1. Pre-process your data
@@ -203,6 +258,10 @@ follows:
 ├── _demo_pretrain.yaml
 ├── _generate_trajectories.yaml
 ├── _pretrain.yaml
+├── backend
+│   ├── hf.yaml
+│   ├── sglang.yaml
+│   └── sglang_demo.yaml
 ├── datamodule
 │   ├── default.yaml
 │   ├── generate_trajectories.yaml
