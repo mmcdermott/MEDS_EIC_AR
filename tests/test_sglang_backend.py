@@ -17,6 +17,7 @@ What's deliberately NOT tested here:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -30,10 +31,17 @@ if TYPE_CHECKING:
 from MEDS_EIC_AR.model.backends import GenerationBackend, SGLangBackend
 from MEDS_EIC_AR.model.backends.sglang import (
     _FLASHINFER_MIN_HEAD_DIM,
-    _SGLANG_CONTEXT_RESERVE,
+    _SGLANG_MAX_REQ_LEN_GAP,
     _pad_right_to_tensor,
     _strip_padding_to_lists,
 )
+
+
+#: What a real engine reports for a model with ``context_len`` positions, when the context length
+#: (rather than the KV pool) is the binding term:
+#: ``max_req_input_len = min(context_len - 1, pool - 1) - _SGLANG_MAX_REQ_LEN_GAP``.
+def _reported_input_len(context_len: int) -> int:
+    return context_len - 1 - _SGLANG_MAX_REQ_LEN_GAP
 
 
 class _FakeEngine:
@@ -43,9 +51,12 @@ class _FakeEngine:
     particular, that HF-only kwargs have been stripped by the backend before reaching here).
     """
 
-    def __init__(self, model_path: str, **engine_kwargs: Any):
+    def __init__(self, model_path: str, max_req_input_len: int = 1_000_000, **engine_kwargs: Any):
         self.model_path = model_path
         self.engine_kwargs = engine_kwargs
+        # Real engines expose this; the backend requires it to know how many prompt tokens will
+        # actually be read. Defaults high so tests that don't care about the ceiling are unaffected.
+        self.scheduler_info = {"status": "ready", "max_req_input_len": max_req_input_len}
         self.generate_calls: list[dict] = []
         # Tests inject what the next ``generate`` call should return.
         self._next_outputs: list[dict] | None = None
@@ -77,11 +88,12 @@ class _FakeEngine:
 class _FakeSGLModule:
     """Matches the tiny surface of the real ``sglang`` module that the backend touches."""
 
-    def __init__(self):
+    def __init__(self, max_req_input_len: int = 1_000_000):
         self.last_engine: _FakeEngine | None = None
+        self.max_req_input_len = max_req_input_len
 
     def Engine(self, *, model_path: str, **engine_kwargs: Any) -> _FakeEngine:  # noqa: N802 — mirrors the real sglang.Engine class name
-        eng = _FakeEngine(model_path=model_path, **engine_kwargs)
+        eng = _FakeEngine(model_path=model_path, max_req_input_len=self.max_req_input_len, **engine_kwargs)
         self.last_engine = eng
         return eng
 
@@ -100,8 +112,8 @@ def _make_backend_with_context(tmp_path: Path, context_len: int) -> tuple[SGLang
     determine a ceiling and leaves budgets alone — which is what keeps the older tests here
     unaffected by the context-window clamp. Tests that exercise the clamp need a readable config.
     """
-    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": context_len}))
-    fake = _FakeSGLModule()
+    _write_config(tmp_path, max_position_embeddings=context_len)
+    fake = _FakeSGLModule(max_req_input_len=_reported_input_len(context_len))
     backend = SGLangBackend(tmp_path, sgl_module=fake)
     return backend, fake
 
@@ -549,7 +561,7 @@ def test_budget_at_the_ceiling_is_passed_through_unchanged(tmp_path: Path):
     two cases an off-by-one in the cap would get wrong.
     """
     backend, fake = _make_backend_with_context(tmp_path, context_len=512)
-    ceiling = 512 - 128 - _SGLANG_CONTEXT_RESERVE
+    ceiling = 512 - 128 - 2
     assert _one_row_call(backend, fake, prompt_len=128, max_new_tokens=ceiling - 1)["max_new_tokens"] == (
         ceiling - 1
     )
@@ -564,7 +576,7 @@ def test_budget_over_the_ceiling_is_clamped_and_logged(tmp_path: Path, caplog: p
     a word. The clamp is now applied here and announced.
     """
     backend, fake = _make_backend_with_context(tmp_path, context_len=512)
-    ceiling = 512 - 128 - _SGLANG_CONTEXT_RESERVE
+    ceiling = 512 - 128 - 2
 
     with caplog.at_level("WARNING"):
         sp = _one_row_call(backend, fake, prompt_len=128, max_new_tokens=384)
@@ -621,19 +633,21 @@ def test_ceiling_uses_the_longest_prompt_in_the_batch(tmp_path: Path):
     backend.generate_chunk(input_ids, attention_mask=attention_mask, generation_config=cfg)
 
     sp = fake.last_engine.generate_calls[-1]["sampling_params"]
-    assert sp["max_new_tokens"] == 64 - 40 - _SGLANG_CONTEXT_RESERVE
+    assert sp["max_new_tokens"] == 64 - 40 - 2
 
 
-def test_unreadable_config_leaves_the_budget_alone(tmp_path: Path):
-    """With no readable ``config.json`` the ceiling is unknown, so the request must pass through.
+def test_budgets_do_not_depend_on_a_readable_config(tmp_path: Path):
+    """An unreadable ``config.json`` costs the head-dim pre-flight, not the ceilings.
 
-    Falling back to the engine's own ``allow_auto_truncate`` is worse than capping proactively, but
-    much better than refusing to construct the backend or guessing a context length.
+    Both ceilings come from the engine, so a missing config no longer leaves the backend guessing about how
+    many tokens it may send or receive.
     """
-    fake = _FakeSGLModule()
+    fake = _FakeSGLModule(max_req_input_len=200)
     backend = SGLangBackend(tmp_path, sgl_module=fake)  # empty dir: no config.json
-    assert backend._context_len is None
-    assert _one_row_call(backend, fake, prompt_len=128, max_new_tokens=100_000)["max_new_tokens"] == 100_000
+
+    assert backend.max_prompt_len == 199
+    sp = _one_row_call(backend, fake, prompt_len=128, max_new_tokens=100_000)
+    assert sp["max_new_tokens"] == 200 + _SGLANG_MAX_REQ_LEN_GAP - 128 - 1
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +656,12 @@ def test_unreadable_config_leaves_the_budget_alone(tmp_path: Path):
 
 
 def _write_config(tmp_path: Path, **fields: Any) -> Path:
-    (tmp_path / "config.json").write_text(json.dumps(fields))
+    """Write a model config, defaulting ``model_type`` so ``AutoConfig`` can load it.
+
+    ``export_lightning_to_hf_dir`` always writes ``model_type``; a config without one is not a
+    shape the backend ever sees in practice, and ``AutoConfig`` cannot resolve it.
+    """
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama", **fields}))
     return tmp_path
 
 
@@ -695,3 +714,125 @@ def test_unknown_head_dim_does_not_block_construction(tmp_path: Path):
     """
     _write_config(tmp_path, max_position_embeddings=512)
     SGLangBackend(tmp_path, sgl_module=_FakeSGLModule())
+
+
+def test_max_prompt_len_reports_sglangs_real_input_ceiling(tmp_path: Path):
+    """The advertised ceiling is ``context_len - 7``, matching SGLang's own arithmetic.
+
+    ``max_req_input_len = min(context_len - 1, kv_pool - 1) - 5`` and the length check is ``>=``,
+    so the longest prompt read in full is ``context_len - 7``. Verified against a live engine:
+    on a 16-position model a 9-token prompt is honored and a 10-token prompt is truncated.
+    """
+    backend, _ = _make_backend_with_context(tmp_path, context_len=16)
+    assert backend.max_prompt_len == 9
+
+
+def test_missing_engine_ceiling_raises_rather_than_guessing(tmp_path: Path):
+    """An engine that reports no ``max_req_input_len`` must stop construction.
+
+    Guessing a ceiling here is not safe: too high and the engine silently truncates prompts, and
+    nothing downstream can tell that it happened.
+    """
+    fake = _FakeSGLModule()
+    fake.max_req_input_len = 1  # `- 1` leaves no room for a prompt
+    with pytest.raises(RuntimeError, match="no room for a prompt"):
+        SGLangBackend(tmp_path, sgl_module=fake)
+
+    class _NoInfoModule(_FakeSGLModule):
+        def Engine(self, *, model_path: str, **engine_kwargs: Any):  # noqa: N802
+            eng = super().Engine(model_path=model_path, **engine_kwargs)
+            del eng.scheduler_info
+            return eng
+
+    with pytest.raises(RuntimeError, match="did not report a usable"):
+        SGLangBackend(tmp_path, sgl_module=_NoInfoModule())
+
+
+def test_prompt_over_the_input_ceiling_raises_instead_of_being_truncated(tmp_path: Path):
+    """The reported defect (#171): SGLang silently drops the prompt tail past its input cap.
+
+    It does not reject the request and the returned shape looks correct, so the corruption is
+    invisible -- it surfaced only as grammar-invalid trajectories. Refuse loudly instead.
+    """
+    backend, fake = _make_backend_with_context(tmp_path, context_len=16)
+    with pytest.raises(ValueError, match="silently truncate"):
+        _one_row_call(backend, fake, prompt_len=10, max_new_tokens=1)
+
+
+def test_prompt_at_the_input_ceiling_is_accepted(tmp_path: Path):
+    """The boundary itself must still work -- the cap is inclusive of ``context_len - 7``."""
+    backend, fake = _make_backend_with_context(tmp_path, context_len=16)
+    sp = _one_row_call(backend, fake, prompt_len=9, max_new_tokens=1)
+    assert sp["max_new_tokens"] == 1
+
+
+def test_input_ceiling_is_checked_against_the_longest_prompt_in_the_batch(tmp_path: Path):
+    """``max_new_tokens`` is shared across the call, and so is the input ceiling check."""
+    backend, fake = _make_backend_with_context(tmp_path, context_len=16)
+    ids = torch.zeros((2, 12), dtype=torch.long)
+    mask = torch.zeros((2, 12), dtype=torch.bool)
+    mask[0, -4:] = True  # 4 real tokens: fine
+    mask[1, -11:] = True  # 11 real tokens: over the ceiling
+    fake.last_engine = None
+    with pytest.raises(ValueError, match="11-token prompt"):
+        backend.generate_chunk(
+            ids,
+            attention_mask=mask,
+            generation_config=GenerationConfig(
+                max_new_tokens=1, do_sample=False, pad_token_id=0, eos_token_id=99
+            ),
+        )
+
+
+def test_ceilings_are_derived_from_the_engines_reported_value(tmp_path: Path):
+    """Both ceilings follow from ``scheduler_info``, not from the model config.
+
+    That is what keeps them right when the KV pool binds instead of the context length, a case
+    no config-file arithmetic can see. The prompt ceiling is one below the reported value (the
+    engine's check is ``>=``); the output ceiling follows from ``max_req_len``.
+    """
+    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": 512}))
+    # Deliberately inconsistent with the config: a pool-bound engine reports far less.
+    fake = _FakeSGLModule(max_req_input_len=64)
+    backend = SGLangBackend(tmp_path, sgl_module=fake)
+
+    assert backend.max_prompt_len == 63, "Prompt ceiling should track the engine, not the config."
+
+    sp = _one_row_call(backend, fake, prompt_len=40, max_new_tokens=1000)
+    assert sp["max_new_tokens"] == 64 + _SGLANG_MAX_REQ_LEN_GAP - 40 - 1
+
+
+def test_explicit_flashinfer_below_the_floor_is_refused(tmp_path: Path):
+    """Naming FlashInfer explicitly does not make it dispatch a narrow head dim.
+
+    The floor is FlashInfer's, so it applies however FlashInfer came to be selected; deferring to an explicit
+    choice here would just hand back the exit -9 the check exists to prevent.
+    """
+    _write_config(tmp_path, max_position_embeddings=512, head_dim=32)
+    with pytest.raises(ValueError, match="explicitly selected"):
+        SGLangBackend(
+            tmp_path, engine_kwargs={"attention_backend": "flashinfer"}, sgl_module=_FakeSGLModule()
+        )
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("sglang") is None,
+    reason="Name validation is defined by sglang's own ATTENTION_BACKEND_CHOICES; without the "
+    "package installed there is no list to validate against and the check is skipped by design.",
+)
+def test_unknown_attention_backend_is_refused(tmp_path: Path):
+    """A misspelled backend should fail here, naming the valid choices."""
+    _write_config(tmp_path, max_position_embeddings=512, head_dim=128)
+    with pytest.raises(ValueError, match="Unknown SGLang attention_backend"):
+        SGLangBackend(
+            tmp_path, engine_kwargs={"attention_backend": "flashinfer_typo"}, sgl_module=_FakeSGLModule()
+        )
+
+
+def test_non_flashinfer_backend_below_the_floor_is_allowed(tmp_path: Path):
+    """Backends without FlashInfer's floor must not inherit its restriction."""
+    _write_config(tmp_path, max_position_embeddings=512, head_dim=32)
+    backend = SGLangBackend(
+        tmp_path, engine_kwargs={"attention_backend": "triton"}, sgl_module=_FakeSGLModule()
+    )
+    assert backend._engine_kwargs["attention_backend"] == "triton"

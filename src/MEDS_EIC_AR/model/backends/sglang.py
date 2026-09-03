@@ -44,14 +44,14 @@ Gotchas accounted for:
 from __future__ import annotations
 
 import atexit
-import json
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from transformers import GenerationConfig
 
 logger = logging.getLogger(__name__)
@@ -80,33 +80,27 @@ _HF_ONLY_KWARGS: frozenset[str] = frozenset(
 #: if neither key is found we raise loudly (see ``generate_chunk``).
 _SGLANG_OUTPUT_KEYS: tuple[str, ...] = ("output_ids", "token_ids")
 
-#: Positions SGLang holds back from the model's context window, on top of the prompt.
+#: Gap between SGLang's two per-request limits, i.e. ``max_req_len - max_req_input_len``.
 #:
-#: Two layers are involved and only the second costs tokens. The tokenizer manager checks
-#: ``len(input) + max_new_tokens >= context_len`` and either raises or, under
-#: ``allow_auto_truncate``, clamps to ``context_len - len(input)`` — a no-op at exactly the
-#: boundary. The *scheduler* is what actually trims, in ``init_req_max_new_tokens``::
+#: Both of SGLang's request ceilings derive from one quantity, and only one of them is reported
+#: by the engine, so this constant bridges them (``sglang==0.5.9``)::
 #:
-#:     max_req_len    = min(context_len - 1, max_token_pool_size - 1)   # tp_worker
-#:     max_new_tokens = min(requested, max_req_len - len(input) - 1)    # scheduler
+#:     max_req_len       = min(context_len - 1, kv_pool_size - 1)   # managers/tp_worker.py
+#:     max_req_input_len = max_req_len - 5                          # managers/tp_worker.py
 #:
-#: which is ``context_len - len(input) - 2`` whenever the context length is the binding term.
-#: That ``min`` is unconditional: no warning, and not gated on ``allow_auto_truncate``. HF's
-#: ``generate``, by contrast, will fill the window exactly. Matches the measurement it was
-#: derived from — on a 512-position model with a 128-token prompt, 382 new tokens is the largest
-#: request honored in full, while 383 and 384 both come back as 382.
+#: ``scheduler_info`` reports ``max_req_input_len``, from which ``max_req_len`` follows. Deriving
+#: both ceilings from the reported value keeps them correct when the KV pool binds rather than
+#: the context length -- a case no config-file arithmetic can see.
 #:
-#: **Two is a floor, not a guarantee.** When the KV pool is the binding term instead — a large
-#: model, or a small ``mem_fraction_static`` — ``max_req_len`` is smaller than ``context_len - 1``
-#: and the shortfall grows. Capping by this constant keeps the common case honest; the residual is
-#: what ``allow_auto_truncate`` is left on to absorb.
+#: The two ceilings behave very differently when exceeded:
 #:
-#: The subtraction also goes negative: at ``len(input) == context_len - 1`` the scheduler's cap is
-#: ``-1``, and ``Req.check_finished`` stops on ``len(output_ids) >= max_new_tokens``, which holds
-#: at zero output tokens. The request completes having generated nothing — which is why
-#: :meth:`SGLangBackend._cap_max_new_tokens` raises rather than letting the rolling loop receive an
-#: empty chunk it would spin on.
-_SGLANG_CONTEXT_RESERVE = 2
+#: * **Input** (``len(input_ids) >= max_req_input_len``, managers/utils.py): the engine keeps the
+#:   *oldest* tokens and discards the tail, then generates from that stale prefix. Silent, and
+#:   it corrupts the conditioning rather than merely shortening it, so the adapter refuses such
+#:   prompts outright.
+#: * **Output** (``max_new_tokens = max_req_len - len(input) - 1``, managers/scheduler.py): the
+#:   request simply emits fewer tokens than asked. Harmless in itself, but worth surfacing.
+_SGLANG_MAX_REQ_LEN_GAP = 5
 
 
 #: Smallest attention head dimension SGLang's default FlashInfer attention backend can dispatch.
@@ -117,81 +111,74 @@ _SGLANG_CONTEXT_RESERVE = 2
 #: backend has no such floor.
 _FLASHINFER_MIN_HEAD_DIM = 64
 
+#: What SGLang selects when ``attention_backend`` is left unset.
+_SGLANG_DEFAULT_ATTENTION_BACKEND = "flashinfer"
 
-def _read_hf_config(hf_model_dir: Path | str) -> dict:
-    """Parse an HF model directory's ``config.json``, or return ``{}`` if it can't be read.
 
-    Degrading to an empty dict rather than raising is deliberate: every use of this config is a
-    pre-flight check that improves diagnostics, and none of them is worth refusing to construct
-    the backend over. A missing config costs the checks, not the run.
+def _read_hf_config_value(hf_model_dir: Path | str, key: str) -> int | None:
+    """Read one integer field from an HF model directory's config, or ``None`` if unavailable.
+
+    Uses ``transformers``' own config loader rather than parsing ``config.json`` by hand, so
+    derived and aliased fields resolve the way the model itself sees them (``head_dim``, for
+    one, is filled in from ``hidden_size / num_attention_heads`` when absent from the file).
+
+    Returns ``None`` rather than raising when the directory has no readable config or the field
+    is missing: the only caller is a pre-flight diagnostic, and losing it is worth less than
+    refusing to construct the backend.
 
     Examples:
         >>> import json, tempfile
         >>> from pathlib import Path
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     _ = (Path(d) / "config.json").write_text(json.dumps({"head_dim": 64}))
-        ...     _read_hf_config(d)
-        {'head_dim': 64}
+        ...     _ = (Path(d) / "config.json").write_text(json.dumps({
+        ...         "model_type": "llama", "hidden_size": 128, "num_attention_heads": 4,
+        ...     }))
+        ...     _read_hf_config_value(d, "head_dim")
+        32
 
-        Missing and malformed configs both degrade to ``{}``:
+        Missing config, or a field the config doesn't carry, both give ``None``:
 
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     _read_hf_config(d)
-        {}
+        ...     print(_read_hf_config_value(d, "head_dim"))
+        None
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     _ = (Path(d) / "config.json").write_text("{not json")
-        ...     _read_hf_config(d)
-        {}
+        ...     _ = (Path(d) / "config.json").write_text(json.dumps({
+        ...         "model_type": "llama", "hidden_size": 128, "num_attention_heads": 4,
+        ...     }))
+        ...     print(_read_hf_config_value(d, "not_a_field"))
+        None
     """
-    config_fp = Path(hf_model_dir) / "config.json"
+    from transformers import AutoConfig
+
     try:
-        config = json.loads(config_fp.read_text())
-    except (OSError, ValueError) as e:
+        config = AutoConfig.from_pretrained(str(hf_model_dir))
+    except Exception as e:  # any load failure just costs us the pre-flight check
         logger.warning(
-            f"Could not read {config_fp} ({type(e).__name__}: {e}). The SGLang backend's "
-            "pre-flight checks on context length and attention head dimension will be skipped."
+            f"Could not load an HF config from {hf_model_dir} ({type(e).__name__}: {e}). The "
+            "SGLang backend's attention-head-dimension pre-flight check will be skipped."
         )
-        return {}
-    return config if isinstance(config, dict) else {}
+        return None
 
-
-def _config_int(config: dict, key: str) -> int | None:
-    """Pull an integer field out of a parsed HF config, or ``None`` if it isn't there.
-
-    Examples:
-        >>> _config_int({"head_dim": 64}, "head_dim")
-        64
-        >>> print(_config_int({}, "head_dim"))
-        None
-        >>> print(_config_int({"head_dim": None}, "head_dim"))
-        None
-        >>> print(_config_int({"head_dim": "64"}, "head_dim"))
-        None
-
-        ``bool`` is a subclass of ``int`` but never a valid answer here:
-
-        >>> print(_config_int({"head_dim": True}, "head_dim"))
-        None
-    """
-    value = config.get(key)
+    value = getattr(config, key, None)
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
 
 
-def _check_head_dim_against_attention_backend(head_dim: int | None, engine_kwargs: dict) -> None:
-    """Refuse to start SGLang on a default attention backend that cannot dispatch this head dim.
+def _check_attention_backend(head_dim: int | None, engine_kwargs: dict) -> None:
+    """Validate the requested attention backend, and its head-dim floor if it has one.
 
-    SGLang defaults to FlashInfer, which aborts on ``head_dim`` below
-    :data:`_FLASHINFER_MIN_HEAD_DIM`. The abort kills the scheduler subprocess and surfaces in the
-    parent as SIGQUIT / exit ``-9``, so what is really a shape constraint reads as an
-    out-of-memory kill — the single most misleading failure this backend can produce. Catching it
-    here costs nothing and names both remedies.
+    Two failures worth catching before the engine starts:
 
-    The check only fires when ``attention_backend`` is left unset, i.e. when *we* are the ones
-    letting SGLang pick FlashInfer. A caller who names a backend explicitly has made a choice and
-    is trusted with it, which also means this cannot wrongly block a future FlashInfer that lifts
-    the floor.
+    * An unrecognized backend name. SGLang would reject it, but later and less clearly.
+    * FlashInfer below :data:`_FLASHINFER_MIN_HEAD_DIM`. FlashInfer aborts the scheduler
+      subprocess with ``FlashInfer Internal Error: Invalid configuration``, which reaches the
+      parent as SIGQUIT / exit ``-9`` — indistinguishable at a glance from an out-of-memory
+      kill, and so a genuinely expensive thing to debug.
+
+    The floor applies whenever FlashInfer is what will actually run, whether it was named
+    explicitly or left to SGLang to choose. Naming it does not make it work. Backends other than
+    FlashInfer are left alone: the floor is FlashInfer's, not a general one.
 
     Args:
         head_dim: The model's attention head dimension, or ``None`` if it could not be read (in
@@ -199,35 +186,64 @@ def _check_head_dim_against_attention_backend(head_dim: int | None, engine_kwarg
         engine_kwargs: The kwargs about to be passed to ``sglang.Engine``.
 
     Raises:
-        ValueError: If the head dimension is below the FlashInfer floor and no attention backend
-            was named.
+        ValueError: If the backend name is unrecognized, or FlashInfer would run below its floor.
 
     Examples:
-        Fine: head dim at or above the floor, or unknown, or a backend named explicitly.
+        Fine: at or above the floor, unknown head dim, or a backend without the floor.
 
-        >>> _check_head_dim_against_attention_backend(64, {})
-        >>> _check_head_dim_against_attention_backend(None, {})
-        >>> _check_head_dim_against_attention_backend(32, {"attention_backend": "triton"})
+        >>> _check_attention_backend(64, {})
+        >>> _check_attention_backend(None, {})
+        >>> _check_attention_backend(32, {"attention_backend": "triton"})
 
-        Refused: below the floor with the backend left to SGLang's default.
+        Refused below the floor, whether FlashInfer is implicit (``None``/absent) or explicit:
 
-        >>> _check_head_dim_against_attention_backend(32, {})
+        >>> _check_attention_backend(32, {})
         Traceback (most recent call last):
             ...
-        ValueError: SGLang's default FlashInfer attention backend cannot dispatch
-        attention_head_dim=32 ...
+        ValueError: SGLang's FlashInfer attention backend cannot dispatch attention_head_dim=32 ...
+        >>> _check_attention_backend(32, {"attention_backend": None})
+        Traceback (most recent call last):
+            ...
+        ValueError: SGLang's FlashInfer attention backend cannot dispatch attention_head_dim=32 ...
+        >>> _check_attention_backend(32, {"attention_backend": "flashinfer"})
+        Traceback (most recent call last):
+            ...
+        ValueError: SGLang's FlashInfer attention backend cannot dispatch attention_head_dim=32 ...
+
+        An unrecognized name is also refused, regardless of head dim -- but only when ``sglang``
+        is installed, since its ``ATTENTION_BACKEND_CHOICES`` is what defines "recognized". With
+        the package absent (the backend is reachable in that state only via an injected
+        ``sgl_module``) the name check is skipped rather than guessing at a hard-coded list. See
+        ``test_unknown_attention_backend_is_refused``.
     """
+    requested = engine_kwargs.get("attention_backend")
+
+    if requested is not None:
+        try:
+            from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+
+            valid = set(ATTENTION_BACKEND_CHOICES)
+        except ImportError:  # pragma: no cover — only if SGLang moves the constant
+            valid = set()
+        if valid and requested not in valid:
+            raise ValueError(
+                f"Unknown SGLang attention_backend {requested!r}. Valid choices: {', '.join(sorted(valid))}."
+            )
+
+    # ``None``/absent means SGLang picks, and it picks FlashInfer.
+    if requested not in (None, _SGLANG_DEFAULT_ATTENTION_BACKEND):
+        return
     if head_dim is None or head_dim >= _FLASHINFER_MIN_HEAD_DIM:
         return
-    if engine_kwargs.get("attention_backend") is not None:
-        return
+    how_selected = "explicitly selected" if requested else "SGLang's default when none is named"
     raise ValueError(
-        f"SGLang's default FlashInfer attention backend cannot dispatch attention_head_dim="
-        f"{head_dim} (its floor is {_FLASHINFER_MIN_HEAD_DIM}). It would abort the scheduler "
-        "subprocess with 'FlashInfer Internal Error: Invalid configuration', which reaches this "
-        "process as SIGQUIT / exit -9 and looks like an out-of-memory kill rather than a shape "
-        "error. Either train with lightning_module.model.gpt_kwargs.attention_head_dim>="
-        f"{_FLASHINFER_MIN_HEAD_DIM}, or select an attention backend that has no such floor with "
+        f"SGLang's FlashInfer attention backend cannot dispatch attention_head_dim={head_dim} "
+        f"(its floor is {_FLASHINFER_MIN_HEAD_DIM}); it is {how_selected}. It "
+        "would abort the scheduler subprocess with 'FlashInfer Internal Error: Invalid "
+        "configuration', which reaches this process as SIGQUIT / exit -9 and looks like an "
+        "out-of-memory kill rather than a shape error. Either train with "
+        f"lightning_module.model.gpt_kwargs.attention_head_dim>={_FLASHINFER_MIN_HEAD_DIM}, or "
+        "select an attention backend that has no such floor with "
         "backend.engine_kwargs.attention_backend=triton."
     )
 
@@ -362,69 +378,105 @@ class SGLangBackend:
         # ``max_context_length`` exactly. HF's ``generate`` accepts that boundary (positions
         # ``0..max_pos-1`` inclusive); SGLang's tokenizer manager raises on it unless this flag is
         # set. The token loss happens further in, in the scheduler, and happens either way — see
-        # ``_SGLANG_CONTEXT_RESERVE``. So this flag is what keeps boundary requests alive, and
+        # ``_SGLANG_MAX_REQ_LEN_GAP``. So this flag is what keeps boundary requests alive, and
         # :meth:`generate_chunk` is what makes the resulting shortfall visible instead of leaving
         # it to be discovered in the output shape. Non-overridable for the same reason as
         # ``skip_tokenizer_init``: turning it off converts every window-saturating chunk from a
-        # shortfall into a crash mid-run.
+        # shortfall into a crash mid-run. The *input* ceiling is enforced by this adapter instead,
+        # since auto-truncation there is silently destructive rather than merely lossy.
         self._engine_kwargs["allow_auto_truncate"] = True
-        hf_config = _read_hf_config(hf_model_dir)
-        self._context_len = _config_int(hf_config, "max_position_embeddings")
-        if self._context_len is None:
-            logger.warning(
-                f"No integer ``max_position_embeddings`` in {Path(hf_model_dir) / 'config.json'}; "
-                "SGLang's own auto-truncation will apply instead, which clamps silently."
-            )
-        _check_head_dim_against_attention_backend(_config_int(hf_config, "head_dim"), self._engine_kwargs)
-        # Log the ceiling once at construction rather than per call — the rolling loop calls
+        _check_attention_backend(_read_hf_config_value(hf_model_dir, "head_dim"), self._engine_kwargs)
+        # Log the shortfall once at construction rather than per call — the rolling loop calls
         # ``generate_chunk`` many times with the same shape, and a per-call warning would bury
         # the run's real output.
         self._logged_context_clamp = False
         self._engine = sgl_module.Engine(model_path=str(hf_model_dir), **self._engine_kwargs)
+        self._max_req_input_len = self._read_max_req_input_len()
         self._is_shutdown = False
         atexit.register(self.shutdown)
 
-    def _cap_max_new_tokens(self, requested: int, prompt_len: int) -> int:
-        """Clamp ``requested`` to what SGLang will actually honor for a ``prompt_len``-token prompt.
+    def _read_max_req_input_len(self) -> int:
+        """Read the engine's own ``max_req_input_len``.
 
-        Returns ``requested`` unchanged when the model's context length could not be read (in
-        which case we fall back to the engine's own auto-truncate) or when the request already
-        fits. Otherwise returns the ceiling and logs the shortfall once.
-
-        Raises:
-            ValueError: If the prompt is so long that no new tokens fit under the ceiling. This is
-                reachable from the rolling loop, whose default ``rolling_context_size`` of
-                ``max_seq_len - 1`` leaves only one position for new tokens — one fewer than the
-                reserve needs. Raising beats returning an empty chunk, which the rolling loop
-                would read as "no progress" and spin on forever.
+        Asked of the engine rather than re-derived from the model config so it tracks SGLang's rule across
+        versions and stays correct when the KV pool binds instead of the context length. Raises rather than
+        guessing: a wrong ceiling here is silently destructive, since an over-long prompt is truncated by the
+        engine rather than rejected.
         """
-        if self._context_len is None:
-            return requested
+        info = getattr(self._engine, "scheduler_info", None)
+        reported = info.get("max_req_input_len") if isinstance(info, dict) else None
+        if not isinstance(reported, int) or isinstance(reported, bool) or reported <= 0:
+            raise RuntimeError(
+                "SGLang did not report a usable ``max_req_input_len`` in ``scheduler_info`` "
+                f"(got {reported!r} from {info!r}). The adapter needs it to know how many prompt "
+                "tokens the engine will actually read: past that limit SGLang silently discards "
+                "the tail of the prompt instead of rejecting it, so proceeding without the "
+                "ceiling risks generating from a truncated context. This is expected on "
+                "sglang>=0.4; if a newer release moved the field, the adapter needs updating."
+            )
+        if reported - 1 <= 0:
+            raise RuntimeError(
+                f"SGLang reports max_req_input_len={reported}, leaving no room for a prompt on "
+                "this model. Its context window is too small to generate from."
+            )
+        return reported
 
-        allowed = self._context_len - prompt_len - _SGLANG_CONTEXT_RESERVE
+    @property
+    def max_prompt_len(self) -> int:
+        """Longest prompt SGLang will read in full.
+
+        Prompts longer than this are silently truncated by the engine rather than rejected, so
+        callers that build their own prompt windows -- notably
+        :meth:`MEDS_EIC_AR.model.model.Model._rolling_generate` -- must size them against this
+        rather than the model's raw context length. One less than the engine's reported
+        ``max_req_input_len`` because SGLang's length check is ``>=``, not ``>``.
+        """
+        return self._max_req_input_len - 1
+
+    @property
+    def _max_req_len(self) -> int:
+        """SGLang's per-request total-length ceiling (prompt + generated)."""
+        return self._max_req_input_len + _SGLANG_MAX_REQ_LEN_GAP
+
+    def _check_prompt_len(self, prompt_len: int) -> None:
+        """Refuse a prompt SGLang would silently truncate.
+
+        Raising beats the alternative: SGLang would accept the request, drop the tail of the
+        prompt, and return tokens conditioned on a prefix the caller never asked for. That is
+        invisible at the API surface -- the output has the right shape and the right length.
+        """
+        if prompt_len <= self.max_prompt_len:
+            return
+        raise ValueError(
+            f"SGLang would silently truncate this {prompt_len}-token prompt: it reads at most "
+            f"{self.max_prompt_len} prompt tokens (engine-reported max_req_input_len="
+            f"{self._max_req_input_len}, compared with >=). It does not reject the request -- it "
+            "keeps the oldest tokens, drops the tail, and generates from what remains, so the "
+            "model would be conditioned on something you did not ask for. The HF backend has no "
+            f"such limit. Lower the prompt window to at most {self.max_prompt_len} tokens (for "
+            f"rolling generation, set rolling_generation.rolling_context_size<={self.max_prompt_len})."
+        )
+
+    def _cap_max_new_tokens(self, requested: int, prompt_len: int) -> int:
+        """Clamp ``requested`` to what SGLang will actually emit for a ``prompt_len``-token prompt.
+
+        SGLang's scheduler caps ``max_new_tokens`` at ``max_req_len - len(input) - 1``, so a
+        request that would fill the window comes back short. Applying the cap here rather than
+        leaving it to the engine is what makes the shortfall visible; the shortfall itself is
+        unavoidable. Unlike the input ceiling this is not corrupting -- the tokens returned are
+        correct, there are just fewer of them.
+        """
+        allowed = self._max_req_len - prompt_len - 1
         if allowed >= requested:
             return requested
-
-        if allowed <= 0:
-            raise ValueError(
-                f"SGLang cannot generate any new tokens for a {prompt_len}-token prompt against a "
-                f"{self._context_len}-position context window: its scheduler caps max_new_tokens "
-                f"at max_req_len - len(input) - 1, which holds back {_SGLANG_CONTEXT_RESERVE} "
-                f"positions and leaves {allowed} here. At or past this point SGLang returns an "
-                "empty completion rather than an error, which the rolling loop would read as no "
-                "progress and spin on. HF's generate accepts this prompt, so the ceiling is "
-                "SGLang-specific. Set rolling_generation.rolling_context_size to at most "
-                f"{self._context_len - _SGLANG_CONTEXT_RESERVE - 1} so every chunk has room for at "
-                "least one new token."
-            )
 
         if not self._logged_context_clamp:
             self._logged_context_clamp = True
             logger.warning(
                 f"SGLang chunk budget clamped from {requested} to {allowed} new tokens for a "
-                f"{prompt_len}-token prompt: its scheduler holds back "
-                f"{_SGLANG_CONTEXT_RESERVE} of the model's {self._context_len} positions, where "
-                "HF's generate would use the full window. Generated trajectories will be "
+                f"{prompt_len}-token prompt: its scheduler caps max_new_tokens at "
+                f"max_req_len - len(input) - 1 (max_req_len={self._max_req_len}), where HF's "
+                "generate would use the full window. Generated trajectories will be "
                 "correspondingly shorter than the HF backend's on window-saturating chunks. "
                 "Logged once per backend instance."
             )
@@ -475,10 +527,10 @@ class SGLangBackend:
         subprocess. The stripped kwargs are logged at debug level.
 
         ``generation_config.max_new_tokens`` is a request, not a guarantee: SGLang reserves
-        ``_SGLANG_CONTEXT_RESERVE`` positions of the model's context window that HF's ``generate``
-        would happily use, so a window-saturating chunk comes back that many tokens shorter. The
-        shortfall is applied here and logged rather than left to the engine to swallow; see
-        :meth:`_cap_max_new_tokens`.
+        a few positions of the model's context window that HF's ``generate`` would happily use, so a
+        window-saturating chunk comes back correspondingly shorter. The shortfall is applied here
+        and logged rather than left to the engine to swallow; see :meth:`_cap_max_new_tokens`.
+        An over-long *prompt* is refused outright instead -- see :meth:`_check_prompt_len`.
         """
         stripped = {k: v for k, v in kwargs.items() if k in _HF_ONLY_KWARGS}
         if stripped:
@@ -492,11 +544,12 @@ class SGLangBackend:
 
         # Apply SGLang's context ceiling ourselves, against the longest prompt in the batch (the
         # binding one, since ``max_new_tokens`` is shared across the whole call). Doing it here
-        # rather than leaving it to ``allow_auto_truncate`` is what makes the shortfall visible;
-        # see ``_SGLANG_CONTEXT_RESERVE``.
-        max_new_tokens = self._cap_max_new_tokens(
-            generation_config.max_new_tokens, max((len(p) for p in prompts), default=0)
-        )
+        # rather than leaving it to ``allow_auto_truncate`` is what makes the shortfall visible.
+        longest_prompt = max((len(p) for p in prompts), default=0)
+        # Input ceiling first: an over-long prompt is silently truncated by the engine, which is
+        # strictly worse than the output-side shortfall handled just below.
+        self._check_prompt_len(longest_prompt)
+        max_new_tokens = self._cap_max_new_tokens(generation_config.max_new_tokens, longest_prompt)
 
         # Map HF ``GenerationConfig`` → SGLang sampling-params dict. Intentional translations:
         #   - ``do_sample=False`` → ``temperature=0.0`` regardless of the caller's configured
