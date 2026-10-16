@@ -836,3 +836,21 @@ def test_non_flashinfer_backend_below_the_floor_is_allowed(tmp_path: Path):
         tmp_path, engine_kwargs={"attention_backend": "triton"}, sgl_module=_FakeSGLModule()
     )
     assert backend._engine_kwargs["attention_backend"] == "triton"
+
+
+def test_empty_prompt_row_is_refused_before_reaching_the_engine():
+    """Regression for #176: an all-pad row must raise here, not reach the scheduler.
+
+    SGLang only rejects an empty top-level ``input_ids`` list; a per-row ``[]`` is accepted and
+    later crashes the engine subprocess whenever it lands in a prefill batch of its own.
+    """
+    backend, fake = _make_backend()
+    input_ids = torch.tensor([[1, 2, 3], [0, 0, 0], [0, 4, 5]], dtype=torch.long)
+    attention_mask = input_ids != 0
+    cfg = GenerationConfig(max_new_tokens=2, do_sample=False, pad_token_id=0, eos_token_id=99)
+    fake.last_engine.set_next_outputs([{"output_ids": [7]}] * 3)
+
+    with pytest.raises(ValueError, match=r"rows \[1\] of this batch have no real \(non-pad\) tokens"):
+        backend.generate_chunk(input_ids, attention_mask=attention_mask, generation_config=cfg)
+
+    assert fake.last_engine.generate_calls == [], "the engine must not see the batch"
