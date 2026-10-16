@@ -13,6 +13,9 @@ seed: null
 
 pretrained_model_config: ${load_yaml_file:${model_initialization_dir}/config.yaml}
 ckpt_path: ${model_initialization_dir}/best_model.ckpt
+# Which checkpoint weights to generate from: ``raw``, ``ema`` (Anytime EMA weights), or ``auto`` (EMA when the
+# checkpoint has them, raw otherwise).
+checkpoint_weights: auto
 
 do_overwrite: False
 

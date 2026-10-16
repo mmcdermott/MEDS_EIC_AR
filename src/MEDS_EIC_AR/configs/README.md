@@ -77,6 +77,14 @@ Two root configuration files drive the main entry points:
 Both of these files can be overridden on the command line or by providing a
 custom YAML file to Hydra.
 
+`_pretrain.yaml` also takes an optional `training_schedule` preset that rewires
+several groups at once. `training_schedule=anytime_constant` selects a
+horizon-free warmup-then-constant LR
+(`lightning_module/LR_scheduler/get_constant_schedule_with_warmup.yaml`) and the
+`trainer/callbacks/anytime.yaml` callback set. That set adds the `anytime_ema`
+weight average and drops early stopping, so that a finished run can be resumed
+with a larger `trainer.max_steps`.
+
 ## `datamodule` configuration:
 
 Configuration for constructing dataloaders backed by

@@ -1,0 +1,10 @@
+# @package _global_
+# Anytime pretraining (Meterez et al., 2026, https://arxiv.org/abs/2602.03702): warmup to a constant LR plus a
+# growing-horizon EMA of the weights. Validation, checkpoint selection and generation use the EMA weights;
+# training (and resume) continues from the raw weights. Because no part of this schedule depends on
+# ``trainer.max_steps``, a finished run may be resumed with a larger ``trainer.max_steps``.
+#
+# Tune with ``lightning_module.LR_scheduler.num_warmup_steps=...`` and ``trainer.callbacks.anytime_ema.k=...``.
+defaults:
+  - override /lightning_module/LR_scheduler: get_constant_schedule_with_warmup
+  - override /trainer/callbacks: anytime

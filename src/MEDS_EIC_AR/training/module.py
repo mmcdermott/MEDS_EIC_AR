@@ -23,6 +23,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..generation.repeated_dataset import PredictBatch, PredictStepOutput
 from ..model import Model
+from .anytime import ANYTIME_EMA_STATE_KEY, load_ema_weights
 from .metrics import NextCodeMetrics
 
 logger = logging.getLogger(__name__)
@@ -127,11 +128,18 @@ class MEICARModule(L.LightningModule):
     """A LightningModule for training and evaluating the MEICAR model."""
 
     @classmethod
-    def load_from_checkpoint(cls, ckpt_path: Path | None = None) -> "MEICARModule":
+    def load_from_checkpoint(
+        cls, ckpt_path: Path | None = None, weights: Literal["auto", "raw", "ema"] = "auto"
+    ) -> "MEICARModule":
         """Loads the full lightning module from a checkpoint.
 
         Args:
             ckpt_path: Path to the checkpoint file.
+            weights: Which weights to load. ``"raw"`` loads the module's saved parameters (the ones training
+                optimizes and resumes from). ``"ema"`` loads the Anytime EMA weights kept by
+                :class:`~MEDS_EIC_AR.training.AnytimeEMA` instead. ``"auto"`` picks ``"ema"`` when the
+                checkpoint carries EMA state and ``"raw"`` otherwise, so Anytime checkpoints are evaluated
+                and exported with their averaged weights by default.
 
         Returns:
             The loaded MEICARModule instance, with all hyperparameters matching _except_ for the optimizer
@@ -140,6 +148,8 @@ class MEICARModule(L.LightningModule):
 
         Raises:
             KeyError: If the checkpoint does not contain the expected hyperparameters.
+            ValueError: If ``weights="ema"`` but the checkpoint has no EMA state, or ``weights`` is not one of
+                the accepted values.
 
         Examples:
             >>> model = Model({
@@ -178,7 +188,19 @@ class MEICARModule(L.LightningModule):
             Loaded module has the same parameter names as the original!
             >>> for k, v in model_params.items():
             ...     assert torch.equal(v, loaded_module.state_dict()[k]), f"Parameter {k} does not match"
+
+        This checkpoint has no Anytime EMA state, so asking for EMA weights explicitly is an error:
+
+            >>> with tempfile.NamedTemporaryFile(suffix=".ckpt") as f:
+            ...     trainer.save_checkpoint(f.name)
+            ...     MEICARModule.load_from_checkpoint(f.name, weights="ema")
+            Traceback (most recent call last):
+                ...
+            ValueError: weights='ema' was requested, but /tmp/....ckpt has no AnytimeEMA state.
         """
+
+        if weights not in ("auto", "raw", "ema"):
+            raise ValueError(f"weights must be one of 'auto', 'raw', 'ema'; got {weights!r}.")
 
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
@@ -193,13 +215,25 @@ class MEICARModule(L.LightningModule):
         optimizer = _dict_to_factory(hparams["optimizer"])
         LR_scheduler = _dict_to_factory(hparams["LR_scheduler"])
 
-        return super().load_from_checkpoint(
+        ema_state = checkpoint.get("callbacks", {}).get(ANYTIME_EMA_STATE_KEY)
+        if weights == "auto":
+            weights = "raw" if ema_state is None else "ema"
+        if weights == "ema" and ema_state is None:
+            raise ValueError(f"weights='ema' was requested, but {ckpt_path} has no AnytimeEMA state.")
+
+        module = super().load_from_checkpoint(
             ckpt_path,
             model=model,
             metrics=metrics,
             optimizer=optimizer,
             LR_scheduler=LR_scheduler,
         )
+
+        if weights == "ema":
+            load_ema_weights(module, ema_state)
+            logger.info(f"Loaded the Anytime EMA weights (age {ema_state['age']} steps) from {ckpt_path}.")
+
+        return module
 
     def __init__(
         self,

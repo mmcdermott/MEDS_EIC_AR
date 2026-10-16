@@ -166,6 +166,30 @@ configuration parameters (as shown above via `datamodule.config.tensorized_cohor
 though you will more likely materialize an experimental configuration file to disk in yaml form and overwrite
 the config path and name directly in the normal hydra manner.
 
+#### Anytime pretraining
+
+By default the LR follows a cosine schedule sized to `trainer.max_steps`, so the step budget has to be fixed
+up front. Adding `training_schedule=anytime_constant` switches to
+[Anytime pretraining](https://arxiv.org/abs/2602.03702) instead. The LR warms up over an absolute number of
+steps and then stays constant, and the weights are tracked by a growing-horizon EMA (EMA-25 by default).
+Validation, checkpoint selection and `MEICAR_generate_trajectories` use the EMA weights. Training, and any
+resume, continues from the raw weights. Because nothing in this schedule depends on `trainer.max_steps`, a
+finished run can be extended:
+
+```bash
+MEICAR_pretrain ... training_schedule=anytime_constant trainer.max_steps=20000 \
+    lightning_module.LR_scheduler.num_warmup_steps=2000
+# later, same output_dir: continues from step 20000 with no re-warmup and no EMA reset
+MEICAR_pretrain ... training_schedule=anytime_constant trainer.max_steps=100000 \
+    lightning_module.LR_scheduler.num_warmup_steps=2000 do_resume=true
+```
+
+Only `trainer.max_steps` / `trainer.max_epochs` may change across such a resume. Every other setting,
+including the warmup length and the EMA's `trainer.callbacks.anytime_ema.k`, must match. Horizon-dependent
+schedules still reject a changed step budget. Generation takes `checkpoint_weights=raw|ema|auto` (default
+`auto`, which means EMA when the checkpoint has it). The preset drops early stopping, and it supports
+single-device and DDP training only.
+
 > [!WARNING]
 > Tests here only validate that the model runs without errors and (in demo mode) runs without producing nans
 > or invalid values. It has not yet been assessed to ensure it runs to convergence, etc.

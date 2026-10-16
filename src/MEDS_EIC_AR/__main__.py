@@ -201,7 +201,7 @@ def generate_trajectories(cfg: DictConfig):
     rolling_kwargs = validate_rolling_cfg(cfg.get("rolling_generation", None))
     rolling_requested = "max_new_tokens" in rolling_kwargs
 
-    M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path))
+    M = MEICARModule.load_from_checkpoint(Path(cfg.ckpt_path), weights=cfg.checkpoint_weights)
     M.eval()
 
     # Auto-populate ``eos_token_id`` on the loaded checkpoint if it's unset. Models pretrained through

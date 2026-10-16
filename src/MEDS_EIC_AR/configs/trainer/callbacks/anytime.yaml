@@ -1,0 +1,11 @@
+# Callback set for Anytime pretraining. Same as ``default`` but with the growing-horizon EMA added and
+# early stopping dropped: an Anytime run is meant to reach its step budget and then be extended, and a
+# restored early-stopping counter would end an extended run before it trains at all.
+defaults:
+  - model_checkpoint
+  - learning_rate_monitor
+  - save_logger_run_ids
+  - anytime_ema
+  - _self_
+
+_target_: MEDS_EIC_AR.values_as_list

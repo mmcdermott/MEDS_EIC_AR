@@ -1,0 +1,6 @@
+# Horizon-free schedule: linear warmup over an absolute number of optimizer steps, then a constant peak LR
+# forever after. Nothing here depends on ``trainer.max_steps``, which is what lets a run using it be resumed
+# with a larger step budget (see ``training_schedule/anytime_constant.yaml``).
+_target_: transformers.get_constant_schedule_with_warmup
+_partial_: true
+num_warmup_steps: 5000 # absolute optimizer steps; never a fraction of max_steps
