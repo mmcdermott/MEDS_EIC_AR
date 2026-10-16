@@ -143,11 +143,10 @@ class _ForceEarlyEOS:
 def test_finished_rows_never_reach_the_engine(backend: SGLangBackend):
     """Rolling generation on the real engine, with one row finishing long before the others.
 
-    Before the fix for #176, row 0's all-pad window from chunk 2 onward reached the engine as an
-    empty prompt, which crashes the scheduler whenever such prompts form a prefill batch of their
-    own. Here every call to the real engine must carry only unfinished rows and no empty prompt,
-    the finished row must come back as EOS-then-pad in its own row, and the engine must still be
-    usable afterwards.
+    Before the fix for #176, row 0's all-pad window from chunk 2 onward reached the engine as an empty prompt,
+    which crashes the scheduler whenever such prompts form a prefill batch of their own. Here every call to
+    the real engine must carry only unfinished rows and no empty prompt, the finished row must come back as
+    EOS-then-pad in its own row, and the engine must still be usable afterwards.
     """
     torch.manual_seed(0)
     model = Model(GPT_KWARGS, precision="32-true")
