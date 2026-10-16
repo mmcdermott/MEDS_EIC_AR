@@ -295,6 +295,7 @@ follows:
 │   └── demo.yaml
 ├── lightning_module
 │   ├── LR_scheduler
+│   │   ├── get_constant_schedule_with_warmup.yaml
 │   │   └── get_cosine_schedule_with_warmup.yaml
 │   ├── default.yaml
 │   ├── demo.yaml
@@ -313,23 +314,27 @@ follows:
 │   ├── optimizer
 │   │   └── adamw.yaml
 │   └── small.yaml
-└── trainer
-    ├── callbacks
-    │   ├── default.yaml
-    │   ├── early_stopping.yaml
-    │   ├── generation.yaml
-    │   ├── generation_speed_logger.yaml
-    │   ├── learning_rate_monitor.yaml
-    │   ├── model_checkpoint.yaml
-    │   └── save_logger_run_ids.yaml
-    ├── default.yaml
-    ├── demo.yaml
-    ├── demo_generate.yaml
-    ├── generate.yaml
-    └── logger
-        ├── csv.yaml
-        ├── mlflow.yaml
-        └── wandb.yaml
+├── trainer
+│   ├── callbacks
+│   │   ├── anytime.yaml
+│   │   ├── anytime_ema.yaml
+│   │   ├── default.yaml
+│   │   ├── early_stopping.yaml
+│   │   ├── generation.yaml
+│   │   ├── generation_speed_logger.yaml
+│   │   ├── learning_rate_monitor.yaml
+│   │   ├── model_checkpoint.yaml
+│   │   └── save_logger_run_ids.yaml
+│   ├── default.yaml
+│   ├── demo.yaml
+│   ├── demo_generate.yaml
+│   ├── generate.yaml
+│   └── logger
+│       ├── csv.yaml
+│       ├── mlflow.yaml
+│       └── wandb.yaml
+└── training_schedule
+    └── anytime_constant.yaml
 
 ```
 
