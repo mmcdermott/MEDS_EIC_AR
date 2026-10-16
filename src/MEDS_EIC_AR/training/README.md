@@ -14,7 +14,14 @@ validation, and prediction. It owns:
     dir so resumes can verify no load-bearing param changed. A small allow-list
     (`ALLOWED_DIFFERENCE_KEYS` in [`files.py`](files.py)) covers cadence params that are safe to adjust
     across a resume (`trainer.val_check_interval`, `trainer.check_val_every_n_epoch`,
-    `trainer.log_every_n_steps`).
+    `trainer.log_every_n_steps`). The step budget (`trainer.max_steps`, `trainer.max_epochs`) is also
+    allowed to change, but only when both runs use a horizon-free LR schedule
+    (`HORIZON_FREE_LR_SCHEDULERS`).
+- **Anytime EMA** — [`AnytimeEMA`](anytime.py) keeps a growing-horizon average of the weights
+    (`beta_t = 2^(-k / t)`), updated once per optimizer step. Validation swaps the EMA weights in and then
+    restores the raw weights exactly. The EMA and its age are checkpointed as callback state and checked
+    against the restored step on resume. `MEICARModule.load_from_checkpoint(..., weights="auto")` loads the
+    EMA weights whenever a checkpoint has them.
 - **Prediction** — `predict_step` takes a `PredictBatch` — the
     `(mdata_batch, dataset_row_idxs, trajectory_idxs)` three-tuple yielded by the N-sample
     interleaving dataloader in [`generation/`](../generation/) — and runs the rolling generator

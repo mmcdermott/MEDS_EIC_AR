@@ -21,6 +21,18 @@ ALLOWED_DIFFERENCE_KEYS = {
     "trainer.log_every_n_steps",
 }
 
+# Step-budget knobs. These may differ across a resume only when the LR schedule is horizon-free (see
+# ``HORIZON_FREE_LR_SCHEDULERS``): extending a finished Anytime run is then a continuation of the same
+# trajectory. For a schedule built from the planned horizon (cosine, linear decay) a new budget would change
+# the schedule mid-run, so the strict comparison stays in force.
+HORIZON_KEYS = {"trainer.max_steps", "trainer.max_epochs"}
+
+# LR schedulers whose value at a step depends only on the optimizer step count, never on the final horizon.
+HORIZON_FREE_LR_SCHEDULERS = {
+    "transformers.get_constant_schedule",
+    "transformers.get_constant_schedule_with_warmup",
+}
+
 STR_ENUM_PARAMS = {
     "seq_sampling_strategy": SubsequenceSamplingStrategy,
     "padding_side": PaddingSide,
@@ -146,6 +158,32 @@ def diff_configs(new_config: dict[str, Any], old_config: dict[str, Any]) -> dict
     return differences
 
 
+def is_horizon_free(cfg: dict[str, Any]) -> bool:
+    """Returns whether a (resolved) pretraining config uses an LR schedule that ignores the step budget.
+
+    A run with no LR scheduler at all is horizon-free too, since its LR never changes.
+
+    Examples:
+        >>> is_horizon_free({"lightning_module": {"LR_scheduler": {
+        ...     "_target_": "transformers.get_constant_schedule_with_warmup", "num_warmup_steps": 10,
+        ... }}})
+        True
+        >>> is_horizon_free({"lightning_module": {"LR_scheduler": None}})
+        True
+        >>> is_horizon_free({"lightning_module": {"LR_scheduler": {
+        ...     "_target_": "transformers.get_cosine_schedule_with_warmup", "num_training_steps": 100,
+        ... }}})
+        False
+        >>> is_horizon_free({})
+        False
+    """
+    module_cfg = cfg.get("lightning_module")
+    if not isinstance(module_cfg, dict) or "LR_scheduler" not in module_cfg:
+        return False
+    scheduler_cfg = module_cfg["LR_scheduler"]
+    return scheduler_cfg is None or scheduler_cfg.get("_target_") in HORIZON_FREE_LR_SCHEDULERS
+
+
 def validate_resume_directory(output_dir: Path, cfg: DictConfig):
     """Validates that this is a valid directory to resume training from for the given configuration.
 
@@ -225,6 +263,55 @@ def validate_resume_directory(output_dir: Path, cfg: DictConfig):
         ... })
         >>> with yaml_disk(disk) as output_dir:
         ...     validate_resume_directory(output_dir, input_cfg)  # no error
+
+    The step budget (``trainer.max_steps`` / ``trainer.max_epochs``) may change only when both the old and
+    new runs use a horizon-free LR schedule, which makes extending a finished Anytime run a supported resume:
+
+        >>> disk = '''
+        ...   config.yaml:
+        ...     do_resume: false
+        ...     lightning_module:
+        ...       LR_scheduler:
+        ...         _target_: transformers.get_constant_schedule_with_warmup
+        ...         num_warmup_steps: 10
+        ...     trainer:
+        ...       max_steps: 100
+        ... '''
+        >>> input_cfg = DictConfig({
+        ...     "do_resume": True,
+        ...     "lightning_module": {"LR_scheduler": {
+        ...         "_target_": "transformers.get_constant_schedule_with_warmup", "num_warmup_steps": 10,
+        ...     }},
+        ...     "trainer": {"max_steps": 500},
+        ... })
+        >>> with yaml_disk(disk) as output_dir:
+        ...     validate_resume_directory(output_dir, input_cfg)  # no error
+
+    Under a schedule that was built from the planned horizon, the same change is rejected:
+
+        >>> disk = '''
+        ...   config.yaml:
+        ...     do_resume: false
+        ...     lightning_module:
+        ...       LR_scheduler:
+        ...         _target_: transformers.get_cosine_schedule_with_warmup
+        ...         num_warmup_steps: 10
+        ...     trainer:
+        ...       max_steps: 100
+        ... '''
+        >>> input_cfg = DictConfig({
+        ...     "do_resume": True,
+        ...     "lightning_module": {"LR_scheduler": {
+        ...         "_target_": "transformers.get_cosine_schedule_with_warmup", "num_warmup_steps": 10,
+        ...     }},
+        ...     "trainer": {"max_steps": 500},
+        ... })
+        >>> with yaml_disk(disk) as output_dir:
+        ...     validate_resume_directory(output_dir, input_cfg)
+        Traceback (most recent call last):
+            ...
+        ValueError: The configuration in the output directory does not match the input:
+          - key 'trainer.max_steps' has value 100 (int) in the old config, but 500 (int) in the new config.
     """
     old_cfg_fp = output_dir / "config.yaml"
     if not old_cfg_fp.is_file():
@@ -237,9 +324,13 @@ def validate_resume_directory(output_dir: Path, cfg: DictConfig):
 
     differences = diff_configs(new_cfg, old_cfg)
 
+    allowed = set(ALLOWED_DIFFERENCE_KEYS)
+    if is_horizon_free(old_cfg) and is_horizon_free(new_cfg):
+        allowed |= HORIZON_KEYS
+
     err_lines = []
     for key, diff in differences.items():
-        if key in ALLOWED_DIFFERENCE_KEYS:
+        if key in allowed:
             continue
         err_lines.append(f"  - key '{key}' {diff}")
 

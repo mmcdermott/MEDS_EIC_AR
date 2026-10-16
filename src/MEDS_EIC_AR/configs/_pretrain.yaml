@@ -2,6 +2,8 @@ defaults:
   - lightning_module: ???
   - datamodule: pretrain
   - trainer: default
+  # Optional training-schedule preset that rewires other groups, e.g. ``training_schedule=anytime_constant``.
+  - training_schedule: null
   - _self_
 
 max_seq_len: 512

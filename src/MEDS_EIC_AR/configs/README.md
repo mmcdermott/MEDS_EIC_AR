@@ -22,6 +22,7 @@ configuration structure is as follows:
 │   └── demo.yaml
 ├── lightning_module
 │   ├── LR_scheduler
+│   │   ├── get_constant_schedule_with_warmup.yaml
 │   │   └── get_cosine_schedule_with_warmup.yaml
 │   ├── default.yaml
 │   ├── demo.yaml
@@ -40,23 +41,27 @@ configuration structure is as follows:
 │   ├── optimizer
 │   │   └── adamw.yaml
 │   └── small.yaml
-└── trainer
-    ├── callbacks
-    │   ├── default.yaml
-    │   ├── early_stopping.yaml
-    │   ├── generation.yaml
-    │   ├── generation_speed_logger.yaml
-    │   ├── learning_rate_monitor.yaml
-    │   ├── model_checkpoint.yaml
-    │   └── save_logger_run_ids.yaml
-    ├── default.yaml
-    ├── demo.yaml
-    ├── demo_generate.yaml
-    ├── generate.yaml
-    └── logger
-        ├── csv.yaml
-        ├── mlflow.yaml
-        └── wandb.yaml
+├── trainer
+│   ├── callbacks
+│   │   ├── anytime.yaml
+│   │   ├── anytime_ema.yaml
+│   │   ├── default.yaml
+│   │   ├── early_stopping.yaml
+│   │   ├── generation.yaml
+│   │   ├── generation_speed_logger.yaml
+│   │   ├── learning_rate_monitor.yaml
+│   │   ├── model_checkpoint.yaml
+│   │   └── save_logger_run_ids.yaml
+│   ├── default.yaml
+│   ├── demo.yaml
+│   ├── demo_generate.yaml
+│   ├── generate.yaml
+│   └── logger
+│       ├── csv.yaml
+│       ├── mlflow.yaml
+│       └── wandb.yaml
+└── training_schedule
+    └── anytime_constant.yaml
 
 ```
 
@@ -76,6 +81,14 @@ Two root configuration files drive the main entry points:
 
 Both of these files can be overridden on the command line or by providing a
 custom YAML file to Hydra.
+
+`_pretrain.yaml` also takes an optional `training_schedule` preset that rewires
+several groups at once. `training_schedule=anytime_constant` selects a
+horizon-free warmup-then-constant LR
+(`lightning_module/LR_scheduler/get_constant_schedule_with_warmup.yaml`) and the
+`trainer/callbacks/anytime.yaml` callback set. That set adds the `anytime_ema`
+weight average and drops early stopping, so that a finished run can be resumed
+with a larger `trainer.max_steps`.
 
 ## `datamodule` configuration:
 
