@@ -283,6 +283,46 @@ def _strip_padding_to_lists(input_ids: torch.Tensor, attention_mask: torch.Tenso
     return [row[m].tolist() for row, m in zip(cpu_ids, cpu_mask, strict=True)]
 
 
+def _check_no_empty_prompts(prompts: list[list[int]]) -> None:
+    """Refuse a batch in which any prompt has no real tokens (issue #176).
+
+    SGLang's API layer only rejects an empty *top-level* ``input_ids`` list; an empty per-row
+    prompt passes through to the scheduler, which gives it ``extend_input_len = 0``. Such a
+    request rides along harmlessly when it shares a prefill batch with real prompts, but when
+    the scheduler's chunked-prefill budget is exhausted exactly at the last non-empty prompt,
+    the empties left over form a prefill batch of their own. That batch has zero tokens, the
+    forward pass dies in the first kernel that cannot take a zero-row tensor (RoPE:
+    ``cannot reshape tensor of 0 elements into shape [0, -1, head_dim]``), and the scheduler
+    subprocess takes the parent down with SIGQUIT (exit 137 under Slurm). Because it depends on
+    where batch boundaries fall, it surfaces intermittently, deep into a run. Verified against
+    ``sglang==0.5.9``.
+
+    Raising here turns that into an immediate, attributable error in the calling process. The
+    rolling loop never sends finished rows (whose windows are all pad) any more, so an empty
+    prompt reaching this point means a row with no history at all.
+
+    Examples:
+        >>> _check_no_empty_prompts([[1, 2], [3]])
+        >>> _check_no_empty_prompts([[1, 2], [], [3], []])
+        Traceback (most recent call last):
+            ...
+        ValueError: SGLang cannot generate from an empty prompt, but rows [1, 3] of this batch ...
+    """
+    empty_rows = [i for i, p in enumerate(prompts) if not p]
+    if not empty_rows:
+        return
+    shown = empty_rows[:10]
+    more = f" (and {len(empty_rows) - len(shown)} more)" if len(empty_rows) > len(shown) else ""
+    raise ValueError(
+        f"SGLang cannot generate from an empty prompt, but rows {shown}{more} of this batch have "
+        "no real (non-pad) tokens. Its scheduler accepts such a request and crashes the engine "
+        "subprocess when the request lands in a prefill batch of its own (RoPE: 'cannot reshape "
+        "tensor of 0 elements', then SIGQUIT / exit 137), so it is refused here instead. Every row "
+        "handed to the backend must carry at least one real token; a row with no history cannot "
+        "be generated from."
+    )
+
+
 def _pad_right_to_tensor(
     new_tokens_per_row: list[list[int]],
     *,
@@ -541,6 +581,7 @@ class SGLangBackend:
         forwarded = {k: v for k, v in kwargs.items() if k not in _HF_ONLY_KWARGS}
 
         prompts = _strip_padding_to_lists(input_ids, attention_mask)
+        _check_no_empty_prompts(prompts)
 
         # Apply SGLang's context ceiling ourselves, against the longest prompt in the batch (the
         # binding one, since ``max_new_tokens`` is shared across the whole call). Doing it here

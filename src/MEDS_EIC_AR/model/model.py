@@ -718,8 +718,9 @@ class Model(torch.nn.Module):
 
         HF ``generate`` handles in-chunk EOS (``TIMELINE//END``) naturally: rows that hit EOS are
         padded with ``PAD_INDEX`` from that point on. Across chunks we track a ``finished`` mask and
-        overwrite tokens produced for already-finished rows with pad before writing them, so those
-        rows don't "resurrect" when the next chunk's prompt re-exposes their EOS token. The loop
+        send only the unfinished rows to the backend, scattering their new tokens back into a
+        pad-filled block, so finished rows never "resurrect" when a later window re-exposes their
+        EOS token and are never submitted as an all-pad (empty) prompt (issue #176). The loop
         terminates as soon as every row is finished or the new-token budget is exhausted.
 
         **Why we maintain our own loop.** HF Transformers mainline currently exposes no first-class
@@ -973,23 +974,29 @@ class Model(torch.nn.Module):
             # the per-chunk budget is always positive. The ``min`` only kicks in on the last iteration
             # when the remaining budget is smaller than the per-call cap.
             chunk_budget = min(max_new_tokens - n_generated, self.max_seq_len - prompt_len)
-            new_tokens = self._generate_chunk(
-                prompt,
-                attention_mask=prompt_mask,
+
+            # Only rows still generating go to the backend (issue #176). A finished row's window
+            # keeps sliding over the pad it was filled with after EOS, and once the window has moved
+            # entirely past the EOS it holds no real tokens at all. HF's ``generate`` shrugs at a
+            # fully-masked row, but SGLang's scheduler crashes the engine subprocess when such empty
+            # prompts land in a prefill batch of their own. Skipping finished rows also stops paying
+            # a full chunk budget for output that was only ever going to be discarded.
+            active = ~finished
+            active_tokens = self._generate_chunk(
+                prompt[active],
+                attention_mask=prompt_mask[active],
                 max_new_tokens=chunk_budget,
                 pad_id=pad_id,
                 do_sample=do_sample,
                 **kwargs,
             )
-            new_len = new_tokens.size(1)
+            new_len = active_tokens.size(1)
 
-            # Mask out tokens for already-finished rows so they stay padded in the buffer. HF already
-            # pads post-EOS within each chunk via ``pad_token_id`` during generation, so within-chunk
-            # post-EOS positions are already correct; this mask only keeps rows that finished in
-            # *earlier* chunks from resurrecting on the next iteration (because the new prompt
-            # includes the EOS token in its visible tail, and HF would happily keep going).
-            if bool(finished.any()):
-                new_tokens = new_tokens.masked_fill(finished.unsqueeze(1), pad_id)
+            # Scatter back into a full-height, pad-filled block: finished rows stay padded, and row
+            # order is preserved. Within a chunk, positions after a row's first EOS are already pad
+            # by the backend contract, so nothing further is needed for rows that finish here.
+            new_tokens = torch.full((batch_size, new_len), pad_id, dtype=active_tokens.dtype, device=device)
+            new_tokens[active] = active_tokens
 
             sequence_so_far[:, n_total : n_total + new_len] = new_tokens
             n_total += new_len

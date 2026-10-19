@@ -30,6 +30,7 @@ from meds_torchdata import MEDSTorchBatch, MEDSTorchDataConfig
 from polars.testing import assert_frame_equal
 
 from conftest import run_and_check
+from MEDS_EIC_AR.model.backends.sglang import _strip_padding_to_lists
 from MEDS_EIC_AR.model.model import Model
 
 
@@ -436,3 +437,76 @@ def test_rolling_context_size_above_a_backend_ceiling_is_rejected(rolling_model:
     rolling_model._backend = _CappedBackend(rolling_model._backend)
     with pytest.raises(ValueError, match="_CappedBackend"):
         _run_rolling(rolling_model, rolling_batch, max_new_tokens=10, rolling_context_size=8)
+
+
+# ---------------------------------------------------------------------------
+# Finished rows must not go back to the backend (issue #176)
+# ---------------------------------------------------------------------------
+
+
+class _EarlyEOSBackend:
+    """Backend stub for the finished-row regression (issue #176).
+
+    Rows in ``eos_rows`` emit EOS as their very first token; every other row emits ``filler``
+    forever. Each call records the *stripped* prompts, i.e. exactly the ragged lists
+    ``SGLangBackend`` would submit to its engine, so a test can assert that no empty prompt is
+    ever produced.
+    """
+
+    def __init__(self, *, eos_id: int, pad_id: int, eos_rows: set[int], filler: int = 5):
+        self.eos_id, self.pad_id, self.eos_rows, self.filler = eos_id, pad_id, eos_rows, filler
+        self.stripped_prompts: list[list[list[int]]] = []
+
+    def generate_chunk(self, input_ids, *, attention_mask, generation_config, **kwargs):
+        self.stripped_prompts.append(_strip_padding_to_lists(input_ids, attention_mask))
+        out = torch.full(
+            (input_ids.shape[0], generation_config.max_new_tokens), self.filler, dtype=input_ids.dtype
+        )
+        if len(self.stripped_prompts) == 1:
+            for row in self.eos_rows:
+                out[row, 0] = self.eos_id
+                out[row, 1:] = self.pad_id
+        return out
+
+
+def test_rolling_generate_sends_only_unfinished_rows_to_the_backend(
+    rolling_model: Model, rolling_batch: MEDSTorchBatch
+):
+    """A row that finished in an earlier chunk is excluded from later backend calls.
+
+    With ``rolling_context_size=4`` and row 0 finishing on its first token, row 0's window is
+    entirely pad from the second chunk on. Before the fix for #176 the loop still sent that row,
+    which reached SGLang as a zero-token prompt and crashed its engine subprocess. Row order and
+    the post-EOS padding of the finished row must survive the exclusion.
+    """
+    pad_id = rolling_batch.PAD_INDEX
+    backend = _EarlyEOSBackend(eos_id=37, pad_id=pad_id, eos_rows={0})
+    rolling_model.set_backend(backend)
+
+    out = rolling_model._rolling_generate(
+        rolling_batch, max_new_tokens=40, rolling_context_size=4, do_sample=False
+    )
+
+    assert len(backend.stripped_prompts) >= 3, "expected the budget to span several chunks"
+    assert [len(p) for p in backend.stripped_prompts[0]] == [3, 3], "chunk 1 sees both rows"
+    for i, prompts in enumerate(backend.stripped_prompts[1:], start=2):
+        assert len(prompts) == 1, f"chunk {i} should only carry the unfinished row, got {len(prompts)}"
+        assert all(len(p) > 0 for p in prompts), f"chunk {i} submitted an empty prompt"
+
+    assert out.shape == (2, 40)
+    assert out[0, 0].item() == 37 and bool((out[0, 1:] == pad_id).all()), "finished row is EOS then pad"
+    assert bool((out[1] == backend.filler).all()), "unfinished row keeps its own tokens, in its own row"
+
+
+def test_rolling_generate_stops_after_every_row_finishes(rolling_model: Model, rolling_batch: MEDSTorchBatch):
+    """When every row hits EOS in the first chunk, no further backend call is made."""
+    pad_id = rolling_batch.PAD_INDEX
+    backend = _EarlyEOSBackend(eos_id=37, pad_id=pad_id, eos_rows={0, 1})
+    rolling_model.set_backend(backend)
+
+    out = rolling_model._rolling_generate(
+        rolling_batch, max_new_tokens=40, rolling_context_size=4, do_sample=False
+    )
+
+    assert len(backend.stripped_prompts) == 1
+    assert bool((out[:, 0] == 37).all()) and bool((out[:, 1:] == pad_id).all())
