@@ -6,6 +6,9 @@ log_dir: ${output_dir}/.logs
 
 do_reshard: False
 do_demo: False
+# Fold categorical text values into codes (the ``fuse_text_values`` stage); the stage is also skipped
+# automatically when the input has no ``text_value`` column.
+do_fuse_text_values: True
 
 hydra:
   run:

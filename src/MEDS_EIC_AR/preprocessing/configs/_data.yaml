@@ -2,6 +2,40 @@ input_dir: ${oc.env:RAW_MEDS_DIR}
 output_dir: ${oc.env:MTD_INPUT_DIR}
 
 stages:
+  # Categorical observations arrive with their category in ``text_value`` (a bedside heart-rhythm
+  # reading, a safety-measure entry, an ectopy type), and the tokenizer reads ``code`` only, so
+  # without this stage the model sees that the item was charted but never which category. This
+  # stage folds the category into the code the way ``bin_numeric_values`` folds a numeric bin
+  # into it: ``LAB//220048//UNK`` with ``text_value`` ``"AF (Atrial Fibrillation)"`` becomes
+  # ``LAB//220048//UNK//AF (Atrial Fibrillation)``. Only rows whose ``text_value`` contains an
+  # ASCII letter and whose ``numeric_value`` is null are folded (and their ``text_value`` is
+  # cleared); numbers stored as text (``"120/80"``, ``"72.5"``) are left for the ETL to parse, a
+  # text flag next to a number is kept, and every other row passes through untouched. The list
+  # form compiles to a per-row coalesce, which keeps every row and its order; a ``_match_revise``
+  # matcher over ``text_value`` would evaluate to null on rows without text and drop them. Each
+  # surviving (item, category) pair is then one code for the rare-code filter below.
+  - fuse_text_values:
+      code:
+        - output:
+            str: "{code}//{text_value}"
+          matcher:
+            text_value:
+              regex: "[A-Za-z]"
+            numeric_value:
+              present: False
+        - code
+      text_value:
+        - output:
+            col: text_value
+          matcher:
+            numeric_value:
+              present: True
+        - output:
+            col: text_value
+          matcher:
+            text_value:
+              regex: "^[^A-Za-z]*$"
+    _base_stage: extract_values
   # Stage-order note (issue #126): rare-code and rare-subject filtering must run *before*
   # ``add_time_derived_measurements``. Timeline delta tokens are inserted between consecutive
   # events, so inserting them first and filtering after leaves back-to-back

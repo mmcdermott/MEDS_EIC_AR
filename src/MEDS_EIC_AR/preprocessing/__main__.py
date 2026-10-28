@@ -2,9 +2,9 @@
 
 Shells out to two upstream CLIs back-to-back against a shared Hydra config:
 
-1. ``MEDS_transform-pipeline`` — the general MEDS → MEDS pipeline transform pass (filtering, timeline
-   tokens, value quantization). Takes the pipeline-config YAML as a positional argument. Shipped by
-   :mod:`MEDS_transforms` (0.6.x+).
+1. ``MEDS_transform-pipeline`` — the general MEDS → MEDS pipeline transform pass (categorical text
+   values fused into codes, filtering, timeline tokens, value quantization). Takes the pipeline-config
+   YAML as a positional argument. Shipped by :mod:`MEDS_transforms` (0.6.x+).
 2. ``MTD_preprocess`` — the :mod:`meds_torchdata` tensorization pass that produces the directory layout
    consumed by :class:`meds_torchdata.MEDSPytorchDataset` and the downstream training loop.
 
@@ -20,11 +20,49 @@ from importlib.resources import files
 from pathlib import Path
 
 import hydra
-from omegaconf import DictConfig
+import polars as pl
+from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
 CONFIGS = files("MEDS_EIC_AR") / "preprocessing" / "configs"
+
+TEXT_VALUE_FUSION_STAGE = "fuse_text_values"
+TEXT_VALUE_COLUMN = "text_value"
+
+
+def _input_has_text_value(input_dir: Path) -> bool:
+    """Whether the input cohort's data shards carry a ``text_value`` column, which MEDS leaves optional."""
+    shards = sorted((input_dir / "data").rglob("*.parquet"))
+    if not shards:
+        return False
+    return TEXT_VALUE_COLUMN in pl.scan_parquet(shards[0]).collect_schema().names()
+
+
+def _pipeline_config(
+    template_fp: Path, input_dir: Path, out_fp: Path, do_fuse_text_values: bool = True
+) -> Path:
+    """Write the pipeline config this run uses next to its outputs and return its path.
+
+    The ``fuse_text_values`` stage reads ``text_value``, and MEDS-transforms refuses an expression over a
+    column the data does not have, so the stage is dropped when the input lacks that column; it is also
+    dropped when ``do_fuse_text_values`` is false. Writing the config out records which stages produced a
+    given cohort.
+    """
+    cfg = OmegaConf.load(template_fp)
+    skip_reason = None
+    if not do_fuse_text_values:
+        skip_reason = "do_fuse_text_values=False"
+    elif not _input_has_text_value(input_dir):
+        skip_reason = f"the input has no {TEXT_VALUE_COLUMN} column"
+    if skip_reason is not None:
+        logger.info(f"Skipping the {TEXT_VALUE_FUSION_STAGE} stage: {skip_reason}")
+        cfg.stages = [
+            s for s in cfg.stages if not (isinstance(s, DictConfig) and TEXT_VALUE_FUSION_STAGE in s)
+        ]
+    out_fp.parent.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, out_fp)
+    return out_fp
 
 
 def _run_streamed(cmd: list[str], *, env: dict[str, str] | None = None, stage_name: str) -> None:
@@ -83,7 +121,13 @@ def process_data(cfg: DictConfig):
             env["MIN_SUBJECTS_PER_CODE"] = "2"
             env["MIN_EVENTS_PER_SUBJECT"] = "1"
 
-        pipeline_config_fp = (CONFIGS / "_reshard_data.yaml") if cfg.do_reshard else (CONFIGS / "_data.yaml")
+        template_fp = (CONFIGS / "_reshard_data.yaml") if cfg.do_reshard else (CONFIGS / "_data.yaml")
+        pipeline_config_fp = _pipeline_config(
+            Path(str(template_fp)),
+            input_dir,
+            intermediate_dir / ".logs" / "pipeline_config.yaml",
+            do_fuse_text_values=bool(cfg.get("do_fuse_text_values", True)),
+        )
         _run_streamed(
             ["MEDS_transform-pipeline", str(pipeline_config_fp)],
             env=env,
